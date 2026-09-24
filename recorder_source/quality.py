@@ -1,0 +1,192 @@
+"""Shared media-quality probing helpers.
+
+This module owns the common FFprobe command shape and result interpretation used
+by both the mature recorder and the Identity Coordinator. Callers remain free to
+supply their own process runner so recorder-specific logging/redaction behavior
+does not leak into the shared source-intelligence layer.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from typing import Callable, Mapping, Optional, Sequence
+
+from .selection import video_quality_rank
+
+
+def parse_frame_rate(value: object) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if "/" in text:
+        left, right = text.split("/", 1)
+        try:
+            denominator = float(right)
+            return float(left) / denominator if denominator else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_ffprobe_quality_command(
+    stream_url: str,
+    headers: Mapping[str, str],
+    *,
+    decryption_key: str = "",
+) -> list[str]:
+    command = ["ffprobe", "-v", "error"]
+    if headers:
+        header_blob = "".join(
+            f"{name}: {value}\r\n"
+            for name, value in headers.items()
+        )
+        command.extend(["-headers", header_blob])
+    if decryption_key:
+        command.extend(["-decryption_key", decryption_key])
+    command.extend([
+        "-select_streams", "v",
+        "-show_entries",
+        (
+            "stream=index,codec_name,width,height,avg_frame_rate,r_frame_rate,"
+            "bit_rate,field_order:format=bit_rate"
+        ),
+        "-of", "json",
+        stream_url,
+    ])
+    return command
+
+
+def parse_ffprobe_quality_output(
+    stdout: str,
+    *,
+    target_quality: Optional[Mapping[str, object]] = None,
+    motion_cap_fps: float = 50.0,
+) -> Optional[dict]:
+    data = json.loads(str(stdout or ""))
+    format_bitrate = int((data.get("format") or {}).get("bit_rate") or 0)
+    qualities: list[dict] = []
+
+    for stream in data.get("streams") or []:
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        fps = parse_frame_rate(stream.get("avg_frame_rate"))
+        if fps <= 0:
+            fps = parse_frame_rate(stream.get("r_frame_rate"))
+
+        stream_bitrate = int(stream.get("bit_rate") or 0)
+        bitrate = stream_bitrate or format_bitrate
+        bitrate_source = (
+            "stream" if stream_bitrate > 0
+            else "format" if format_bitrate > 0
+            else ""
+        )
+
+        field_order = str(stream.get("field_order") or "").strip().casefold()
+        if field_order == "progressive":
+            scan_type = "progressive"
+        elif field_order in {"tt", "bb", "tb", "bt"}:
+            scan_type = "interlaced"
+        else:
+            scan_type = ""
+
+        qualities.append({
+            "quality_known": bool(
+                fps > 0 or (width > 0 and height > 0) or bitrate > 0
+            ),
+            "video_fps": fps,
+            "video_width": width,
+            "video_height": height,
+            "video_scan_type": scan_type,
+            "video_scan_type_source": "ffprobe" if scan_type else "",
+            "video_bitrate_bps": bitrate,
+            "video_bitrate_source": bitrate_source,
+            "_ffprobe_stream_index": int(stream.get("index") or 0),
+            "_ffprobe_codec_name": str(stream.get("codec_name") or "").strip(),
+        })
+
+    if not qualities:
+        return None
+
+    target = target_quality or {}
+    target_width = int(target.get("video_width") or 0)
+    target_height = int(target.get("video_height") or 0)
+    target_fps = float(target.get("video_fps") or 0.0)
+
+    matched = []
+    for item in qualities:
+        if target_width > 0 and target_height > 0:
+            if (
+                int(item.get("video_width") or 0) != target_width
+                or int(item.get("video_height") or 0) != target_height
+            ):
+                continue
+        if target_fps > 0:
+            item_fps = float(item.get("video_fps") or 0.0)
+            if item_fps <= 0 or abs(item_fps - target_fps) > 0.05:
+                continue
+        matched.append(item)
+
+    best = max(
+        matched or qualities,
+        key=lambda item: video_quality_rank(
+            item,
+            motion_cap_fps=float(motion_cap_fps),
+        ),
+    )
+    best["_ffprobe_target_match_count"] = (
+        len(matched) if target_quality else len(qualities)
+    )
+    return best
+
+
+def probe_stream_quality_ffprobe(
+    stream_url: str,
+    headers: Mapping[str, str],
+    *,
+    timeout_sec: float = 20.0,
+    target_quality: Optional[Mapping[str, object]] = None,
+    motion_cap_fps: float = 50.0,
+    decryption_key: str = "",
+    runner: Optional[Callable[[Sequence[str], float], object]] = None,
+) -> Optional[dict]:
+    command = build_ffprobe_quality_command(
+        stream_url,
+        headers,
+        decryption_key=decryption_key,
+    )
+
+    if runner is None:
+        def default_runner(args: Sequence[str], timeout: float):
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": timeout,
+                "check": False,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            return subprocess.run(list(args), **kwargs)
+        runner = default_runner
+
+    result = runner(command, float(timeout_sec))
+    stdout = str(getattr(result, "stdout", "") or "").strip()
+    returncode = int(getattr(result, "returncode", 0) or 0)
+    if returncode != 0 or not stdout:
+        stderr = str(getattr(result, "stderr", "") or "").strip()
+        detail = stderr or (
+            f"ffprobe exited with code {returncode}"
+            if returncode
+            else "ffprobe returned no video stream information"
+        )
+        raise RuntimeError(detail)
+
+    return parse_ffprobe_quality_output(
+        stdout,
+        target_quality=target_quality,
+        motion_cap_fps=motion_cap_fps,
+    )

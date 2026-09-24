@@ -387,6 +387,85 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("First seen 10:00",coord.render_dashboard(first,()))
         self.assertIn("First seen 10:00",coord.render_dashboard(second,()))
 
+    def test_header_keeps_each_target_on_one_logical_line(self):
+        now=datetime(2026,9,24,17,28,57)
+        t=target(
+            name="Asian Games",
+            primary=("Presidents cup",),
+            rejected=(("TAM","Tamil"),),
+            preferred=(("ENG","English"),),
+        )
+        window=coord.CoordinatorWindow("ACTIVE",now,None)
+        snap=coord.build_snapshot(
+            (coord.TargetView(t,"ACTIVE",now,None),),
+            {"Asian Games":()},
+            coordinator_window=window,
+            now=now,
+        )
+        rendered=coord.render_dashboard(
+            snap,
+            (),
+            config_path=Path("recorder_dynamic_user_config.py"),
+            refresh_interval_sec=300,
+        )
+        target_lines=[line for line in rendered.splitlines() if line.startswith("Target 1")]
+        self.assertEqual(len(target_lines),1)
+        self.assertIn("Asian Games | MANUAL | ACTIVE until stopped",target_lines[0])
+        self.assertIn("Search: Presidents cup",target_lines[0])
+        self.assertIn("exclude: (TAM OR Tamil)",target_lines[0])
+        self.assertIn("prefer: (ENG OR English)",target_lines[0])
+        self.assertIn("Sources: SONYLIV_EVENTS",target_lines[0])
+        self.assertNotIn("Mode         :",rendered)
+        self.assertNotIn("mode=inspect",rendered)
+        self.assertIn("End: until stopped",rendered)
+
+    def test_compact_source_name_preserves_github_provenance(self):
+        self.assertEqual(
+            coord.compact_source_name(
+                "https://raw.githubusercontent.com/user/repo/refs/heads/main/path/fancode.m3u"
+            ),
+            "github:user/repo@main/path/fancode.m3u",
+        )
+        self.assertEqual(
+            coord.compact_source_name(
+                "https://premiumplugx.com//VIP/pluglist.php"
+            ),
+            "premiumplugx.com/VIP/pluglist.php",
+        )
+
+    def test_initial_context_callback_runs_before_acquisition(self):
+        order=[]
+        now=datetime(2026,9,24,10,0,0)
+
+        class FakeState:
+            raw_config={}
+            def reload(self, value):
+                return (), False
+            def coordinator_window(self, value):
+                return coord.CoordinatorWindow("ACTIVE",value,None)
+            def target_views(self, value, *, coordinator_active=True):
+                return (view(now=value),)
+
+        def context(snapshot):
+            order.append("header")
+        def acquire(*args, **kwargs):
+            order.append("acquire")
+            return {"T":()}, ()
+
+        with patch.object(coord,"acquire_active_targets",side_effect=acquire):
+            coord.run_once(FakeState(),None,context_callback=context)
+        self.assertEqual(order[:2],["header","acquire"])
+
+    def test_nextpvr_reference_palette_is_used_for_event_and_marker(self):
+        snap=snapshot([sony_candidate()])
+        rendered=coord.render_dashboard(
+            snap,
+            (coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,next(iter(snap.blocks))[1]),("x",),True),),
+            use_color=True,
+        )
+        self.assertIn("\033[38;2;41;159;214mAsian Games\033[0m",rendered)
+        self.assertIn("\033[38;2;255;135;3m[NEW]\033[0m",rendered)
+
     def test_coordinator_notification_uses_softer_two_note_pattern(self):
         event=coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,"id"),("appeared",),beep=True)
         with patch("recorder_coordinator.terminal.winsound") as sound:

@@ -14,6 +14,7 @@ from recorder_source.discovery import (
     parse_playlist_text,
     probe_candidate_hls,
 )
+from recorder_source.quality import parse_ffprobe_quality_output
 from recorder_source.matching import (
     build_match_groups,
     evaluate_match,
@@ -393,6 +394,71 @@ https://cdn.test/live.mpd
         self.assertTrue(out.launchable)
         self.assertEqual(out.stream_type, "DASH")
         self.assertEqual((out.video_width, out.video_height, out.video_fps), (1920, 1080, 50.0))
+
+    def test_probe_hls_fills_missing_fps_from_shared_ffprobe(self):
+        body = b'''#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3322000,RESOLUTION=1920x1080\nvideo.m3u8\n'''
+        class Headers:
+            def get(self, name, default=None):
+                return "application/vnd.apple.mpegurl"
+        class Response:
+            headers = Headers()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1): return body
+            def geturl(self): return "https://final.test/master.m3u8"
+
+        ffprobe = {
+            "quality_known": True,
+            "video_width": 1920,
+            "video_height": 1080,
+            "video_fps": 50.0,
+            "video_bitrate_bps": 3322000,
+            "video_scan_type": "progressive",
+        }
+        with patch("recorder_source.discovery.urlopen", return_value=Response()), patch(
+            "recorder_source.discovery.probe_stream_quality_ffprobe",
+            return_value=ffprobe,
+        ) as probe:
+            out = probe_candidate_hls(
+                candidate(
+                    stream_url="https://src.test/master.m3u8",
+                    extra={"provider":"FANCODE"},
+                )
+            )
+        probe.assert_called_once()
+        self.assertEqual(out.video_fps, 50.0)
+        self.assertEqual(out.extra["video_fps_source"], "ffprobe")
+        self.assertEqual(out.extra["quality_source"], "manifest+ffprobe")
+
+    def test_shared_ffprobe_parser_uses_same_quality_ranking(self):
+        payload = json.dumps({
+            "streams": [
+                {
+                    "index": 0,
+                    "width": 1920,
+                    "height": 1080,
+                    "avg_frame_rate": "25/1",
+                    "bit_rate": "5000000",
+                    "field_order": "progressive",
+                },
+                {
+                    "index": 1,
+                    "width": 1920,
+                    "height": 1080,
+                    "avg_frame_rate": "50/1",
+                    "bit_rate": "4000000",
+                    "field_order": "progressive",
+                },
+            ],
+            "format": {},
+        })
+        quality = parse_ffprobe_quality_output(
+            payload,
+            target_quality={"video_width":1920,"video_height":1080},
+            motion_cap_fps=50,
+        )
+        self.assertEqual(quality["video_fps"], 50.0)
+        self.assertEqual(quality["_ffprobe_stream_index"], 1)
 
     def test_probe_http_403_is_access_blocked(self):
         error = HTTPError("https://x", 403, "Forbidden", {}, None)

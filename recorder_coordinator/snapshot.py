@@ -29,11 +29,26 @@ PROVIDER_SELECTION_POLICY = PROVIDER_SELECTION_POLICIES
 
 
 def compact_source_name(url: str) -> str:
+    """Keep source provenance recognizable without query/token noise."""
     try:
         parsed = urlsplit(url)
-        path = parsed.path.rstrip("/")
-        tail = "/".join(path.split("/")[-3:])
-        return f"{parsed.netloc}/{tail}" if tail else parsed.netloc
+        host = parsed.netloc
+        parts = [part for part in parsed.path.split("/") if part]
+        if host.casefold() == "raw.githubusercontent.com" and len(parts) >= 3:
+            owner, repo = parts[0], parts[1]
+            rest = parts[2:]
+            branch = ""
+            if len(rest) >= 3 and rest[0:2] == ["refs", "heads"]:
+                branch = rest[2]
+                rest = rest[3:]
+            elif rest:
+                branch = rest[0]
+                rest = rest[1:]
+            suffix = "/".join(rest)
+            branch_text = f"@{branch}" if branch else ""
+            return f"github:{owner}/{repo}{branch_text}/{suffix}".rstrip("/")
+        suffix = "/".join(parts)
+        return f"{host}/{suffix}".rstrip("/") if suffix else host
     except Exception:
         return url
 

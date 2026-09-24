@@ -34,40 +34,53 @@ def _terminal_is_interactive() -> bool:
         return False
 
 
-def _paint(text: str, code: str, use_color: bool) -> str:
-    return f"\033[{code}m{text}\033[0m" if use_color else text
+# Palette sampled from the user's NextPVR reference and deliberately kept soft.
+_EVENT_RGB = (41, 159, 214)       # #299FD6
+_MARKER_RGB = (255, 135, 3)       # #FF8703
+_SECONDARY_RGB = (176, 176, 176)
+_MUTED_RGB = (118, 118, 118)
+_IDENTITY_RGB = (145, 153, 160)
+_ERROR_RGB = (224, 82, 82)
+_IMPORTANT_RGB = (220, 220, 220)
+
+
+def _paint_rgb(text: str, rgb: Tuple[int, int, int], use_color: bool) -> str:
+    if not use_color:
+        return text
+    red, green, blue = rgb
+    return f"\033[38;2;{red};{green};{blue}m{text}\033[0m"
 
 
 def _marker(text: str, use_color: bool) -> str:
-    return _paint(text, "1;93", use_color)
+    return _paint_rgb(text, _MARKER_RGB, use_color)
 
 
 def _event_title(text: str, use_color: bool) -> str:
-    return _paint(text, "1;96", use_color)
+    return _paint_rgb(text, _EVENT_RGB, use_color)
 
 
 def _identity_text(text: str, use_color: bool) -> str:
-    return _paint(text, "94", use_color)
+    return _paint_rgb(text, _IDENTITY_RGB, use_color)
 
 
 def _group_text(text: str, use_color: bool) -> str:
-    return _paint(text, "94", use_color)
+    return _paint_rgb(text, _IDENTITY_RGB, use_color)
 
 
 def _important_text(text: str, use_color: bool) -> str:
-    return _paint(text, "97", use_color)
+    return _paint_rgb(text, _IMPORTANT_RGB, use_color)
 
 
 def _secondary_text(text: str, use_color: bool) -> str:
-    return _paint(text, "37", use_color)
+    return _paint_rgb(text, _SECONDARY_RGB, use_color)
 
 
 def _muted_text(text: str, use_color: bool) -> str:
-    return _paint(text, "90", use_color)
+    return _paint_rgb(text, _MUTED_RGB, use_color)
 
 
 def _off_text(text: str, use_color: bool) -> str:
-    return _paint(text, "1;91", use_color)
+    return _paint_rgb(text, _ERROR_RGB, use_color)
 
 
 def _phrase_group_text(value: object) -> str:
@@ -108,14 +121,92 @@ def _target_search_text(target: IdentityTarget) -> str:
     return " | ".join([primary] + extras)
 
 
-def _view_timing(view: TargetView) -> str:
+def _target_status_text(view: TargetView) -> str:
+    if view.status == "ACTIVE":
+        if view.active_until is None:
+            return "ACTIVE until stopped"
+        return f"ACTIVE until {view.active_until:%Y-%m-%d %H:%M:%S}"
     if view.status == "SCHEDULED" and view.active_from is not None:
-        return f" | starts {view.active_from:%Y-%m-%d %H:%M:%S}"
-    if view.status == "ACTIVE" and view.active_until is not None:
-        return f" | active until {view.active_until:%Y-%m-%d %H:%M:%S}"
+        text = f"SCHEDULED from {view.active_from:%Y-%m-%d %H:%M:%S}"
+        if view.active_until is not None:
+            text += f" until {view.active_until:%Y-%m-%d %H:%M:%S}"
+        return text
     if view.status == "EXPIRED" and view.active_until is not None:
-        return f" | ended {view.active_until:%Y-%m-%d %H:%M:%S}"
-    return ""
+        return f"EXPIRED at {view.active_until:%Y-%m-%d %H:%M:%S}"
+    if view.status == "WAITING_COORDINATOR":
+        return "WAITING for coordinator"
+    return view.status
+
+
+def _coordinator_status_text(snapshot: DashboardSnapshot) -> str:
+    window = snapshot.coordinator_window
+    if window is None:
+        return "status unavailable"
+    if window.status == "WAITING":
+        text = f"WAITING | Starts: {window.active_from:%Y-%m-%d %H:%M:%S}"
+        if window.active_until is not None:
+            text += f" | End: {window.active_until:%Y-%m-%d %H:%M:%S}"
+        return text
+    if window.status == "ACTIVE":
+        end_text = (
+            f"{window.active_until:%Y-%m-%d %H:%M:%S}"
+            if window.active_until is not None
+            else "until stopped"
+        )
+        return (
+            f"ACTIVE | Started: {window.active_from:%Y-%m-%d %H:%M:%S} "
+            f"| End: {end_text}"
+        )
+    if window.status == "EXPIRED":
+        end_text = (
+            f"{window.active_until:%Y-%m-%d %H:%M:%S}"
+            if window.active_until is not None
+            else "unknown"
+        )
+        return (
+            f"EXPIRED | Started: {window.active_from:%Y-%m-%d %H:%M:%S} "
+            f"| End: {end_text}"
+        )
+    return window.status
+
+
+def _header_lines(
+    snapshot: DashboardSnapshot,
+    *,
+    config_path: Optional[Path],
+    refresh_interval_sec: Optional[float],
+) -> List[str]:
+    lines = ["RECORDER EVENT COORDINATOR"]
+    if config_path is not None:
+        lines.append(f"Config       : {Path(config_path).name}")
+    if refresh_interval_sec is not None:
+        lines.append(f"Refresh      : every {refresh_interval_sec:g}s + manual r")
+    if snapshot.coordinator_window is not None:
+        lines.append(f"Coordinator : {_coordinator_status_text(snapshot)}")
+
+    for index, view in enumerate(snapshot.target_views, start=1):
+        target = view.target
+        lines.append(
+            f"Target {index:<2}    : {target.name} | {target.policy} | "
+            f"{_target_status_text(view)} | Search: {_target_search_text(target)} "
+            f"| Sources: {', '.join(target.source_groups) or '-'}"
+        )
+    return lines
+
+
+def render_header(
+    snapshot: DashboardSnapshot,
+    *,
+    config_path: Optional[Path] = None,
+    refresh_interval_sec: Optional[float] = None,
+) -> str:
+    return "\n".join(
+        _header_lines(
+            snapshot,
+            config_path=config_path,
+            refresh_interval_sec=refresh_interval_sec,
+        )
+    )
 
 
 def _quality_key(candidate) -> Tuple[int, int, float, int, str]:
@@ -172,36 +263,15 @@ def render_dashboard(
     color = _terminal_is_interactive() if use_color is None else bool(use_color)
     identity_events, source_events, quality_events = _event_maps(events)
 
-    lines: List[str] = []
-    lines.append("RECORDER EVENT COORDINATOR")
-    if config_path is not None:
-        lines.append(f"Config       : {Path(config_path).name}")
-    if refresh_interval_sec is not None:
-        lines.append(f"Refresh      : every {refresh_interval_sec:g}s + manual r")
-    lines.append("Mode         : inspect / watch")
-
-    if snapshot.coordinator_window is not None:
-        window = snapshot.coordinator_window
-        timing = f" from {window.active_from:%Y-%m-%d %H:%M:%S}"
-        if window.active_until is not None:
-            timing += f" until {window.active_until:%Y-%m-%d %H:%M:%S}"
-        lines.append(f"Coordinator  : {window.status}{timing}")
-
-    for index, view in enumerate(snapshot.target_views, start=1):
-        lines.append(
-            f"Target {index:<2}    : {view.target.name} | {view.target.policy} | "
-            f"{view.status}{_view_timing(view)}"
-        )
-        lines.append(f"               Search: {_target_search_text(view.target)}")
-        lines.append(
-            f"               Sources: {', '.join(view.target.source_groups) or '-'}"
-        )
+    lines: List[str] = _header_lines(
+        snapshot,
+        config_path=config_path,
+        refresh_interval_sec=refresh_interval_sec,
+    )
 
     lines.append("")
     lines.append("=" * 88)
-    lines.append(
-        f"EVENT WATCH  {snapshot.created_at:%Y-%m-%d %H:%M:%S}  mode=inspect"
-    )
+    lines.append(f"EVENT WATCH  {snapshot.created_at:%Y-%m-%d %H:%M:%S}")
     lines.append(
         f"{_provider_summary(snapshot)} | identity blocks={len(snapshot.blocks)}"
     )
@@ -236,8 +306,13 @@ def render_dashboard(
                 else serialized
             )
             identity_marker = _marker_text(identity_events.get(block_key, ()), color)
+            state_label = (
+                _important_text(block.overall_state, color)
+                if block.overall_state == "AVAILABLE"
+                else _off_text(block.overall_state, color)
+            )
             lines.append(
-                f"{identity_marker}[{index}] {block.overall_state} {block.identity.provider} "
+                f"{identity_marker}[{index}] {state_label} {block.identity.provider} "
                 f"| Identity: {_identity_text(identity_value, color)} "
                 f"| Targets: {', '.join(block.target_names)} "
                 f"| Sources: {len(block.observations)}"
@@ -290,8 +365,13 @@ def render_dashboard(
                         for event in quality_events.get(block_key, ())
                     )
                 suffix_text = " " + " ".join(suffix) if suffix else ""
+                quality_display = (
+                    _off_text(quality_label, color)
+                    if quality_label == "no working candidate"
+                    else _important_text(quality_label, color)
+                )
                 lines.append(
-                    f"    Quality : {_important_text(quality_label, color)}{suffix_text}"
+                    f"    Quality : {quality_display}{suffix_text}"
                 )
                 if block.best_candidate is not None and quality_key == best_key:
                     for event in quality_events.get(block_key, ()):
@@ -321,7 +401,7 @@ def render_dashboard(
                     trailing_state = (
                         ""
                         if state_text == "WORKING"
-                        else " | " + _muted_text(state_text, color)
+                        else " | " + _off_text(state_text, color)
                     )
                     lines.append(
                         "        "

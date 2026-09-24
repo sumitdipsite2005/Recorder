@@ -61,6 +61,7 @@ from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 from recorder_source import discovery as source_discovery
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
+from recorder_source import quality as source_quality
 from recorder_source.models import (
     SelectionDecision,
     SelectionPolicy,
@@ -10192,28 +10193,11 @@ def _ffprobe_nm3u8dl_stream_quality(
     decryption_key: str = "",
     target_quality: Optional[dict] = None,
 ) -> Optional[dict]:
-    command = ["ffprobe", "-v", "error"]
-
-    if headers:
-        header_blob = "".join(
-            f"{name}: {value}\r\n"
-            for name, value in headers.items()
-        )
-        command.extend(["-headers", header_blob])
-
-    if decryption_key:
-        command.extend(["-decryption_key", decryption_key])
-
-    command.extend([
-        "-select_streams", "v",
-        "-show_entries",
-        (
-            "stream=index,codec_name,width,height,avg_frame_rate,r_frame_rate,"
-            "bit_rate,field_order:format=bit_rate"
-        ),
-        "-of", "json",
+    command = source_quality.build_ffprobe_quality_command(
         stream_url,
-    ])
+        headers,
+        decryption_key=decryption_key,
+    )
 
     parsed_url = urlparse(stream_url)
     probe_identity = (
@@ -10234,77 +10218,19 @@ def _ffprobe_nm3u8dl_stream_quality(
     if not stdout:
         raise RuntimeError(_summarize_nm3u8dl_ffprobe_failure(result))
 
-    data = json.loads(stdout)
-    format_bitrate = int((data.get("format") or {}).get("bit_rate") or 0)
-    qualities = []
-
-    for stream in data.get("streams") or []:
-        width = int(stream.get("width") or 0)
-        height = int(stream.get("height") or 0)
-        fps = _parse_nm3u8dl_frame_rate(stream.get("avg_frame_rate"))
-        if fps <= 0:
-            fps = _parse_nm3u8dl_frame_rate(stream.get("r_frame_rate"))
-
-        stream_bitrate = int(stream.get("bit_rate") or 0)
-        bitrate = stream_bitrate or format_bitrate
-        bitrate_source = (
-            "stream" if stream_bitrate > 0
-            else "format" if format_bitrate > 0
-            else ""
+    try:
+        best_quality = source_quality.parse_ffprobe_quality_output(
+            stdout,
+            target_quality=target_quality,
+            motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
         )
+    except Exception as error:
+        raise RuntimeError(
+            f"ffprobe quality output could not be parsed ({type(error).__name__}: {error})"
+        ) from error
 
-        field_order = str(stream.get("field_order") or "").strip().casefold()
-        if field_order == "progressive":
-            scan_type = "progressive"
-        elif field_order in {"tt", "bb", "tb", "bt"}:
-            scan_type = "interlaced"
-        else:
-            scan_type = ""
-
-        qualities.append({
-            "quality_known": bool(
-                fps > 0 or (width > 0 and height > 0) or bitrate > 0
-            ),
-            "video_fps": fps,
-            "video_width": width,
-            "video_height": height,
-            "video_scan_type": scan_type,
-            "video_scan_type_source": "ffprobe" if scan_type else "",
-            "video_bitrate_bps": bitrate,
-            "video_bitrate_source": bitrate_source,
-            "_ffprobe_stream_index": int(stream.get("index") or 0),
-            "_ffprobe_codec_name": str(stream.get("codec_name") or "").strip(),
-        })
-
-    if not qualities:
+    if not best_quality:
         raise RuntimeError(_summarize_nm3u8dl_ffprobe_failure(result))
-
-    target = target_quality or {}
-    target_width = int(target.get("video_width") or 0)
-    target_height = int(target.get("video_height") or 0)
-    target_fps = float(target.get("video_fps") or 0.0)
-
-    matched_qualities = []
-    for item in qualities:
-        if target_width > 0 and target_height > 0:
-            if (
-                int(item.get("video_width") or 0) != target_width
-                or int(item.get("video_height") or 0) != target_height
-            ):
-                continue
-        if target_fps > 0:
-            item_fps = float(item.get("video_fps") or 0.0)
-            if item_fps <= 0 or abs(item_fps - target_fps) > 0.05:
-                continue
-        matched_qualities.append(item)
-
-    best_quality = max(
-        matched_qualities or qualities,
-        key=_nm3u8dl_video_quality_rank,
-    )
-    best_quality["_ffprobe_target_match_count"] = (
-        len(matched_qualities) if target_quality else len(qualities)
-    )
 
     if (
         sample_missing_bitrate

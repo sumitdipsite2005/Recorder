@@ -44,6 +44,7 @@ from recorder_coordinator.terminal import (
     clear_dashboard_terminal,
     clear_live_status_line,
     render_dashboard,
+    render_header,
     retire_live_status_after_user_command,
     set_live_status_line,
     update_display_order,
@@ -689,6 +690,7 @@ def run_once(
     previous: Optional[DashboardSnapshot],
     *,
     progress_callback: Optional[Callable[[str], None]] = None,
+    context_callback: Optional[Callable[[DashboardSnapshot], None]] = None,
     first_seen_registry: Optional[Dict[Tuple[str, str, str, str, str], datetime]] = None,
 ) -> Tuple[DashboardSnapshot, Tuple[ChangeEvent, ...]]:
     now = datetime.now()
@@ -699,6 +701,15 @@ def run_once(
         coordinator_active=(window.status == "ACTIVE"),
     )
     raw = config_state.raw_config or {}
+    if context_callback is not None:
+        context_callback(
+            DashboardSnapshot(
+                created_at=now,
+                target_views=tuple(target_views),
+                coordinator_window=window,
+                blocks={},
+            )
+        )
     if window.status == "ACTIVE":
         candidates_by_target, source_errors = acquire_active_targets(
             raw,
@@ -813,10 +824,26 @@ def run(config_path: Path, *, once: bool = False) -> int:
             now_monotonic = time.monotonic()
             if force_refresh or now_monotonic >= next_refresh_monotonic:
                 try:
+                    def show_initial_header(preview: DashboardSnapshot) -> None:
+                        clear_live_status_line()
+                        clear_dashboard_terminal()
+                        print(
+                            render_header(
+                                preview,
+                                config_path=config_path,
+                                refresh_interval_sec=state.refresh_interval_sec,
+                            )
+                        )
+
                     snapshot, events = run_once(
                         state,
                         previous,
                         progress_callback=(None if once else set_live_status_line),
+                        context_callback=(
+                            show_initial_header
+                            if previous is None and not once
+                            else None
+                        ),
                         first_seen_registry=first_seen_registry,
                     )
                 except KeyboardInterrupt:

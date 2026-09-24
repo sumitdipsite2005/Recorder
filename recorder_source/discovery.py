@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 from .matching import evaluate_match
+from .quality import probe_stream_quality_ffprobe
 from .models import (
     PlaylistSourceSpec,
     SourceAcquisitionRequest,
@@ -747,6 +748,67 @@ def probe_candidate_hls(
         is_playlist = bool(is_hls or is_dash)
         expired_now = expiry is not None and expiry <= time.time()
         launchable = bool(is_playlist and not unsupported_drm and not expired_now)
+
+        quality_source = "manifest" if quality_known else ""
+        video_fps_source = "manifest" if fps > 0 else ""
+        ffprobe_failure = ""
+        manifest_complete = bool(
+            fps > 0
+            and width > 0
+            and height > 0
+            and bitrate > 0
+        )
+        if launchable and not manifest_complete:
+            try:
+                ffprobe_quality = probe_stream_quality_ffprobe(
+                    final_url or candidate.stream_url,
+                    headers,
+                    timeout_sec=min(20.0, max(1.0, float(timeout_sec))),
+                    target_quality={
+                        "video_width": width,
+                        "video_height": height,
+                        "video_fps": fps,
+                    },
+                    motion_cap_fps=50.0,
+                )
+                if ffprobe_quality:
+                    ffprobe_fps = float(ffprobe_quality.get("video_fps") or 0.0)
+                    if fps <= 0 and ffprobe_fps > 0:
+                        fps = ffprobe_fps
+                        video_fps_source = "ffprobe"
+
+                    ffprobe_width = int(ffprobe_quality.get("video_width") or 0)
+                    ffprobe_height = int(ffprobe_quality.get("video_height") or 0)
+                    if width <= 0 and ffprobe_width > 0:
+                        width = ffprobe_width
+                    if height <= 0 and ffprobe_height > 0:
+                        height = ffprobe_height
+
+                    ffprobe_bitrate = int(
+                        ffprobe_quality.get("video_bitrate_bps") or 0
+                    )
+                    if bitrate <= 0 and ffprobe_bitrate > 0:
+                        bitrate = ffprobe_bitrate
+
+                    ffprobe_scan_type = str(
+                        ffprobe_quality.get("video_scan_type") or ""
+                    ).strip()
+                    if not scan_type and ffprobe_scan_type:
+                        scan_type = ffprobe_scan_type
+
+                    quality_known = bool(
+                        fps > 0
+                        or (width > 0 and height > 0)
+                        or bitrate > 0
+                    )
+                    quality_source = (
+                        "manifest+ffprobe" if quality_source else "ffprobe"
+                    )
+            except Exception as error:
+                # Availability is already proven by the manifest request. A
+                # quality fallback failure must not turn a working source OFF.
+                ffprobe_failure = f"{type(error).__name__}: {error}"
+
         probe_status = (
             "expired" if expired_now else "working" if launchable else "unsupported"
         )
@@ -775,7 +837,13 @@ def probe_candidate_hls(
                 if not is_playlist
                 else ""
             ),
-            extra={**dict(candidate.extra), "manifest_final_url": final_url},
+            extra={
+                **dict(candidate.extra),
+                "manifest_final_url": final_url,
+                "quality_source": quality_source,
+                "video_fps_source": video_fps_source,
+                "ffprobe_probe_failure": ffprobe_failure,
+            },
         )
     except HTTPError as error:
         blocked = int(getattr(error, "code", 0) or 0) in (401, 403, 451)
