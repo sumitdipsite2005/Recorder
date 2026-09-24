@@ -13,13 +13,15 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import queue
 import runpy
 import sys
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from recorder_coordinator.models import (
     ChangeEvent,
@@ -40,8 +42,12 @@ from recorder_coordinator.snapshot import (
 from recorder_coordinator.terminal import (
     beep,
     clear_dashboard_terminal,
+    clear_live_status_line,
     render_dashboard,
+    retire_live_status_after_user_command,
+    set_live_status_line,
     update_display_order,
+    watch_status_text,
     write_log,
 )
 from recorder_source.discovery import (
@@ -529,6 +535,8 @@ def _identity_serialized(candidate: SourceCandidate) -> str:
 def acquire_active_targets(
     raw_config: Mapping[str, object],
     target_views: Sequence[TargetView],
+    *,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[Dict[str, Tuple[SourceCandidate, ...]], Tuple[str, ...]]:
     active = [view for view in target_views if view.status == "ACTIVE"]
     if not active:
@@ -548,7 +556,17 @@ def acquire_active_targets(
     url_source_specs: Dict[str, PlaylistSourceSpec] = {}
     for spec in source_specs_by_key.values():
         url_source_specs.setdefault(spec.url, spec)
-    documents, fetch_errors, _ = fetch_playlist_documents(tuple(url_source_specs.values()))
+    source_specs = tuple(url_source_specs.values())
+    if progress_callback is not None:
+        progress_callback(f"Scanning playlists 0/{len(source_specs)}")
+    documents, fetch_errors, _ = fetch_playlist_documents(
+        source_specs,
+        progress_callback=(
+            (lambda done, total: progress_callback(f"Scanning playlists {done}/{total}"))
+            if progress_callback is not None
+            else None
+        ),
+    )
 
     parsed_by_key: Dict[Tuple[str, str, str], Tuple[SourceCandidate, ...]] = {}
     errors: List[str] = list(fetch_errors)
@@ -628,7 +646,17 @@ def acquire_active_targets(
     for candidates in raw_candidates_by_target.values():
         for candidate in candidates:
             unique_by_key.setdefault(_probe_key(candidate), candidate)
-    probed = probe_candidates(tuple(unique_by_key.values()))
+    probe_pool = tuple(unique_by_key.values())
+    if progress_callback is not None:
+        progress_callback(f"Checking candidates 0/{len(probe_pool)}")
+    probed = probe_candidates(
+        probe_pool,
+        progress_callback=(
+            (lambda done, total: progress_callback(f"Checking candidates {done}/{total}"))
+            if progress_callback is not None
+            else None
+        ),
+    )
     probed_by_key = {_probe_key(candidate): candidate for candidate in probed}
 
     final: Dict[str, Tuple[SourceCandidate, ...]] = {}
@@ -655,6 +683,9 @@ def acquire_active_targets(
 def run_once(
     config_state: CoordinatorConfigState,
     previous: Optional[DashboardSnapshot],
+    *,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    first_seen_registry: Optional[Dict[Tuple[str, str, str, str, str], datetime]] = None,
 ) -> Tuple[DashboardSnapshot, Tuple[ChangeEvent, ...]]:
     now = datetime.now()
     config_messages, _ = config_state.reload(now)
@@ -665,9 +696,17 @@ def run_once(
     )
     raw = config_state.raw_config or {}
     if window.status == "ACTIVE":
-        candidates_by_target, source_errors = acquire_active_targets(raw, target_views)
+        candidates_by_target, source_errors = acquire_active_targets(
+            raw,
+            target_views,
+            progress_callback=progress_callback,
+        )
     else:
         candidates_by_target, source_errors = {}, ()
+
+    if progress_callback is not None:
+        progress_callback("Building identities...")
+
     snapshot = build_snapshot(
         target_views,
         candidates_by_target,
@@ -675,6 +714,7 @@ def run_once(
         config_messages=config_messages,
         coordinator_window=window,
         now=now,
+        first_seen_registry=first_seen_registry,
     )
     events = diff_snapshots(previous, snapshot)
     return snapshot, events
@@ -718,75 +758,204 @@ def next_watch_sleep_seconds(
     return min(delays)
 
 
+def _command_reader(
+    command_queue: "queue.Queue[str]",
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            value = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        command_queue.put(value)
+
+
+def _has_visible_transient(
+    snapshot: DashboardSnapshot,
+    events: Sequence[ChangeEvent],
+) -> bool:
+    if snapshot.config_messages:
+        return True
+    return any(
+        event.marker not in {"REMOVED", "SOURCE-"}
+        for event in events
+    )
+
+
 def run(config_path: Path, *, once: bool = False) -> int:
     state = CoordinatorConfigState(config_path)
     previous: Optional[DashboardSnapshot] = None
     display_order: Dict[str, List[str]] = {POLICY_ALL: [], POLICY_MANUAL: []}
+    first_seen_registry: Dict[Tuple[str, str, str, str, str], datetime] = {}
     started = datetime.now()
     log_path = Path.cwd() / f"IDENTITY_COORDINATOR_{started:%Y%m%d_%H%M%S}.log"
 
-    while True:
-        try:
-            snapshot, events = run_once(state, previous)
-        except KeyboardInterrupt:
-            print("\nIdentity Coordinator stopped by user.")
-            return 0
-        except Exception as error:
-            message = f"Identity Coordinator scan failed: {type(error).__name__}: {error}"
-            print(message)
-            write_log(log_path, f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}")
-            if once:
-                return 1
-            time.sleep(max(5.0, float(state.refresh_interval_sec)))
-            continue
+    command_queue: "queue.Queue[str]" = queue.Queue()
+    stop_event = threading.Event()
+    if not once:
+        threading.Thread(
+            target=_command_reader,
+            args=(command_queue, stop_event),
+            daemon=True,
+        ).start()
 
-        errors_changed = previous is None or snapshot.source_errors != previous.source_errors
-        meaningful = (
-            previous is None
-            or bool(events)
-            or bool(snapshot.config_messages)
-            or errors_changed
-        )
-        display_order = update_display_order(display_order, snapshot)
-        if meaningful:
-            text = render_dashboard(snapshot, events, display_order)
-            clear_dashboard_terminal()
-            print(text)
-            print(f"\nLog: {log_path}")
-            write_log(log_path, text)
-            if events:
-                for event in events:
+    force_refresh = True
+    next_refresh_monotonic = 0.0
+    last_scan_wall_time: Optional[float] = None
+    dashboard_has_transient = False
+
+    try:
+        while not stop_event.is_set():
+            now_monotonic = time.monotonic()
+            if force_refresh or now_monotonic >= next_refresh_monotonic:
+                try:
+                    snapshot, events = run_once(
+                        state,
+                        previous,
+                        progress_callback=(None if once else set_live_status_line),
+                        first_seen_registry=first_seen_registry,
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception as error:
+                    clear_live_status_line()
+                    message = (
+                        f"Identity Coordinator scan failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    print(message)
                     write_log(
                         log_path,
-                        (
-                            f"CHANGE {event.marker} {event.block_key[1]} :: "
-                            f"{'; '.join(event.details)}"
-                        ),
+                        f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}",
                     )
-            beep(events)
-        else:
-            print(f"{datetime.now():%H:%M:%S} Watch scan complete — no meaningful change")
+                    if once:
+                        return 1
+                    next_refresh_monotonic = (
+                        time.monotonic() + max(5.0, float(state.refresh_interval_sec))
+                    )
+                    last_scan_wall_time = time.time()
+                    force_refresh = False
+                    set_live_status_line(
+                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                    )
+                    continue
 
-        previous = snapshot
-        if (
-            snapshot.coordinator_window is not None
-            and snapshot.coordinator_window.status == "EXPIRED"
-        ):
-            print("Identity Coordinator schedule complete.")
-            return 0
-        if once:
-            return 0
+                errors_changed = (
+                    previous is None
+                    or snapshot.source_errors != previous.source_errors
+                )
+                header_changed = (
+                    previous is None
+                    or snapshot.target_views != previous.target_views
+                    or snapshot.coordinator_window != previous.coordinator_window
+                )
+                meaningful = (
+                    previous is None
+                    or bool(events)
+                    or bool(snapshot.config_messages)
+                    or errors_changed
+                    or header_changed
+                )
+                clear_transient_only = (not meaningful) and dashboard_has_transient
 
-        sleep_for = next_watch_sleep_seconds(
-            snapshot,
-            state.refresh_interval_sec,
-            now=datetime.now(),
-        )
-        try:
-            time.sleep(sleep_for)
-        except KeyboardInterrupt:
-            print("\nIdentity Coordinator stopped by user.")
-            return 0
+                display_order = update_display_order(display_order, snapshot)
+                if meaningful or clear_transient_only:
+                    clear_live_status_line()
+                    terminal_events = events if meaningful else ()
+                    terminal_text = render_dashboard(
+                        snapshot,
+                        terminal_events,
+                        display_order,
+                        config_path=config_path,
+                        refresh_interval_sec=state.refresh_interval_sec,
+                        use_color=True,
+                    )
+                    clear_dashboard_terminal()
+                    print(terminal_text)
+
+                    if meaningful:
+                        log_text = render_dashboard(
+                            snapshot,
+                            terminal_events,
+                            display_order,
+                            config_path=config_path,
+                            refresh_interval_sec=state.refresh_interval_sec,
+                            use_color=False,
+                        )
+                        write_log(log_path, log_text)
+                        for event in events:
+                            write_log(
+                                log_path,
+                                (
+                                    f"CHANGE {event.marker} {event.block_key[1]} :: "
+                                    f"{'; '.join(event.details)}"
+                                ),
+                            )
+                        beep(events)
+
+                    dashboard_has_transient = (
+                        _has_visible_transient(snapshot, terminal_events)
+                        if meaningful
+                        else False
+                    )
+
+                previous = snapshot
+                if (
+                    snapshot.coordinator_window is not None
+                    and snapshot.coordinator_window.status == "EXPIRED"
+                ):
+                    clear_live_status_line()
+                    print("Identity Coordinator schedule complete.")
+                    return 0
+                if once:
+                    return 0
+
+                last_scan_wall_time = time.time()
+                sleep_for = next_watch_sleep_seconds(
+                    snapshot,
+                    state.refresh_interval_sec,
+                    now=datetime.now(),
+                )
+                next_refresh_monotonic = time.monotonic() + sleep_for
+                force_refresh = False
+                set_live_status_line(
+                    watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                )
+
+            timeout = max(
+                0.1,
+                min(0.5, next_refresh_monotonic - time.monotonic()),
+            )
+            try:
+                command = command_queue.get(timeout=timeout)
+            except queue.Empty:
+                if next_refresh_monotonic > 0:
+                    set_live_status_line(
+                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                    )
+                continue
+
+            retire_live_status_after_user_command()
+            normalized = " ".join(command.split()).casefold()
+            if normalized in {"r", "refresh"}:
+                force_refresh = True
+                continue
+
+            if normalized:
+                set_live_status_line(
+                    "Use r=refresh | Ctrl+C=exit"
+                )
+            elif next_refresh_monotonic > 0:
+                set_live_status_line(
+                    watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                )
+
+    except KeyboardInterrupt:
+        clear_live_status_line()
+        print("\nIdentity Coordinator stopped by user.")
+        return 0
+    finally:
+        stop_event.set()
 
 
 def parse_args(argv: Optional[Sequence[str]] = None):

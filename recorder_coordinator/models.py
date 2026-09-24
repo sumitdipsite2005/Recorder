@@ -71,6 +71,7 @@ class IdentityBlock:
     target_names: List[str] = field(default_factory=list)
     candidates: List[SourceCandidate] = field(default_factory=list)
     observations: Dict[str, SourceObservation] = field(default_factory=dict)
+    row_first_seen: Dict[Tuple[str, str, str, str], datetime] = field(default_factory=dict)
     best_candidate: Optional[SourceCandidate] = None
     overall_state: str = "UNUSABLE"
 
@@ -81,6 +82,7 @@ class ChangeEvent:
     block_key: Tuple[str, str]
     details: Tuple[str, ...]
     beep: bool = False
+    source_id: Optional[str] = None
 
 
 @dataclass

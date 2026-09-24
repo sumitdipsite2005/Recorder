@@ -14,7 +14,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlsplit
 from urllib.request import Request, urlopen
@@ -510,6 +510,7 @@ def fetch_playlist_documents(
     *,
     timeout_sec: float = 20.0,
     max_workers: int = 8,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[Mapping[str, str], Tuple[str, ...], Mapping[str, Mapping[str, object]]]:
     """Fetch all sources concurrently while preserving per-source diagnostics."""
     unique_sources: List[PlaylistSourceSpec] = []
@@ -544,12 +545,17 @@ def fetch_playlist_documents(
     ) as executor:
         future_map = {executor.submit(fetch_one, source): source for source in unique_sources}
         completed: Dict[str, object] = {}
+        completed_count = 0
         for future in as_completed(future_map):
             source = future_map[future]
             try:
                 completed[source.url] = future.result()
             except Exception as error:
                 completed[source.url] = error
+            finally:
+                completed_count += 1
+                if progress_callback is not None:
+                    progress_callback(completed_count, len(unique_sources))
 
     # Interpret in configured order so concurrency never changes visible ordering.
     for source in unique_sources:
@@ -800,6 +806,7 @@ def probe_candidates(
     *,
     timeout_sec: float = 15.0,
     max_workers: int = 8,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[SourceCandidate, ...]:
     if not candidates:
         return ()
@@ -814,6 +821,7 @@ def probe_candidates(
             executor.submit(probe_candidate_hls, candidate, timeout_sec=timeout_sec): index
             for index, candidate in enumerate(candidates)
         }
+        completed_count = 0
         for future in as_completed(future_map):
             index = future_map[future]
             try:
@@ -826,6 +834,10 @@ def probe_candidates(
                     probe_error=f"{type(error).__name__}: {error}",
                     reason="probe failed",
                 )
+            finally:
+                completed_count += 1
+                if progress_callback is not None:
+                    progress_callback(completed_count, len(candidates))
     return tuple(
         item if item is not None else candidates[index]
         for index, item in enumerate(result)

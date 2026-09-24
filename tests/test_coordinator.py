@@ -296,8 +296,105 @@ class SnapshotAndChangeTests(unittest.TestCase):
         snap=snapshot([sony_candidate()])
         rendered=coord.render_dashboard(snap,())
         self.assertIn("[ON] Asian Games",rendered)
-        self.assertIn("1920x1080",rendered)
-        self.assertIn("SONYLIV|lane:2120305/AG_Strea2309/ENG",rendered)
+        self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps",rendered)
+        self.assertIn("Identity: lane:2120305/AG_Strea2309/ENG",rendered)
+
+    def test_dashboard_header_shows_target_search_and_source_scope(self):
+        t=target(
+            name="Asian Games",
+            primary=("Asian Games",),
+            required=("ENG",),
+            rejected=("Highlights",),
+        )
+        snap=coord.build_snapshot(
+            (view(t),),
+            {"Asian Games":(sony_candidate(),)},
+            now=datetime(2026,9,24,10,0,0),
+        )
+        rendered=coord.render_dashboard(
+            snap,
+            (),
+            config_path=Path("recorder_dynamic_user_config.py"),
+            refresh_interval_sec=300,
+        )
+        self.assertIn("RECORDER EVENT COORDINATOR",rendered)
+        self.assertIn("Target 1",rendered)
+        self.assertIn("Asian Games | MANUAL | ACTIVE",rendered)
+        self.assertIn("Search: Asian Games | required: ENG | exclude: Highlights",rendered)
+        self.assertIn("Sources: SONYLIV_EVENTS",rendered)
+
+    def test_dashboard_groups_quality_variants_under_one_identity(self):
+        a=sony_candidate(playlist="https://one/list",source_name="one",fps=50)
+        b=sony_candidate(playlist="https://two/list",source_name="two",fps=25)
+        snap=snapshot([a,b])
+        rendered=coord.render_dashboard(snap,())
+        self.assertEqual(rendered.count("Quality : 1920x1080"),2)
+        self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps [BEST]",rendered)
+        self.assertIn("Quality : 1920x1080 | 25p | 5000 Kbps",rendered)
+        self.assertEqual(rendered.count("[ON] Asian Games"),2)
+
+    def test_source_plus_marker_is_on_added_source_row_only(self):
+        old=snapshot([sony_candidate(playlist="https://one/list",source_name="one")])
+        new=snapshot([
+            sony_candidate(playlist="https://one/list",source_name="one"),
+            sony_candidate(playlist="https://two/list",source_name="two"),
+        ])
+        events=coord.diff_snapshots(old,new)
+        rendered=coord.render_dashboard(new,events)
+        identity_line=next(line for line in rendered.splitlines() if "Identity:" in line)
+        self.assertNotIn("[SOURCE+]",identity_line)
+        source_lines=[line for line in rendered.splitlines() if "[ON]" in line]
+        self.assertEqual(sum("[SOURCE+]" in line for line in source_lines),1)
+
+    def test_update_marker_is_on_changed_source_row_with_delta(self):
+        old=snapshot([sony_candidate(title="Shooting")])
+        new=snapshot([sony_candidate(title="Athletics")])
+        events=coord.diff_snapshots(old,new)
+        rendered=coord.render_dashboard(new,events)
+        identity_line=next(line for line in rendered.splitlines() if "Identity:" in line)
+        self.assertNotIn("[UPDATE]",identity_line)
+        self.assertIn("[UPDATE] [ON] Athletics",rendered)
+        self.assertIn("Event Shooting -> Athletics",rendered)
+
+    def test_source_minus_is_not_a_live_dashboard_marker(self):
+        old=snapshot([
+            sony_candidate(playlist="https://one/list",source_name="one"),
+            sony_candidate(playlist="https://two/list",source_name="two"),
+        ])
+        new=snapshot([sony_candidate(playlist="https://one/list",source_name="one")])
+        events=coord.diff_snapshots(old,new)
+        rendered=coord.render_dashboard(new,events)
+        self.assertNotIn("[SOURCE-]",rendered)
+        self.assertNotIn("two",rendered)
+
+    def test_first_seen_survives_unchanged_refresh(self):
+        registry={}
+        t1=datetime(2026,9,24,10,0,0)
+        t2=datetime(2026,9,24,10,5,0)
+        c=sony_candidate()
+        first=coord.build_snapshot(
+            (view(now=t1),),
+            {"T":(c,)},
+            now=t1,
+            first_seen_registry=registry,
+        )
+        second=coord.build_snapshot(
+            (view(now=t2),),
+            {"T":(c,)},
+            now=t2,
+            first_seen_registry=registry,
+        )
+        self.assertIn("First seen 10:00",coord.render_dashboard(first,()))
+        self.assertIn("First seen 10:00",coord.render_dashboard(second,()))
+
+    def test_coordinator_notification_uses_softer_two_note_pattern(self):
+        event=coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,"id"),("appeared",),beep=True)
+        with patch("recorder_coordinator.terminal.winsound") as sound:
+            coord.beep((event,))
+        self.assertEqual(
+            [call.args for call in sound.Beep.call_args_list],
+            [(523,180),(659,320)],
+        )
 
     def test_display_order_keeps_existing_rows_stable_and_new_at_top(self):
         a=sony_candidate(lane="1/A/ENG")

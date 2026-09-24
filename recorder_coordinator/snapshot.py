@@ -7,6 +7,7 @@ rendering and terminal side effects live in recorder_coordinator.terminal.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
@@ -43,6 +44,16 @@ def _candidate_source_id(candidate: SourceCandidate) -> str:
 
 def _candidate_source_name(candidate: SourceCandidate) -> str:
     return str(candidate.extra.get("source_name") or compact_source_name(candidate.playlist_url))
+
+
+def candidate_row_key(candidate: SourceCandidate) -> Tuple[str, str, str, str]:
+    """Stable presentation key for one source/metadata row."""
+    return (
+        _candidate_source_id(candidate),
+        str(candidate.tvg_name or "").strip(),
+        str(candidate.group_title or "").strip(),
+        str(candidate.entry_title or "").strip(),
+    )
 
 
 def _candidate_observation_key(candidate: SourceCandidate) -> Tuple[object, ...]:
@@ -180,7 +191,10 @@ def build_snapshot(
     config_messages: Sequence[str] = (),
     coordinator_window: Optional[CoordinatorWindow] = None,
     now: Optional[datetime] = None,
+    first_seen_registry: Optional[Dict[Tuple[str, str, str, str, str], datetime]] = None,
 ) -> DashboardSnapshot:
+    current_time = now or datetime.now()
+    first_seen_registry = first_seen_registry if first_seen_registry is not None else {}
     blocks: Dict[Tuple[str, str], IdentityBlock] = {}
     target_by_name = {view.target.name: view.target for view in target_views}
 
@@ -226,11 +240,16 @@ def build_snapshot(
             source_id: _build_source_observation(source_id, candidates, block.identity.provider)
             for source_id, candidates in by_source.items()
         }
+        for candidate in block.candidates:
+            row_key = candidate_row_key(candidate)
+            global_key = (block.identity.serialized,) + row_key
+            first_seen = first_seen_registry.setdefault(global_key, current_time)
+            block.row_first_seen[row_key] = first_seen
         block.best_candidate = _best_candidate(block.candidates, block.identity.provider)
         block.overall_state = "AVAILABLE" if block.best_candidate is not None else "UNUSABLE"
 
     return DashboardSnapshot(
-        created_at=now or datetime.now(),
+        created_at=current_time,
         target_views=tuple(target_views),
         coordinator_window=coordinator_window,
         blocks=blocks,
@@ -282,6 +301,7 @@ def diff_snapshots(
                     key,
                     (f"source added: {new.observations[source_id].source_name}",),
                     beep=False,
+                    source_id=source_id,
                 )
             )
         for source_id in sorted(old_sources - new_sources):
@@ -291,47 +311,57 @@ def diff_snapshots(
                     key,
                     (f"source removed: {old.observations[source_id].source_name}",),
                     beep=False,
+                    source_id=source_id,
                 )
             )
 
-        metadata_details: List[str] = []
-        state_changed = False
+        source_state_update = False
         for source_id in sorted(old_sources & new_sources):
             before = old.observations[source_id]
             after = new.observations[source_id]
+            details: List[str] = []
             if before.event_names != after.event_names:
-                metadata_details.append(
-                    f"{after.source_name}: Event {_joined(before.event_names)} "
-                    f"-> {_joined(after.event_names)}"
+                details.append(
+                    f"Event {_joined(before.event_names)} -> {_joined(after.event_names)}"
                 )
             if before.group_titles != after.group_titles:
-                metadata_details.append(
-                    f"{after.source_name}: Group {_joined(before.group_titles)} "
-                    f"-> {_joined(after.group_titles)}"
+                details.append(
+                    f"Group {_joined(before.group_titles)} -> {_joined(after.group_titles)}"
                 )
             if before.tvg_names != after.tvg_names:
-                metadata_details.append(
-                    f"{after.source_name}: TVG {_joined(before.tvg_names)} "
-                    f"-> {_joined(after.tvg_names)}"
+                details.append(
+                    f"TVG {_joined(before.tvg_names)} -> {_joined(after.tvg_names)}"
                 )
             if before.candidate_states != after.candidate_states:
-                state_changed = True
-                metadata_details.append(
-                    f"{after.source_name}: Candidate states "
+                source_state_update = True
+                details.append(
+                    "Candidate states "
                     f"{_joined(before.candidate_states)} -> {_joined(after.candidate_states)}"
                 )
             elif before.state != after.state:
-                state_changed = True
-                metadata_details.append(
-                    f"{after.source_name}: State {before.state} -> {after.state}"
+                source_state_update = True
+                details.append(f"State {before.state} -> {after.state}")
+
+            if details:
+                events.append(
+                    ChangeEvent(
+                        "UPDATE",
+                        key,
+                        tuple(details),
+                        beep=True,
+                        source_id=source_id,
+                    )
                 )
 
-        if old.overall_state != new.overall_state:
-            state_changed = True
-            metadata_details.append(f"Identity state {old.overall_state} -> {new.overall_state}")
-
-        if metadata_details:
-            events.append(ChangeEvent("UPDATE", key, tuple(metadata_details), beep=True))
+        if old.overall_state != new.overall_state and not source_state_update:
+            events.append(
+                ChangeEvent(
+                    "UPDATE",
+                    key,
+                    (f"Identity state {old.overall_state} -> {new.overall_state}",),
+                    beep=True,
+                )
+            )
 
         old_quality = _quality_signature(old.best_candidate)
         new_quality = _quality_signature(new.best_candidate)
