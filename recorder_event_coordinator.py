@@ -557,16 +557,18 @@ def acquire_active_targets(
     for spec in source_specs_by_key.values():
         url_source_specs.setdefault(spec.url, spec)
     source_specs = tuple(url_source_specs.values())
-    if progress_callback is not None:
+    if progress_callback is None:
+        documents, fetch_errors, _ = fetch_playlist_documents(source_specs)
+    else:
         progress_callback(f"Scanning playlists 0/{len(source_specs)}")
-    documents, fetch_errors, _ = fetch_playlist_documents(
-        source_specs,
-        progress_callback=(
-            (lambda done, total: progress_callback(f"Scanning playlists {done}/{total}"))
-            if progress_callback is not None
-            else None
-        ),
-    )
+        documents, fetch_errors, _ = fetch_playlist_documents(
+            source_specs,
+            progress_callback=(
+                lambda done, total: progress_callback(
+                    f"Scanning playlists {done}/{total}"
+                )
+            ),
+        )
 
     parsed_by_key: Dict[Tuple[str, str, str], Tuple[SourceCandidate, ...]] = {}
     errors: List[str] = list(fetch_errors)
@@ -647,16 +649,18 @@ def acquire_active_targets(
         for candidate in candidates:
             unique_by_key.setdefault(_probe_key(candidate), candidate)
     probe_pool = tuple(unique_by_key.values())
-    if progress_callback is not None:
+    if progress_callback is None:
+        probed = probe_candidates(probe_pool)
+    else:
         progress_callback(f"Checking candidates 0/{len(probe_pool)}")
-    probed = probe_candidates(
-        probe_pool,
-        progress_callback=(
-            (lambda done, total: progress_callback(f"Checking candidates {done}/{total}"))
-            if progress_callback is not None
-            else None
-        ),
-    )
+        probed = probe_candidates(
+            probe_pool,
+            progress_callback=(
+                lambda done, total: progress_callback(
+                    f"Checking candidates {done}/{total}"
+                )
+            ),
+        )
     probed_by_key = {_probe_key(candidate): candidate for candidate in probed}
 
     final: Dict[str, Tuple[SourceCandidate, ...]] = {}
