@@ -442,7 +442,7 @@ https://cdn.test/live.mpd
         from recorder_source.quality import parse_hls_manifest_quality
 
         manifest = """#EXTM3U
-#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,FRAME-RATE=50
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
 720.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=3322000,RESOLUTION=1920x1080
 1080.m3u8
