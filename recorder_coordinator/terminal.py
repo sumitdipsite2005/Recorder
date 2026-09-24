@@ -182,7 +182,18 @@ def _header_lines(
     if refresh_interval_sec is not None:
         lines.append(f"Refresh      : every {refresh_interval_sec:g}s + manual r")
     if snapshot.coordinator_window is not None:
-        lines.append(f"Coordinator : {_coordinator_status_text(snapshot)}")
+        window = snapshot.coordinator_window
+        lines.append("Coordinator")
+        lines.append(f"  Status    : {window.status}")
+        lines.append(f"  Started   : {window.active_from:%Y-%m-%d %H:%M:%S}")
+        lines.append(
+            "  End       : "
+            + (
+                f"{window.active_until:%Y-%m-%d %H:%M:%S}"
+                if window.active_until is not None
+                else "until stopped"
+            )
+        )
 
     for index, view in enumerate(snapshot.target_views, start=1):
         target = view.target
@@ -271,9 +282,10 @@ def render_dashboard(
 
     lines.append("")
     lines.append("=" * 88)
-    lines.append(f"EVENT WATCH  {snapshot.created_at:%Y-%m-%d %H:%M:%S}")
     lines.append(
-        f"{_provider_summary(snapshot)} | identity blocks={len(snapshot.blocks)}"
+        f"EVENT WATCH {snapshot.created_at:%Y-%m-%d %H:%M:%S} "
+        f"| {_provider_summary(snapshot)} "
+        f"| Identity blocks={len(snapshot.blocks)}"
     )
     lines.append("=" * 88)
 

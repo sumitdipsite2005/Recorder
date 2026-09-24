@@ -3,7 +3,7 @@
 The repository now keeps two layers of offline regression protection:
 
 - `checkpoint0_tests/`: 11 mature-recorder safety-baseline tests.
-- `tests/`: 103 Checkpoint 1/2 tests for shared source logic, provider-lane identity, Coordinator Inspect/Watch behavior, and architecture boundaries.
+- `tests/`: 105 Checkpoint 1/2 tests for shared source logic, provider-lane identity, Coordinator Inspect/Watch behavior, and architecture boundaries.
 
 No real playlist URLs are contacted and no recording is started.
 

@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 from .matching import evaluate_match
-from .quality import probe_stream_quality_ffprobe
+from .quality import parse_hls_manifest_quality, probe_stream_quality_ffprobe
 from .models import (
     PlaylistSourceSpec,
     SourceAcquisitionRequest,
@@ -595,33 +595,13 @@ def _extract_expiry(*values: str) -> Optional[float]:
     return float(min(expiries)) if expiries else None
 
 
-def _parse_hls_quality(text: str) -> Tuple[bool, int, int, float, int, str]:
-    best = None
-    lines = [line.strip() for line in text.splitlines()]
-    for line in lines:
-        if not line.startswith("#EXT-X-STREAM-INF:"):
-            continue
-        attrs = line.split(":", 1)[1]
-        width = height = bitrate = 0
-        fps = 0.0
-        scan_type = "progressive"
-        resolution = re.search(r"(?i)(?:^|,)RESOLUTION=(\d+)x(\d+)", attrs)
-        bandwidth = re.search(r"(?i)(?:^|,)(?:AVERAGE-)?BANDWIDTH=(\d+)", attrs)
-        frame_rate = re.search(r"(?i)(?:^|,)FRAME-RATE=([0-9.]+)", attrs)
-        if resolution:
-            width, height = int(resolution.group(1)), int(resolution.group(2))
-        if bandwidth:
-            bitrate = int(bandwidth.group(1))
-        if frame_rate:
-            fps = float(frame_rate.group(1))
-        rank = (1 if fps >= 49 else 0, height, fps, width * height, bitrate)
-        if best is None or rank > best[0]:
-            best = (rank, width, height, fps, bitrate, scan_type)
-    if best is None:
-        return False, 0, 0, 0.0, 0, ""
-    _, width, height, fps, bitrate, scan_type = best
-    return True, width, height, fps, bitrate, scan_type
-
+def _parse_hls_quality(text: str, manifest_url: str = "") -> Optional[dict]:
+    return parse_hls_manifest_quality(
+        text,
+        manifest_url,
+        motion_cap_fps=50.0,
+        expiry_parser=lambda value: _extract_expiry(value),
+    )
 
 
 def _parse_dash_frame_rate(value: str) -> float:
@@ -742,7 +722,19 @@ def probe_candidate_hls(
             if widevine:
                 unsupported_drm = "Widevine"
         else:
-            quality_known, width, height, fps, bitrate, scan_type = _parse_hls_quality(text)
+            hls_quality = _parse_hls_quality(text, final_url)
+            if hls_quality:
+                quality_known = bool(hls_quality.get("quality_known"))
+                width = int(hls_quality.get("video_width") or 0)
+                height = int(hls_quality.get("video_height") or 0)
+                fps = float(hls_quality.get("video_fps") or 0.0)
+                bitrate = int(hls_quality.get("video_bitrate_bps") or 0)
+                scan_type = str(hls_quality.get("video_scan_type") or "")
+            else:
+                quality_known = False
+                width = height = bitrate = 0
+                fps = 0.0
+                scan_type = ""
             if "com.widevine" in text.casefold() or "widevine" in text.casefold():
                 unsupported_drm = "Widevine"
         is_playlist = bool(is_hls or is_dash)
@@ -760,8 +752,13 @@ def probe_candidate_hls(
         )
         if launchable and not manifest_complete:
             try:
+                probe_stream_url = (
+                    str(hls_quality.get("manifest_variant_url") or "").strip()
+                    if is_hls and hls_quality
+                    else ""
+                ) or final_url or candidate.stream_url
                 ffprobe_quality = probe_stream_quality_ffprobe(
-                    final_url or candidate.stream_url,
+                    probe_stream_url,
                     headers,
                     timeout_sec=min(20.0, max(1.0, float(timeout_sec))),
                     target_quality={
@@ -840,6 +837,11 @@ def probe_candidate_hls(
             extra={
                 **dict(candidate.extra),
                 "manifest_final_url": final_url,
+                "manifest_variant_url": (
+                    str(hls_quality.get("manifest_variant_url") or "")
+                    if is_hls and hls_quality
+                    else ""
+                ),
                 "quality_source": quality_source,
                 "video_fps_source": video_fps_source,
                 "ffprobe_probe_failure": ffprobe_failure,

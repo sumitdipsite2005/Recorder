@@ -7796,118 +7796,12 @@ def _parse_nm3u8dl_hls_manifest_quality(
     manifest_text: str,
     manifest_url: str = "",
 ) -> Optional[dict]:
-    qualities = []
-
-    manifest_lines = [
-        raw_line.strip()
-        for raw_line in manifest_text.splitlines()
-    ]
-
-    for index, line in enumerate(manifest_lines):
-
-        if not line.startswith("#EXT-X-STREAM-INF:"):
-            continue
-
-        attributes = line.split(":", 1)[1]
-
-        resolution_match = re.search(
-            r'(?:^|,)\s*RESOLUTION=(\d+)x(\d+)',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        frame_rate_match = re.search(
-            r'(?:^|,)\s*FRAME-RATE=([0-9.]+)',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        average_bandwidth_match = re.search(
-            r'(?:^|,)\s*AVERAGE-BANDWIDTH=(\d+)',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        bandwidth_match = re.search(
-            r'(?:^|,)\s*BANDWIDTH=(\d+)',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        codecs_match = re.search(
-            r'(?:^|,)\s*CODECS="([^"]+)"',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        width = int(resolution_match.group(1)) if resolution_match else 0
-        height = int(resolution_match.group(2)) if resolution_match else 0
-        fps = (
-            _parse_nm3u8dl_frame_rate(frame_rate_match.group(1))
-            if frame_rate_match
-            else 0.0
-        )
-
-        bitrate = 0
-        advertised_bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else 0
-        average_bandwidth = (
-            int(average_bandwidth_match.group(1))
-            if average_bandwidth_match
-            else 0
-        )
-        codecs = str(codecs_match.group(1) if codecs_match else "").strip()
-
-        if average_bandwidth > 0:
-            bitrate = average_bandwidth
-        elif advertised_bandwidth > 0:
-            bitrate = advertised_bandwidth
-
-        variant_uri = ""
-
-        for following_line in manifest_lines[index + 1:]:
-            if not following_line:
-                continue
-
-            if following_line.startswith("#"):
-                break
-
-            variant_uri = following_line
-            break
-
-        variant_url = (
-            urljoin(manifest_url, variant_uri)
-            if variant_uri
-            else ""
-        )
-        variant_expiry = (
-            get_nm3u8dl_auth_expiry(variant_url)
-            if variant_url
-            else None
-        )
-
-        qualities.append({
-            "quality_known": bool(
-                fps > 0
-                or (width > 0 and height > 0)
-                or bitrate > 0
-            ),
-            "video_fps": fps,
-            "video_width": width,
-            "video_height": height,
-            "video_scan_type": "",
-            "video_scan_type_source": "",
-            "video_bitrate_bps": bitrate,
-            "manifest_expiry": variant_expiry,
-            "manifest_variant_url": variant_url,
-            "_hls_bandwidth_bps": advertised_bandwidth,
-            "_hls_average_bandwidth_bps": average_bandwidth,
-            "_hls_codecs": codecs,
-        })
-
-    if not qualities:
-        return None
-
-    return max(qualities, key=_nm3u8dl_video_quality_rank)
+    return source_quality.parse_hls_manifest_quality(
+        manifest_text,
+        manifest_url,
+        motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+        expiry_parser=get_nm3u8dl_auth_expiry,
+    )
 
 
 def _inspect_nm3u8dl_hls_manifest_drm(manifest_text: str) -> dict:

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from typing import Callable, Mapping, Optional, Sequence
+from urllib.parse import urljoin
 
 from .selection import video_quality_rank
 
@@ -31,6 +33,104 @@ def parse_frame_rate(value: object) -> float:
         return float(text)
     except (TypeError, ValueError):
         return 0.0
+
+
+def parse_hls_manifest_quality(
+    manifest_text: str,
+    manifest_url: str = "",
+    *,
+    motion_cap_fps: float = 50.0,
+    expiry_parser: Optional[Callable[[str], Optional[float]]] = None,
+) -> Optional[dict]:
+    """Return the best advertised HLS variant and its exact child URL.
+
+    The recorder and Coordinator use this same parser so quality ranking and
+    FFprobe fallback start from the same selected variant.
+    """
+    qualities: list[dict] = []
+    lines = [raw_line.strip() for raw_line in str(manifest_text or "").splitlines()]
+
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+
+        attrs = line.split(":", 1)[1]
+        resolution = re.search(
+            r"(?:^|,)\s*RESOLUTION=(\d+)x(\d+)",
+            attrs,
+            re.IGNORECASE,
+        )
+        frame_rate = re.search(
+            r"(?:^|,)\s*FRAME-RATE=([0-9.]+)",
+            attrs,
+            re.IGNORECASE,
+        )
+        average_bandwidth = re.search(
+            r"(?:^|,)\s*AVERAGE-BANDWIDTH=(\d+)",
+            attrs,
+            re.IGNORECASE,
+        )
+        bandwidth = re.search(
+            r"(?:^|,)\s*BANDWIDTH=(\d+)",
+            attrs,
+            re.IGNORECASE,
+        )
+        codecs = re.search(
+            r'(?:^|,)\s*CODECS="([^"]+)"',
+            attrs,
+            re.IGNORECASE,
+        )
+
+        width = int(resolution.group(1)) if resolution else 0
+        height = int(resolution.group(2)) if resolution else 0
+        fps = parse_frame_rate(frame_rate.group(1)) if frame_rate else 0.0
+        advertised_bitrate = int(bandwidth.group(1)) if bandwidth else 0
+        average_bitrate = int(average_bandwidth.group(1)) if average_bandwidth else 0
+        bitrate = average_bitrate or advertised_bitrate
+
+        variant_uri = ""
+        for following in lines[index + 1:]:
+            if not following:
+                continue
+            if following.startswith("#"):
+                break
+            variant_uri = following
+            break
+
+        variant_url = urljoin(manifest_url, variant_uri) if variant_uri else ""
+        variant_expiry = (
+            expiry_parser(variant_url)
+            if expiry_parser is not None and variant_url
+            else None
+        )
+
+        qualities.append({
+            "quality_known": bool(
+                fps > 0 or (width > 0 and height > 0) or bitrate > 0
+            ),
+            "video_fps": fps,
+            "video_width": width,
+            "video_height": height,
+            "video_scan_type": "",
+            "video_scan_type_source": "",
+            "video_bitrate_bps": bitrate,
+            "manifest_expiry": variant_expiry,
+            "manifest_variant_url": variant_url,
+            "_hls_bandwidth_bps": advertised_bitrate,
+            "_hls_average_bandwidth_bps": average_bitrate,
+            "_hls_codecs": str(codecs.group(1) if codecs else "").strip(),
+        })
+
+    if not qualities:
+        return None
+
+    return max(
+        qualities,
+        key=lambda item: video_quality_rank(
+            item,
+            motion_cap_fps=float(motion_cap_fps),
+        ),
+    )
 
 
 def build_ffprobe_quality_command(

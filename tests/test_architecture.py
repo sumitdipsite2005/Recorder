@@ -43,6 +43,12 @@ class ArchitectureGuardTests(unittest.TestCase):
         for path in ROOT.glob("*.bat"):
             self.assertEqual(path.name, path.name.lower(), path.name)
 
+    def test_recorder_and_coordinator_share_hls_quality_parser(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        self.assertIn("source_quality.parse_hls_manifest_quality(",recorder)
+        self.assertIn("parse_hls_manifest_quality(",discovery)
+
     def test_mature_recorder_consumes_shared_policy(self):
         text=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         self.assertIn("from recorder_source.policy import",text)

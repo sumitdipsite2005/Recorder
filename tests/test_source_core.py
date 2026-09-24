@@ -426,9 +426,38 @@ https://cdn.test/live.mpd
                 )
             )
         probe.assert_called_once()
+        self.assertEqual(
+            probe.call_args.args[0],
+            "https://final.test/video.m3u8",
+        )
         self.assertEqual(out.video_fps, 50.0)
         self.assertEqual(out.extra["video_fps_source"], "ffprobe")
         self.assertEqual(out.extra["quality_source"], "manifest+ffprobe")
+        self.assertEqual(
+            out.extra["manifest_variant_url"],
+            "https://final.test/video.m3u8",
+        )
+
+    def test_shared_hls_parser_returns_selected_variant_url(self):
+        from recorder_source.quality import parse_hls_manifest_quality
+
+        manifest = """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,FRAME-RATE=50
+720.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3322000,RESOLUTION=1920x1080
+1080.m3u8
+"""
+        quality = parse_hls_manifest_quality(
+            manifest,
+            "https://cdn.test/path/master.m3u8",
+            motion_cap_fps=50,
+        )
+        self.assertEqual(quality["video_width"],1920)
+        self.assertEqual(quality["video_height"],1080)
+        self.assertEqual(
+            quality["manifest_variant_url"],
+            "https://cdn.test/path/1080.m3u8",
+        )
 
     def test_shared_ffprobe_parser_uses_same_quality_ranking(self):
         payload = json.dumps({

@@ -417,7 +417,15 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("Sources: SONYLIV_EVENTS",target_lines[0])
         self.assertNotIn("Mode         :",rendered)
         self.assertNotIn("mode=inspect",rendered)
-        self.assertIn("End: until stopped",rendered)
+        self.assertIn("Coordinator\n  Status    : ACTIVE",rendered)
+        self.assertIn("  Started   : 2026-09-24 17:28:57",rendered)
+        self.assertIn("  End       : until stopped",rendered)
+        event_watch_lines=[
+            line for line in rendered.splitlines()
+            if line.startswith("EVENT WATCH ")
+        ]
+        self.assertEqual(len(event_watch_lines),1)
+        self.assertIn("| Provider=SONYLIV | Identity blocks=0",event_watch_lines[0])
 
     def test_compact_source_name_preserves_github_provenance(self):
         self.assertEqual(
