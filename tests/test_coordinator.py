@@ -292,6 +292,13 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertFalse(any(e.marker=="NEW" for e in events))
         self.assertFalse(any(e.marker=="REMOVED" for e in events))
 
+    def test_dashboard_renders_candidate_rows(self):
+        snap=snapshot([sony_candidate()])
+        rendered=coord.render_dashboard(snap,())
+        self.assertIn("[ON] Asian Games",rendered)
+        self.assertIn("1920x1080",rendered)
+        self.assertIn("SONYLIV|lane:2120305/AG_Strea2309/ENG",rendered)
+
     def test_display_order_keeps_existing_rows_stable_and_new_at_top(self):
         a=sony_candidate(lane="1/A/ENG")
         b=sony_candidate(lane="2/B/ENG")

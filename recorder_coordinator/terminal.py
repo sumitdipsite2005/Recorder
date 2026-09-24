@@ -89,24 +89,24 @@ def render_dashboard(
             lines.append(f"    Best: {quality_text(block.best_candidate)}")
             for source in block.observations.values():
                 for candidate in source.candidates:
-                    candidate_state = candidate_state(candidate)
-                    on_off = "ON" if candidate_state == "WORKING" else "OFF"
+                    state_text = candidate_state(candidate)
+                    on_off = "ON" if state_text == "WORKING" else "OFF"
                     event_name = candidate.entry_title or candidate.tvg_name or "-"
                     group_name = candidate.group_title or "-"
                     context_text = " | CONTEXT" if candidate.ignored else ""
                     lines.append(
                         f"    [{on_off}] {event_name} | {group_name} "
                         f"| {quality_text(candidate if candidate.quality_known else None)} "
-                        f"| {candidate_state}{context_text} | {source.source_name}"
+                        f"| {state_text}{context_text} | {source.source_name}"
                     )
-                    if candidate_state != "WORKING" or candidate.ignored:
+                    if state_text != "WORKING" or candidate.ignored:
                         reason = candidate.reason
                         if candidate.ignored and not reason:
                             reason = (
                                 "same feed identity context; this source's current primary "
                                 "metadata does not match the target"
                             )
-                        if candidate_state == "AUTH_UNKNOWN" and not reason:
+                        if state_text == "AUTH_UNKNOWN" and not reason:
                             reason = "authorization expiry is unknown for this provider profile"
                         if reason:
                             lines.append(f"        Reason: {reason}")
