@@ -1,7 +1,7 @@
 """Shared source-policy definitions used by both recorder entry points.
 
 Only rules that must mean the same thing in normal recording and Inspect/Watch
-live here. Recorder-only execution behavior remains in RECORD_DYNAMIC.py.
+live here. Recorder-only execution behavior remains in record_dynamic.py.
 """
 
 from __future__ import annotations
