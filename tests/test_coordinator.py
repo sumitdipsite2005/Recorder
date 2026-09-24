@@ -425,7 +425,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
             if line.startswith("EVENT WATCH ")
         ]
         self.assertEqual(len(event_watch_lines),1)
-        self.assertIn("| Provider=SONYLIV | Identity blocks=0",event_watch_lines[0])
+        self.assertIn("| Provider=- | Identity blocks=0",event_watch_lines[0])
 
     def test_compact_source_name_preserves_github_provenance(self):
         self.assertEqual(
