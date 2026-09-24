@@ -23,7 +23,7 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("from recorder_coordinator.terminal import", text)
         self.assertNotIn("winsound", text)
         self.assertNotIn('os.system("cls"', text)
-        self.assertNotIn("RECORD_DYNAMIC_event_worker", text)
+        self.assertNotIn("record_dynamic_event_worker", text)
 
     def test_shared_source_package_does_not_depend_on_entrypoint_files(self):
         for path in (ROOT/"recorder_source").glob("*.py"):
