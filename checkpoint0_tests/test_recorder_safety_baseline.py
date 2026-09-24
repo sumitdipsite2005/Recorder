@@ -1,4 +1,4 @@
-"""Checkpoint 0 regression protection for the mature RECORD_DYNAMIC.py.
+"""Checkpoint 0 regression protection for the mature record_dynamic.py.
 
 These tests are deliberately offline. They protect mature matching, ranking,
 lifetime, upgrade, and recording-local source identity/fingerprint behavior
@@ -57,8 +57,8 @@ def _load_recorder():
         os.name = "nt"
 
     try:
-        sys.modules.pop("RECORD_DYNAMIC", None)
-        module = importlib.import_module("RECORD_DYNAMIC")
+        sys.modules.pop("record_dynamic", None)
+        module = importlib.import_module("record_dynamic")
     finally:
         os.name = old_os_name
         if old_onedrive is None:

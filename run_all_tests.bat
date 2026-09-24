@@ -9,7 +9,7 @@ python -m unittest discover -s tests -v
 if errorlevel 1 goto :fail
 
 echo.
-echo ALL RECORDER TESTS: PASS ^(99 tests^)
+echo ALL RECORDER TESTS: PASS
 exit /b 0
 
 :fail

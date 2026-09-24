@@ -1,9 +1,11 @@
 """Identity Coordinator — Inspect / Watch checkpoint.
 
-Checkpoint 2 deliberately stops before recording launch.  It dynamically reads
+Checkpoint 2 deliberately stops before recording launch. It dynamically reads
 MANUAL/ALL target definitions, discovers qualifying playlist observations,
-canonicalizes provider feed identities, and presents meaningful NEW/UPDATE/
-SOURCE+ changes.
+canonicalizes provider feed identities, and presents meaningful changes.
+
+State/change intelligence and terminal presentation are kept in separate
+recorder_coordinator modules so this entry point remains orchestration-focused.
 """
 
 from __future__ import annotations
@@ -14,131 +16,51 @@ import os
 import runpy
 import sys
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
-from urllib.parse import urlsplit
 
-try:
-    import winsound
-except ImportError:  # pragma: no cover - non-Windows development/test hosts
-    winsound = None
-
+from recorder_coordinator.models import (
+    ChangeEvent,
+    CoordinatorWindow,
+    DashboardSnapshot,
+    IdentityTarget,
+    POLICY_ALL,
+    POLICY_MANUAL,
+    TargetRuntime,
+    TargetView,
+    VALID_POLICIES,
+)
+from recorder_coordinator.snapshot import (
+    build_snapshot,
+    compact_source_name,
+    diff_snapshots,
+)
+from recorder_coordinator.terminal import (
+    beep,
+    clear_dashboard_terminal,
+    render_dashboard,
+    update_display_order,
+    write_log,
+)
 from recorder_source.discovery import (
     fetch_playlist_documents,
     parse_playlist_text,
     probe_candidates,
 )
-from recorder_source.identity import CanonicalFeedIdentity, derive_feed_identity
+from recorder_source.identity import derive_feed_identity
 from recorder_source.matching import evaluate_match, make_match_definition
 from recorder_source.models import PlaylistSourceSpec, SourceCandidate
 from recorder_source.policy import (
-    DEFAULT_SELECTION_POLICY,
     PLAYLIST_GROUP_MATCH_MODES as GROUP_MATCH_MODE,
     PLAYLIST_GROUP_PROFILES as GROUP_PROVIDER,
     PLAYLIST_GROUP_SOURCE_BUCKETS as GROUP_SOURCE_BUCKET,
     PLAYLIST_USER_AGENTS,
-    PROVIDER_SELECTION_POLICIES as PROVIDER_SELECTION_POLICY,
 )
-from recorder_source.selection import select_join_candidate, video_quality_rank
 
-
-POLICY_MANUAL = "MANUAL"
-POLICY_ALL = "ALL_IDENTITIES"
-VALID_POLICIES = frozenset({POLICY_MANUAL, POLICY_ALL})
 
 DEFAULT_REFRESH_INTERVAL_SEC = 300
-
-
-@dataclass(frozen=True)
-class IdentityTarget:
-    name: str
-    policy: str
-    source_groups: Tuple[str, ...]
-    primary: Tuple[object, ...] = ()
-    required: Tuple[object, ...] = ()
-    rejected: Tuple[object, ...] = ()
-    preferred: Tuple[object, ...] = ()
-    match_all: bool = False
-    enabled: bool = True
-    schedule_start: Optional[datetime] = None
-    activity_duration_min: Optional[float] = None
-    worker_recording_duration_min: Optional[float] = None
-
-
-@dataclass
-class TargetRuntime:
-    first_activation: Optional[datetime] = None
-
-
-@dataclass(frozen=True)
-class TargetView:
-    target: IdentityTarget
-    status: str
-    active_from: Optional[datetime]
-    active_until: Optional[datetime]
-
-
-@dataclass(frozen=True)
-class CoordinatorWindow:
-    status: str
-    active_from: datetime
-    active_until: Optional[datetime]
-
-
-@dataclass(frozen=True)
-class SourceObservation:
-    source_id: str
-    source_name: str
-    candidates: Tuple[SourceCandidate, ...]
-    event_names: Tuple[str, ...]
-    tvg_names: Tuple[str, ...]
-    group_titles: Tuple[str, ...]
-    candidate_states: Tuple[str, ...]
-    state: str
-    best_candidate: Optional[SourceCandidate]
-
-    @property
-    def meaningful_signature(self) -> Tuple[object, ...]:
-        quality = _quality_signature(self.best_candidate)
-        return (
-            self.event_names,
-            self.tvg_names,
-            self.group_titles,
-            self.candidate_states,
-            self.state,
-            quality,
-        )
-
-
-@dataclass
-class IdentityBlock:
-    policy: str
-    identity: CanonicalFeedIdentity
-    target_names: List[str] = field(default_factory=list)
-    candidates: List[SourceCandidate] = field(default_factory=list)
-    observations: Dict[str, SourceObservation] = field(default_factory=dict)
-    best_candidate: Optional[SourceCandidate] = None
-    overall_state: str = "UNUSABLE"
-
-
-@dataclass(frozen=True)
-class ChangeEvent:
-    marker: str
-    block_key: Tuple[str, str]
-    details: Tuple[str, ...]
-    beep: bool = False
-
-
-@dataclass
-class DashboardSnapshot:
-    created_at: datetime
-    target_views: Tuple[TargetView, ...]
-    coordinator_window: Optional[CoordinatorWindow]
-    blocks: Dict[Tuple[str, str], IdentityBlock]
-    source_errors: Tuple[str, ...] = ()
-    config_messages: Tuple[str, ...] = ()
 
 
 class CoordinatorConfigState:
@@ -474,16 +396,6 @@ def _normalize_playlist_source(
     return str(source or "").strip(), "", {}, {}
 
 
-def _compact_source_name(url: str) -> str:
-    try:
-        parsed = urlsplit(url)
-        path = parsed.path.rstrip("/")
-        tail = "/".join(path.split("/")[-3:])
-        return f"{parsed.netloc}/{tail}" if tail else parsed.netloc
-    except Exception:
-        return url
-
-
 def validate_target_source_scopes(
     raw: Mapping[str, object],
     targets: Sequence[IdentityTarget],
@@ -516,7 +428,7 @@ def sources_for_group(raw: Mapping[str, object], group: str) -> Tuple[PlaylistSo
             result.append(
                 PlaylistSourceSpec(
                     url=url,
-                    name=name or _compact_source_name(url),
+                    name=name or compact_source_name(url),
                     group=group_name,
                     provider=provider,
                     request_headers=headers,
@@ -739,501 +651,6 @@ def acquire_active_targets(
     return final, tuple(dict.fromkeys(errors))
 
 
-def _candidate_source_id(candidate: SourceCandidate) -> str:
-    return str(candidate.playlist_url or candidate.extra.get("source_name") or "unknown-source")
-
-
-def _candidate_source_name(candidate: SourceCandidate) -> str:
-    return str(candidate.extra.get("source_name") or _compact_source_name(candidate.playlist_url))
-
-
-def _candidate_observation_key(candidate: SourceCandidate) -> Tuple[object, ...]:
-    """Identify one source observation independent of which targets matched it."""
-    return (
-        _candidate_source_id(candidate),
-        candidate.stream_url,
-        tuple(
-            sorted(
-                (str(key).casefold(), str(value))
-                for key, value in candidate.headers.items()
-            )
-        ),
-        candidate.tvg_name,
-        candidate.group_title,
-        candidate.entry_title,
-    )
-
-
-def _candidate_state(candidate: SourceCandidate) -> str:
-    provider = str(candidate.extra.get("provider") or "UNKNOWN").upper()
-    policy = PROVIDER_SELECTION_POLICY.get(provider, DEFAULT_SELECTION_POLICY)
-    if (
-        candidate.launchable
-        and candidate.expiry is None
-        and policy is not None
-        and not policy.allow_unknown_expiry
-    ):
-        return "AUTH_UNKNOWN"
-    if candidate.launchable:
-        return "WORKING"
-    if candidate.probe_status == "expired":
-        return "EXPIRED"
-    if candidate.access_blocked or candidate.probe_status == "access_blocked":
-        return "ACCESS_BLOCKED"
-    if candidate.unsupported_drm:
-        return "UNSUPPORTED_DRM"
-    if candidate.probe_status == "probe_failed":
-        return "PROBE_FAILED"
-    return str(candidate.probe_status or "UNUSABLE").upper()
-
-
-def _quality_signature(candidate: Optional[SourceCandidate]) -> Tuple[object, ...]:
-    if candidate is None:
-        return ()
-    return (
-        int(candidate.video_width or 0),
-        int(candidate.video_height or 0),
-        round(float(candidate.video_fps or 0.0), 3),
-        int(candidate.video_bitrate_bps or 0),
-        str(candidate.video_scan_type or ""),
-    )
-
-
-def _quality_text(candidate: Optional[SourceCandidate]) -> str:
-    if candidate is None:
-        return "no working candidate"
-    width, height = int(candidate.video_width or 0), int(candidate.video_height or 0)
-    fps = float(candidate.video_fps or 0.0)
-    bitrate = int(candidate.video_bitrate_bps or 0)
-    parts: List[str] = []
-    if width and height:
-        parts.append(f"{width}x{height}")
-    if fps:
-        parts.append(f"{fps:g}p")
-    if bitrate:
-        parts.append(f"{round(bitrate / 1000):d} Kbps")
-    return " | ".join(parts) if parts else "quality unknown"
-
-
-def _best_candidate(
-    candidates: Sequence[SourceCandidate],
-    provider: str,
-) -> Optional[SourceCandidate]:
-    working = [
-        candidate
-        for candidate in candidates
-        if candidate.launchable and not candidate.ignored
-    ]
-    if not working:
-        return None
-    policy = PROVIDER_SELECTION_POLICY.get(provider, DEFAULT_SELECTION_POLICY)
-    decision = select_join_candidate(working, policy, now_ts=time.time())
-    return decision.selected
-
-
-def _build_source_observation(
-    source_id: str,
-    candidates: Sequence[SourceCandidate],
-    provider: str,
-) -> SourceObservation:
-    event_names = tuple(
-        dict.fromkeys(
-            str(item.entry_title or "").strip()
-            for item in candidates
-            if str(item.entry_title or "").strip()
-        )
-    )
-    tvg_names = tuple(
-        dict.fromkeys(
-            str(item.tvg_name or "").strip()
-            for item in candidates
-            if str(item.tvg_name or "").strip()
-        )
-    )
-    group_titles = tuple(
-        dict.fromkeys(
-            str(item.group_title or "").strip()
-            for item in candidates
-            if str(item.group_title or "").strip()
-        )
-    )
-    best = _best_candidate(candidates, provider)
-    candidate_states = tuple(sorted(_candidate_state(item) for item in candidates))
-    states = set(candidate_states)
-    state = "WORKING" if "WORKING" in states else sorted(states)[0] if states else "UNUSABLE"
-    return SourceObservation(
-        source_id=source_id,
-        source_name=_candidate_source_name(candidates[0]) if candidates else source_id,
-        candidates=tuple(candidates),
-        event_names=event_names,
-        tvg_names=tvg_names,
-        group_titles=group_titles,
-        candidate_states=candidate_states,
-        state=state,
-        best_candidate=best,
-    )
-
-
-def build_snapshot(
-    target_views: Sequence[TargetView],
-    candidates_by_target: Mapping[str, Sequence[SourceCandidate]],
-    *,
-    source_errors: Sequence[str] = (),
-    config_messages: Sequence[str] = (),
-    coordinator_window: Optional[CoordinatorWindow] = None,
-    now: Optional[datetime] = None,
-) -> DashboardSnapshot:
-    blocks: Dict[Tuple[str, str], IdentityBlock] = {}
-    target_by_name = {view.target.name: view.target for view in target_views}
-
-    for target_name, candidates in candidates_by_target.items():
-        target = target_by_name[target_name]
-        for candidate in candidates:
-            provider = str(candidate.extra.get("provider") or "UNKNOWN").upper()
-            identity = derive_feed_identity(candidate, provider)
-            key = (target.policy, identity.serialized)
-            block = blocks.get(key)
-            if block is None:
-                block = IdentityBlock(policy=target.policy, identity=identity)
-                blocks[key] = block
-            if target_name not in block.target_names:
-                block.target_names.append(target_name)
-            observation_key = _candidate_observation_key(candidate)
-            existing_index = next(
-                (
-                    index
-                    for index, existing in enumerate(block.candidates)
-                    if _candidate_observation_key(existing) == observation_key
-                ),
-                None,
-            )
-            if existing_index is None:
-                block.candidates.append(candidate)
-            else:
-                existing = block.candidates[existing_index]
-                if existing.ignored and not candidate.ignored:
-                    block.candidates[existing_index] = candidate
-                elif (
-                    existing.ignored == candidate.ignored
-                    and candidate.preferred_qualifier_score
-                    > existing.preferred_qualifier_score
-                ):
-                    block.candidates[existing_index] = candidate
-
-    for block in blocks.values():
-        by_source: Dict[str, List[SourceCandidate]] = {}
-        for candidate in block.candidates:
-            by_source.setdefault(_candidate_source_id(candidate), []).append(candidate)
-        block.observations = {
-            source_id: _build_source_observation(source_id, candidates, block.identity.provider)
-            for source_id, candidates in by_source.items()
-        }
-        block.best_candidate = _best_candidate(block.candidates, block.identity.provider)
-        block.overall_state = "AVAILABLE" if block.best_candidate is not None else "UNUSABLE"
-
-    return DashboardSnapshot(
-        created_at=now or datetime.now(),
-        target_views=tuple(target_views),
-        coordinator_window=coordinator_window,
-        blocks=blocks,
-        source_errors=tuple(source_errors),
-        config_messages=tuple(config_messages),
-    )
-
-
-def diff_snapshots(
-    previous: Optional[DashboardSnapshot],
-    current: DashboardSnapshot,
-) -> Tuple[ChangeEvent, ...]:
-    if previous is None:
-        return ()
-
-    events: List[ChangeEvent] = []
-    previous_keys = set(previous.blocks)
-    current_keys = set(current.blocks)
-    previous_identities = {key[1] for key in previous_keys}
-    current_identities = {key[1] for key in current_keys}
-
-    # NEW belongs to the feed identity itself, not to the MANUAL/ALL presentation
-    # block. Moving an existing target between policies must not invent a NEW feed.
-    for key in current_keys - previous_keys:
-        if key[1] not in previous_identities:
-            events.append(ChangeEvent("NEW", key, ("feed identity appeared",), beep=True))
-
-    for key in previous_keys - current_keys:
-        if key[1] not in current_identities:
-            events.append(
-                ChangeEvent(
-                    "REMOVED",
-                    key,
-                    ("feed identity no longer present",),
-                    beep=False,
-                )
-            )
-
-    for key in current_keys & previous_keys:
-        old = previous.blocks[key]
-        new = current.blocks[key]
-        old_sources = set(old.observations)
-        new_sources = set(new.observations)
-
-        for source_id in sorted(new_sources - old_sources):
-            events.append(
-                ChangeEvent(
-                    "SOURCE+",
-                    key,
-                    (f"source added: {new.observations[source_id].source_name}",),
-                    beep=False,
-                )
-            )
-        for source_id in sorted(old_sources - new_sources):
-            events.append(
-                ChangeEvent(
-                    "SOURCE-",
-                    key,
-                    (f"source removed: {old.observations[source_id].source_name}",),
-                    beep=False,
-                )
-            )
-
-        metadata_details: List[str] = []
-        state_changed = False
-        for source_id in sorted(old_sources & new_sources):
-            before = old.observations[source_id]
-            after = new.observations[source_id]
-            if before.event_names != after.event_names:
-                metadata_details.append(
-                    f"{after.source_name}: Event {_joined(before.event_names)} "
-                    f"-> {_joined(after.event_names)}"
-                )
-            if before.group_titles != after.group_titles:
-                metadata_details.append(
-                    f"{after.source_name}: Group {_joined(before.group_titles)} "
-                    f"-> {_joined(after.group_titles)}"
-                )
-            if before.tvg_names != after.tvg_names:
-                metadata_details.append(
-                    f"{after.source_name}: TVG {_joined(before.tvg_names)} "
-                    f"-> {_joined(after.tvg_names)}"
-                )
-            if before.candidate_states != after.candidate_states:
-                state_changed = True
-                metadata_details.append(
-                    f"{after.source_name}: Candidate states "
-                    f"{_joined(before.candidate_states)} -> {_joined(after.candidate_states)}"
-                )
-            elif before.state != after.state:
-                state_changed = True
-                metadata_details.append(
-                    f"{after.source_name}: State {before.state} -> {after.state}"
-                )
-
-        if old.overall_state != new.overall_state:
-            state_changed = True
-            metadata_details.append(f"Identity state {old.overall_state} -> {new.overall_state}")
-
-        if metadata_details:
-            events.append(ChangeEvent("UPDATE", key, tuple(metadata_details), beep=True))
-
-        old_quality = _quality_signature(old.best_candidate)
-        new_quality = _quality_signature(new.best_candidate)
-        if (
-            old_quality != new_quality
-            and old.best_candidate is not None
-            and new.best_candidate is not None
-        ):
-            policy = PROVIDER_SELECTION_POLICY.get(new.identity.provider, DEFAULT_SELECTION_POLICY)
-            old_rank = video_quality_rank(
-                old.best_candidate, motion_cap_fps=policy.motion_cap_fps
-            )
-            new_rank = video_quality_rank(
-                new.best_candidate, motion_cap_fps=policy.motion_cap_fps
-            )
-            if new_rank > old_rank:
-                events.append(
-                    ChangeEvent(
-                        "QUALITY+",
-                        key,
-                        (
-                            "effective quality "
-                            f"{_quality_text(old.best_candidate)} -> "
-                            f"{_quality_text(new.best_candidate)}",
-                        ),
-                        beep=True,
-                    )
-                )
-            else:
-                events.append(
-                    ChangeEvent(
-                        "QUALITY-",
-                        key,
-                        (
-                            "effective quality "
-                            f"{_quality_text(old.best_candidate)} -> "
-                            f"{_quality_text(new.best_candidate)}",
-                        ),
-                        beep=False,
-                    )
-                )
-
-    return tuple(events)
-
-
-def _joined(values: Sequence[str]) -> str:
-    return " / ".join(values) if values else "-"
-
-
-def _event_markers(events: Sequence[ChangeEvent]) -> Dict[Tuple[str, str], List[ChangeEvent]]:
-    result: Dict[Tuple[str, str], List[ChangeEvent]] = {}
-    for event in events:
-        if event.marker in {"REMOVED", "SOURCE-"}:
-            continue
-        result.setdefault(event.block_key, []).append(event)
-    return result
-
-
-def render_dashboard(
-    snapshot: DashboardSnapshot,
-    events: Sequence[ChangeEvent],
-    display_order: Optional[Mapping[str, Sequence[str]]] = None,
-) -> str:
-    markers = _event_markers(events)
-    lines: List[str] = []
-    lines.append("=" * 96)
-    lines.append(
-        "IDENTITY COORDINATOR — INSPECT / WATCH   "
-        f"{snapshot.created_at:%Y-%m-%d %H:%M:%S}"
-    )
-    lines.append("=" * 96)
-    if snapshot.coordinator_window is not None:
-        window = snapshot.coordinator_window
-        timing = f" from {window.active_from:%Y-%m-%d %H:%M:%S}"
-        if window.active_until is not None:
-            timing += f" until {window.active_until:%Y-%m-%d %H:%M:%S}"
-        lines.append(f"Coordinator: {window.status}{timing}")
-    for view in snapshot.target_views:
-        timing = ""
-        if view.status == "SCHEDULED" and view.active_from is not None:
-            timing = f" — starts {view.active_from:%Y-%m-%d %H:%M:%S}"
-        elif view.status == "ACTIVE" and view.active_until is not None:
-            timing = f" — active until {view.active_until:%Y-%m-%d %H:%M:%S}"
-        lines.append(
-            f"Target: {view.target.name} | {view.target.policy} | {view.status}{timing}"
-        )
-    if snapshot.config_messages:
-        lines.append("")
-        lines.extend(snapshot.config_messages)
-
-    for policy, heading in ((POLICY_ALL, "ALL IDENTITIES"), (POLICY_MANUAL, "MANUAL")):
-        policy_blocks = [block for key, block in snapshot.blocks.items() if key[0] == policy]
-        if display_order is not None:
-            position = {
-                identity: index
-                for index, identity in enumerate(display_order.get(policy, ()))
-            }
-            policy_blocks.sort(
-                key=lambda block: position.get(block.identity.serialized, len(position))
-            )
-        if not policy_blocks:
-            continue
-        lines.append("")
-        lines.append(f"--- {heading} ---")
-        for index, block in enumerate(policy_blocks, start=1):
-            key = (block.policy, block.identity.serialized)
-            block_events = markers.get(key, [])
-            marker_text = " ".join(f"[{event.marker}]" for event in block_events)
-            if marker_text:
-                marker_text += " "
-            lines.append(
-                f"{marker_text}[{index}] {block.overall_state} {block.identity.serialized} "
-                f"| Targets: {', '.join(block.target_names)} | Sources: {len(block.observations)}"
-            )
-            lines.append(f"    Best: {_quality_text(block.best_candidate)}")
-            for source in block.observations.values():
-                for candidate in source.candidates:
-                    candidate_state = _candidate_state(candidate)
-                    on_off = "ON" if candidate_state == "WORKING" else "OFF"
-                    event_name = candidate.entry_title or candidate.tvg_name or "-"
-                    group_name = candidate.group_title or "-"
-                    context_text = " | CONTEXT" if candidate.ignored else ""
-                    lines.append(
-                        f"    [{on_off}] {event_name} | {group_name} "
-                        f"| {_quality_text(candidate if candidate.quality_known else None)} "
-                        f"| {candidate_state}{context_text} | {source.source_name}"
-                    )
-                    if candidate_state != "WORKING" or candidate.ignored:
-                        reason = candidate.reason
-                        if candidate.ignored and not reason:
-                            reason = (
-                                "same feed identity context; this source's current primary "
-                                "metadata does not match the target"
-                            )
-                        if candidate_state == "AUTH_UNKNOWN" and not reason:
-                            reason = "authorization expiry is unknown for this provider profile"
-                        if reason:
-                            lines.append(f"        Reason: {reason}")
-            for event in block_events:
-                for detail in event.details:
-                    lines.append(f"        [{event.marker}] {detail}")
-
-    if snapshot.source_errors:
-        lines.append("")
-        lines.append("Source warnings:")
-        for error in snapshot.source_errors:
-            lines.append(f"  - {error}")
-
-    if not snapshot.blocks:
-        lines.append("")
-        lines.append("No qualifying identities in the current active target scope.")
-    return "\n".join(lines)
-
-
-
-def update_display_order(
-    previous_order: Mapping[str, Sequence[str]],
-    snapshot: DashboardSnapshot,
-) -> Dict[str, List[str]]:
-    """Keep existing identities stable; place genuinely new identities at top."""
-    result: Dict[str, List[str]] = {}
-    for policy in (POLICY_ALL, POLICY_MANUAL):
-        current = [
-            key[1]
-            for key in snapshot.blocks
-            if key[0] == policy
-        ]
-        current_set = set(current)
-        old = [identity for identity in previous_order.get(policy, ()) if identity in current_set]
-        new = [identity for identity in current if identity not in old]
-        result[policy] = new + old
-    return result
-
-
-def _terminal_is_interactive() -> bool:
-    try:
-        return bool(sys.stdout.isatty())
-    except Exception:
-        return False
-
-
-def _clear_dashboard_terminal() -> None:
-    if not _terminal_is_interactive():
-        return
-    os.system("cls" if os.name == "nt" else "clear")
-
-def _write_log(path: Path, text: str) -> None:
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(text.rstrip() + "\n")
-
-
-def _beep(events: Sequence[ChangeEvent]) -> None:
-    if winsound is None or not any(event.beep for event in events):
-        return
-    try:
-        winsound.Beep(880, 180)
-        winsound.Beep(1175, 220)
-    except Exception:
-        pass
-
 
 def run_once(
     config_state: CoordinatorConfigState,
@@ -1317,7 +734,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
         except Exception as error:
             message = f"Identity Coordinator scan failed: {type(error).__name__}: {error}"
             print(message)
-            _write_log(log_path, f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}")
+            write_log(log_path, f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}")
             if once:
                 return 1
             time.sleep(max(5.0, float(state.refresh_interval_sec)))
@@ -1333,20 +750,20 @@ def run(config_path: Path, *, once: bool = False) -> int:
         display_order = update_display_order(display_order, snapshot)
         if meaningful:
             text = render_dashboard(snapshot, events, display_order)
-            _clear_dashboard_terminal()
+            clear_dashboard_terminal()
             print(text)
             print(f"\nLog: {log_path}")
-            _write_log(log_path, text)
+            write_log(log_path, text)
             if events:
                 for event in events:
-                    _write_log(
+                    write_log(
                         log_path,
                         (
                             f"CHANGE {event.marker} {event.block_key[1]} :: "
                             f"{'; '.join(event.details)}"
                         ),
                     )
-            _beep(events)
+            beep(events)
         else:
             print(f"{datetime.now():%H:%M:%S} Watch scan complete — no meaningful change")
 

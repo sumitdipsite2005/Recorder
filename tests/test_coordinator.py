@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import RECORDER_EVENT_COORDINATOR as coord
+import recorder_event_coordinator as coord
+from recorder_coordinator.snapshot import candidate_state
 from recorder_source.models import SourceCandidate
 
 
@@ -372,7 +373,7 @@ class AdditionalRegressionTests(unittest.TestCase):
             expiry=None,
             extra={"provider":"HOTSTAR"},
         )
-        self.assertEqual(coord._candidate_state(c),"AUTH_UNKNOWN")
+        self.assertEqual(candidate_state(c),"AUTH_UNKNOWN")
 
     def test_identity_reappearance_after_absence_is_new_again(self):
         present=snapshot([sony_candidate()])

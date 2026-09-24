@@ -7,10 +7,10 @@ The repository now keeps two layers of offline regression protection:
 
 No real playlist URLs are contacted and no recording is started.
 
-Run all 99 tests from the repository root:
+Run all regression tests from the repository root:
 
 ```bat
-RUN_ALL_TESTS.bat
+run_all_tests.bat
 ```
 
 Or run the suites directly:

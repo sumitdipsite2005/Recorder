@@ -2,11 +2,11 @@ CHECKPOINT 0 - SAFETY BASELINE
 
 Purpose
 -------
-These tests protect important behavior in the current mature RECORD_DYNAMIC.py
+These tests protect important behavior in the current mature record_dynamic.py
 before its source-selection logic is reorganized in Checkpoint 1.
 
 They do not use the internet and they do not start a recording.
-They do not modify RECORD_DYNAMIC.py.
+They do not modify record_dynamic.py.
 
 What is protected
 -----------------
@@ -24,8 +24,8 @@ What is protected
 
 How to run on Windows
 ---------------------
-1. Put the checkpoint0_tests folder directly beside RECORD_DYNAMIC.py.
-2. Double-click RUN_CHECKPOINT_0_TESTS.bat.
+1. Put the checkpoint0_tests folder directly beside record_dynamic.py.
+2. Double-click run_checkpoint_0_tests.bat.
 3. The final line should say: CHECKPOINT 0 TESTS: PASS
 
 Nothing is recorded during this test.
