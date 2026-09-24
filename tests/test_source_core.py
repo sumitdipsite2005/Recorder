@@ -438,6 +438,43 @@ https://cdn.test/live.mpd
             "https://final.test/video.m3u8",
         )
 
+    def test_probe_hls_samples_bitrate_when_manifest_and_ffprobe_lack_it(self):
+        body = b'''#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1920x1080,FRAME-RATE=25\nvideo.m3u8\n'''
+        class Headers:
+            def get(self, name, default=None):
+                return "application/vnd.apple.mpegurl"
+        class Response:
+            headers = Headers()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1): return body
+            def geturl(self): return "https://final.test/master.m3u8"
+
+        ffprobe = {
+            "quality_known": True,
+            "video_width": 1920,
+            "video_height": 1080,
+            "video_fps": 25.0,
+            "video_bitrate_bps": 0,
+            "video_scan_type": "progressive",
+        }
+        with patch("recorder_source.discovery.urlopen", return_value=Response()), patch(
+            "recorder_source.discovery.probe_stream_quality_ffprobe",
+            return_value=ffprobe,
+        ), patch(
+            "recorder_source.discovery.sample_stream_video_bitrate",
+            return_value=3_456_000,
+        ) as sampler:
+            out = probe_candidate_hls(
+                candidate(
+                    stream_url="https://src.test/master.m3u8",
+                    extra={"provider":"FANCODE"},
+                )
+            )
+        sampler.assert_called_once()
+        self.assertEqual(out.video_bitrate_bps,3_456_000)
+        self.assertEqual(out.extra["video_bitrate_source"],"sample")
+
     def test_shared_hls_parser_returns_selected_variant_url(self):
         from recorder_source.quality import parse_hls_manifest_quality
 

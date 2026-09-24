@@ -8863,47 +8863,14 @@ def _sample_nm3u8dl_stream_video_bitrate(
     stream_index: Optional[int] = None,
 ) -> int:
     """Estimate video bitrate from a short copied-media sample."""
-    command = [
-        "ffmpeg",
-        "-v", "error",
-        "-nostdin",
-    ]
-
-    effective_headers = dict(headers or {})
-    if byte_range:
-        effective_headers["Range"] = f"bytes={byte_range}"
-    if effective_headers:
-        header_blob = "".join(
-            f"{name}: {value}\r\n"
-            for name, value in effective_headers.items()
-        )
-        command.extend([
-            "-headers",
-            header_blob,
-        ])
-
-    if decryption_key:
-        command.extend(["-decryption_key", decryption_key])
-
-    map_value = (
-        f"0:{int(stream_index)}"
-        if stream_index is not None and int(stream_index) >= 0
-        else "0:v:0"
+    command = source_quality.build_ffmpeg_bitrate_sample_command(
+        stream_url,
+        headers,
+        sample_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC,
+        byte_range=byte_range,
+        decryption_key=decryption_key,
+        stream_index=stream_index,
     )
-
-    command.extend([
-        "-i", stream_url,
-        "-map", map_value,
-        "-c:v", "copy",
-        "-an",
-        "-sn",
-        "-dn",
-        "-t", str(float(NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC)),
-        "-progress", "pipe:2",
-        "-nostats",
-        "-f", "mpegts",
-        "pipe:1",
-    ])
 
     parsed_url = urlparse(stream_url)
     probe_identity = (
@@ -8952,33 +8919,7 @@ def _sample_nm3u8dl_stream_video_bitrate(
 
     if result.returncode != 0:
         return 0
-
-    total_size = 0
-    out_time_us = 0
-
-    for line in stderr_text.splitlines():
-        key, separator, value = line.partition("=")
-        if not separator:
-            continue
-
-        try:
-            if key == "total_size":
-                total_size = max(total_size, int(value))
-            elif key == "out_time_us":
-                out_time_us = max(out_time_us, int(value))
-        except (TypeError, ValueError):
-            continue
-
-    if total_size <= 0 or out_time_us <= 0:
-        return 0
-
-    sampled_bitrate = int(
-        (float(total_size) * 8.0 * 1_000_000.0)
-        / float(out_time_us)
-    )
-
-    return sampled_bitrate if sampled_bitrate > 0 else 0
-
+    return source_quality.parse_ffmpeg_bitrate_progress(stderr_text)
 
 def _parse_nm3u8dl_idet_scan_type(stderr_text: str) -> str:
     """Return progressive/interlaced only when idet evidence is conclusive."""

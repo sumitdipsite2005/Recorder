@@ -62,12 +62,31 @@ def _candidate_source_name(candidate: SourceCandidate) -> str:
 
 
 def candidate_row_key(candidate: SourceCandidate) -> Tuple[str, str, str, str]:
-    """Stable presentation key for one source/metadata row."""
+    """Presentation key for one source/metadata row."""
     return (
         _candidate_source_id(candidate),
         str(candidate.tvg_name or "").strip(),
         str(candidate.group_title or "").strip(),
         str(candidate.entry_title or "").strip(),
+    )
+
+
+def candidate_update_key(candidate: SourceCandidate) -> Tuple[str, int, str]:
+    """Stable row identity used to retain Last Updated across refreshes."""
+    return (
+        _candidate_source_id(candidate),
+        int(candidate.matching_entry_index or 0),
+        str(candidate.stream_url or candidate.raw_stream_url or "").strip(),
+    )
+
+
+def candidate_update_signature(candidate: SourceCandidate) -> Tuple[object, ...]:
+    return (
+        str(candidate.extra.get("source_name") or "").strip(),
+        str(candidate.tvg_name or "").strip(),
+        str(candidate.group_title or "").strip(),
+        str(candidate.entry_title or "").strip(),
+        candidate_state(candidate),
     )
 
 
@@ -206,10 +225,10 @@ def build_snapshot(
     config_messages: Sequence[str] = (),
     coordinator_window: Optional[CoordinatorWindow] = None,
     now: Optional[datetime] = None,
-    first_seen_registry: Optional[Dict[Tuple[str, str, str, str, str], datetime]] = None,
+    row_update_registry: Optional[Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]]] = None,
 ) -> DashboardSnapshot:
     current_time = now or datetime.now()
-    first_seen_registry = first_seen_registry if first_seen_registry is not None else {}
+    row_update_registry = row_update_registry if row_update_registry is not None else {}
     blocks: Dict[Tuple[str, str], IdentityBlock] = {}
     target_by_name = {view.target.name: view.target for view in target_views}
 
@@ -257,9 +276,12 @@ def build_snapshot(
         }
         for candidate in block.candidates:
             row_key = candidate_row_key(candidate)
-            global_key = (block.identity.serialized,) + row_key
-            first_seen = first_seen_registry.setdefault(global_key, current_time)
-            block.row_first_seen[row_key] = first_seen
+            global_key = (block.identity.serialized,) + candidate_update_key(candidate)
+            signature = candidate_update_signature(candidate)
+            previous_entry = row_update_registry.get(global_key)
+            if previous_entry is None or previous_entry[0] != signature:
+                row_update_registry[global_key] = (signature, current_time)
+            block.row_last_updated[row_key] = row_update_registry[global_key][1]
         block.best_candidate = _best_candidate(block.candidates, block.identity.provider)
         block.overall_state = "AVAILABLE" if block.best_candidate is not None else "UNUSABLE"
 
@@ -310,6 +332,8 @@ def diff_snapshots(
         new_sources = set(new.observations)
 
         for source_id in sorted(new_sources - old_sources):
+            for candidate in new.observations[source_id].candidates:
+                new.row_last_updated[candidate_row_key(candidate)] = current.created_at
             events.append(
                 ChangeEvent(
                     "SOURCE+",
@@ -358,6 +382,8 @@ def diff_snapshots(
                 details.append(f"State {before.state} -> {after.state}")
 
             if details:
+                for candidate in after.candidates:
+                    new.row_last_updated[candidate_row_key(candidate)] = current.created_at
                 events.append(
                     ChangeEvent(
                         "UPDATE",

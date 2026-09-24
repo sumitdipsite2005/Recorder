@@ -23,6 +23,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - Windows is the production terminal
+    msvcrt = None
+
 from recorder_coordinator.models import (
     ChangeEvent,
     CoordinatorWindow,
@@ -45,7 +50,6 @@ from recorder_coordinator.terminal import (
     clear_live_status_line,
     render_dashboard,
     render_header,
-    retire_live_status_after_user_command,
     set_live_status_line,
     update_display_order,
     watch_status_text,
@@ -691,7 +695,7 @@ def run_once(
     *,
     progress_callback: Optional[Callable[[str], None]] = None,
     context_callback: Optional[Callable[[DashboardSnapshot], None]] = None,
-    first_seen_registry: Optional[Dict[Tuple[str, str, str, str, str], datetime]] = None,
+    row_update_registry: Optional[Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]]] = None,
 ) -> Tuple[DashboardSnapshot, Tuple[ChangeEvent, ...]]:
     now = datetime.now()
     config_messages, _ = config_state.reload(now)
@@ -729,7 +733,7 @@ def run_once(
         config_messages=config_messages,
         coordinator_window=window,
         now=now,
-        first_seen_registry=first_seen_registry,
+        row_update_registry=row_update_registry,
     )
     events = diff_snapshots(previous, snapshot)
     return snapshot, events
@@ -777,6 +781,22 @@ def _command_reader(
     command_queue: "queue.Queue[str]",
     stop_event: threading.Event,
 ) -> None:
+    if os.name == "nt" and msvcrt is not None:
+        while not stop_event.is_set():
+            if not msvcrt.kbhit():
+                time.sleep(0.05)
+                continue
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
+            if key.casefold() == "r":
+                command_queue.put("r")
+            elif key == "\x03":
+                command_queue.put("__CTRL_C__")
+        return
+
     while not stop_event.is_set():
         try:
             value = input().strip()
@@ -801,7 +821,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
     state = CoordinatorConfigState(config_path)
     previous: Optional[DashboardSnapshot] = None
     display_order: Dict[str, List[str]] = {POLICY_ALL: [], POLICY_MANUAL: []}
-    first_seen_registry: Dict[Tuple[str, str, str, str, str], datetime] = {}
+    row_update_registry: Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]] = {}
     started = datetime.now()
     log_path = Path.cwd() / f"IDENTITY_COORDINATOR_{started:%Y%m%d_%H%M%S}.log"
 
@@ -844,7 +864,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             if previous is None and not once
                             else None
                         ),
-                        first_seen_registry=first_seen_registry,
+                        row_update_registry=row_update_registry,
                     )
                 except KeyboardInterrupt:
                     raise
@@ -966,16 +986,17 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     )
                 continue
 
-            retire_live_status_after_user_command()
             normalized = " ".join(command.split()).casefold()
+            if normalized == "__ctrl_c__":
+                clear_live_status_line()
+                print("\nIdentity Coordinator stopped by user.")
+                return 0
             if normalized in {"r", "refresh"}:
                 force_refresh = True
                 continue
 
             if normalized:
-                set_live_status_line(
-                    "Use r=refresh | Ctrl+C=exit"
-                )
+                set_live_status_line("Use r=refresh | Ctrl+C=exit")
             elif next_refresh_monotonic > 0:
                 set_live_status_line(
                     watch_status_text(last_scan_wall_time, next_refresh_monotonic)

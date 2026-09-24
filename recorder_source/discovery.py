@@ -21,7 +21,11 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 from .matching import evaluate_match
-from .quality import parse_hls_manifest_quality, probe_stream_quality_ffprobe
+from .quality import (
+    parse_hls_manifest_quality,
+    probe_stream_quality_ffprobe,
+    sample_stream_video_bitrate,
+)
 from .models import (
     PlaylistSourceSpec,
     SourceAcquisitionRequest,
@@ -806,6 +810,31 @@ def probe_candidate_hls(
                 # quality fallback failure must not turn a working source OFF.
                 ffprobe_failure = f"{type(error).__name__}: {error}"
 
+        bitrate_sample_failure = ""
+        if launchable and bitrate <= 0:
+            try:
+                sample_url = (
+                    str(hls_quality.get("manifest_variant_url") or "").strip()
+                    if is_hls and hls_quality
+                    else ""
+                ) or final_url or candidate.stream_url
+                sampled_bitrate = sample_stream_video_bitrate(
+                    sample_url,
+                    headers,
+                    sample_sec=4.0,
+                    timeout_sec=12.0,
+                )
+                if sampled_bitrate > 0:
+                    bitrate = sampled_bitrate
+                    quality_known = True
+                    quality_source = (
+                        quality_source + "+sample"
+                        if quality_source
+                        else "sample"
+                    )
+            except Exception as error:
+                bitrate_sample_failure = f"{type(error).__name__}: {error}"
+
         probe_status = (
             "expired" if expired_now else "working" if launchable else "unsupported"
         )
@@ -845,6 +874,8 @@ def probe_candidate_hls(
                 "quality_source": quality_source,
                 "video_fps_source": video_fps_source,
                 "ffprobe_probe_failure": ffprobe_failure,
+                "video_bitrate_source": "sample" if bitrate_sample_failure == "" and bitrate > 0 and "sample" in quality_source else "",
+                "bitrate_sample_failure": bitrate_sample_failure,
             },
         )
     except HTTPError as error:

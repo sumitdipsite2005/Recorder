@@ -371,7 +371,8 @@ def render_dashboard(
                 )
                 suffix: List[str] = []
                 if block.best_candidate is not None and quality_key == best_key:
-                    suffix.append(_marker("[BEST]", color))
+                    if len(quality_keys) > 1:
+                        suffix.append(_marker("[BEST]", color))
                     suffix.extend(
                         _marker(f"[{event.marker}]", color)
                         for event in quality_events.get(block_key, ())
@@ -406,9 +407,11 @@ def render_dashboard(
                     event_name = candidate.entry_title or candidate.tvg_name or "-"
                     tvg_name = candidate.tvg_name or "-"
                     group_name = candidate.group_title or "-"
-                    first_seen = block.row_first_seen.get(candidate_row_key(candidate))
-                    first_seen_text = (
-                        f"First seen {first_seen:%H:%M}" if first_seen is not None else "First seen -"
+                    last_updated = block.row_last_updated.get(candidate_row_key(candidate))
+                    last_updated_text = (
+                        f"Last Updated {last_updated:%H:%M}"
+                        if last_updated is not None
+                        else "Last Updated -"
                     )
                     trailing_state = (
                         ""
@@ -422,7 +425,7 @@ def render_dashboard(
                         f"{_secondary_text(tvg_name, color)} | "
                         f"{_group_text(group_name, color)} | "
                         f"{_muted_text(source.source_name, color)} | "
-                        f"{_secondary_text(first_seen_text, color)}"
+                        f"{_secondary_text(last_updated_text, color)}"
                         f"{trailing_state}"
                     )
                     for detail in details_to_show:
@@ -491,13 +494,6 @@ def clear_live_status_line() -> None:
     if _terminal_is_interactive():
         sys.stdout.write("\033[s\033[1A\r\033[2K\033[u")
         sys.stdout.flush()
-    _LIVE_STATUS_ACTIVE = False
-    _LIVE_STATUS_TEXT = ""
-
-
-def retire_live_status_after_user_command() -> None:
-    """Input moved the cursor; start a fresh WATCH row after the command."""
-    global _LIVE_STATUS_ACTIVE, _LIVE_STATUS_TEXT
     _LIVE_STATUS_ACTIVE = False
     _LIVE_STATUS_TEXT = ""
 

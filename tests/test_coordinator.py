@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -333,6 +334,11 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("Quality : 1920x1080 | 25p | 5000 Kbps",rendered)
         self.assertEqual(rendered.count("[ON] Asian Games"),2)
 
+    def test_single_quality_group_does_not_show_best_marker(self):
+        snap=snapshot([sony_candidate()])
+        rendered=coord.render_dashboard(snap,())
+        self.assertNotIn("[BEST]",rendered)
+
     def test_source_plus_marker_is_on_added_source_row_only(self):
         old=snapshot([sony_candidate(playlist="https://one/list",source_name="one")])
         new=snapshot([
@@ -367,25 +373,33 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertNotIn("[SOURCE-]",rendered)
         self.assertNotIn("two",rendered)
 
-    def test_first_seen_survives_unchanged_refresh(self):
+    def test_last_updated_stays_stable_until_row_changes(self):
         registry={}
         t1=datetime(2026,9,24,10,0,0)
         t2=datetime(2026,9,24,10,5,0)
-        c=sony_candidate()
+        t3=datetime(2026,9,24,10,7,0)
         first=coord.build_snapshot(
             (view(now=t1),),
-            {"T":(c,)},
+            {"T":(sony_candidate(title="Shooting"),)},
             now=t1,
-            first_seen_registry=registry,
+            row_update_registry=registry,
         )
         second=coord.build_snapshot(
             (view(now=t2),),
-            {"T":(c,)},
+            {"T":(sony_candidate(title="Shooting"),)},
             now=t2,
-            first_seen_registry=registry,
+            row_update_registry=registry,
         )
-        self.assertIn("First seen 10:00",coord.render_dashboard(first,()))
-        self.assertIn("First seen 10:00",coord.render_dashboard(second,()))
+        third=coord.build_snapshot(
+            (view(now=t3),),
+            {"T":(sony_candidate(title="Athletics"),)},
+            now=t3,
+            row_update_registry=registry,
+        )
+        coord.diff_snapshots(second,third)
+        self.assertIn("Last Updated 10:00",coord.render_dashboard(first,()))
+        self.assertIn("Last Updated 10:00",coord.render_dashboard(second,()))
+        self.assertIn("Last Updated 10:07",coord.render_dashboard(third,()))
 
     def test_header_keeps_each_target_on_one_logical_line(self):
         now=datetime(2026,9,24,17,28,57)
@@ -494,6 +508,24 @@ class SnapshotAndChangeTests(unittest.TestCase):
         a_id=next(x for x in ids if "lane:1/A/ENG" in x)
         b_id=next(x for x in ids if "lane:2/B/ENG" in x)
         self.assertEqual(order2[coord.POLICY_MANUAL],[b_id,a_id])
+
+
+    def test_windows_command_reader_accepts_r_without_enter(self):
+        q=queue.Queue()
+        stop=threading.Event()
+
+        class FakeMsvcrt:
+            @staticmethod
+            def kbhit():
+                return True
+            @staticmethod
+            def getwch():
+                stop.set()
+                return "r"
+
+        with patch.object(coord.os,"name","nt"), patch.object(coord,"msvcrt",FakeMsvcrt):
+            coord._command_reader(q,stop)
+        self.assertEqual(q.get_nowait(),"r")
 
 
 class TimingTests(unittest.TestCase):
