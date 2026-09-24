@@ -67,6 +67,13 @@ from recorder_source.models import (
     SourceAcquisitionRequest,
     SourceCandidate,
 )
+from recorder_source.policy import (
+    PLAYLIST_GROUP_MATCH_MODES as SHARED_PLAYLIST_GROUP_MATCH_MODES,
+    PLAYLIST_GROUP_PROFILES as SHARED_PLAYLIST_GROUP_PROFILES,
+    PLAYLIST_GROUP_SOURCE_BUCKETS as SHARED_PLAYLIST_GROUP_SOURCE_BUCKETS,
+    PLAYLIST_USER_AGENTS as SHARED_PLAYLIST_USER_AGENTS,
+    PROVIDER_SELECTION_POLICIES as SHARED_PROVIDER_SELECTION_POLICIES,
+)
 
 # User configuration is shared through OneDrive across all recorder machines.
 if sys.platform == "darwin":
@@ -131,14 +138,7 @@ PLAYLIST_HISTORY_STALE_LOCK_SEC = 5 * 60
 
 # Playlist group → command/runtime profile.
 # The user selects only NM3U8DL_PLAYLIST_GROUP above.
-NM3U8DL_PLAYLIST_GROUP_PROFILES = {
-    "HOTSTAR_EVENTS": "HOTSTAR",
-    "KHEL": "KHEL",
-    "JIO_STAR_SPORTS": "JIO",
-    "SONYLIV_EVENTS": "SONYLIV",
-    "SONY_TV": "SONYLIV",
-    "FANCODE": "FANCODE",
-}
+NM3U8DL_PLAYLIST_GROUP_PROFILES = dict(SHARED_PLAYLIST_GROUP_PROFILES)
 
 NM3U8DL_PLAYLIST_GROUP_PROFILE_OVERRIDES = {
     "SONY_TV": {
@@ -150,14 +150,7 @@ NM3U8DL_PLAYLIST_GROUP_PROFILE_OVERRIDES = {
 # profile. Fixed TV-channel groups use a strong channel phrase/alias match plus
 # qualifier gates; event groups keep flexible phrase matching for variable titles.
 # The historical EXACT_CHANNEL mode name is retained for compatibility/history.
-NM3U8DL_PLAYLIST_GROUP_MATCH_MODES = {
-    "HOTSTAR_EVENTS": "EVENT_PHRASE",
-    "JIO_STAR_SPORTS": "EXACT_CHANNEL",
-    "KHEL": "EXACT_CHANNEL",
-    "SONY_TV": "EXACT_CHANNEL",
-    "SONYLIV_EVENTS": "EVENT_PHRASE",
-    "FANCODE": "EVENT_PHRASE",
-}
+NM3U8DL_PLAYLIST_GROUP_MATCH_MODES = dict(SHARED_PLAYLIST_GROUP_MATCH_MODES)
 
 # Stream lifecycle belongs to the playlist group, independently of matching or
 # downloader profile. Event streams may genuinely end; linear TV channels should
@@ -185,7 +178,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "HOTSTAR": {
         "safe_overtime_min": 60,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": False,
+        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["HOTSTAR"].allow_unknown_expiry,
         "added_headers": {
             "Accept": "*/*",
             "Sec-GPC": "1",
@@ -201,7 +194,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "JIO": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": True,
+        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["JIO"].allow_unknown_expiry,
         "added_headers": {},
         "key_mode": "MP4DECRYPT",
         "extra_args": "--thread-count 1 --live-keep-segments",
@@ -217,7 +210,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "KHEL": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": True,
+        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["KHEL"].allow_unknown_expiry,
         "added_headers": {
             "Accept": "*/*",
             "Sec-GPC": "1",
@@ -229,7 +222,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "SONYLIV": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": True,
+        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["SONYLIV"].allow_unknown_expiry,
         "added_headers": {
             "Accept": "*/*",
             "Origin": "https://www.sonyliv.com",
@@ -252,8 +245,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "FANCODE": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": True,
-        "prefer_unknown_expiry_on_equal_quality": True,
+        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["FANCODE"].allow_unknown_expiry,
+        "prefer_unknown_expiry_on_equal_quality": SHARED_PROVIDER_SELECTION_POLICIES["FANCODE"].prefer_unknown_expiry_on_equal_quality,
         "added_headers": {
             "Accept": "*/*",
             "Origin": "https://www.fancode.com",
@@ -274,15 +267,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     },
 }
 
-NM3U8DL_PLAYLIST_USER_AGENTS = {
-    "DEFAULT": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/141.0.0.0 Safari/537.36"
-    ),
-    "OTT_NAVIGATOR": "OTT Navigator/1.7.1.4",
-    "TIVIMATE": "TiviMate",
-}
+NM3U8DL_PLAYLIST_USER_AGENTS = dict(SHARED_PLAYLIST_USER_AGENTS)
 
 
 # N_M3U8DL CONFIG (if DOWNLOAD_MODE == "N_m3u8DL-RE")
@@ -4601,11 +4586,7 @@ def get_nm3u8dl_playlist_source_bucket() -> str:
     """Return the configured playlist-source bucket for the active runtime group."""
     group_name = NM3U8DL_PLAYLIST_GROUP.strip().upper()
 
-    return {
-        "JIO_STAR_SPORTS": "TV",
-        "KHEL": "TV",
-        "SONY_TV": "TV",
-    }.get(group_name, group_name)
+    return SHARED_PLAYLIST_GROUP_SOURCE_BUCKETS.get(group_name, group_name)
 
 
 def get_nm3u8dl_playlist_urls() -> List[str]:

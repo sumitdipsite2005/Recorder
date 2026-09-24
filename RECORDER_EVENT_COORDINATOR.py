@@ -32,7 +32,15 @@ from recorder_source.discovery import (
 )
 from recorder_source.identity import CanonicalFeedIdentity, derive_feed_identity
 from recorder_source.matching import evaluate_match, make_match_definition
-from recorder_source.models import PlaylistSourceSpec, SelectionPolicy, SourceCandidate
+from recorder_source.models import PlaylistSourceSpec, SourceCandidate
+from recorder_source.policy import (
+    DEFAULT_SELECTION_POLICY,
+    PLAYLIST_GROUP_MATCH_MODES as GROUP_MATCH_MODE,
+    PLAYLIST_GROUP_PROFILES as GROUP_PROVIDER,
+    PLAYLIST_GROUP_SOURCE_BUCKETS as GROUP_SOURCE_BUCKET,
+    PLAYLIST_USER_AGENTS,
+    PROVIDER_SELECTION_POLICIES as PROVIDER_SELECTION_POLICY,
+)
 from recorder_source.selection import select_join_candidate, video_quality_rank
 
 
@@ -41,74 +49,6 @@ POLICY_ALL = "ALL_IDENTITIES"
 VALID_POLICIES = frozenset({POLICY_MANUAL, POLICY_ALL})
 
 DEFAULT_REFRESH_INTERVAL_SEC = 300
-PLAYLIST_USER_AGENTS = {
-    "DEFAULT": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-    ),
-    "OTT_NAVIGATOR": "OTT Navigator/1.7.1.4",
-    "TIVIMATE": "TiviMate",
-}
-
-DEFAULT_MANDATORY_MIN_REMAINING_SEC = 15 * 60
-DEFAULT_SELECTION_POLICY = SelectionPolicy(
-    mandatory_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-    upgrade_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-    allow_unknown_expiry=False,
-)
-
-GROUP_PROVIDER = {
-    "HOTSTAR_EVENTS": "HOTSTAR",
-    "KHEL": "KHEL",
-    "JIO_STAR_SPORTS": "JIO",
-    "SONYLIV_EVENTS": "SONYLIV",
-    "SONY_TV": "SONYLIV",
-    "FANCODE": "FANCODE",
-}
-
-GROUP_MATCH_MODE = {
-    "HOTSTAR_EVENTS": "EVENT_PHRASE",
-    "JIO_STAR_SPORTS": "EXACT_CHANNEL",
-    "KHEL": "EXACT_CHANNEL",
-    "SONY_TV": "EXACT_CHANNEL",
-    "SONYLIV_EVENTS": "EVENT_PHRASE",
-    "FANCODE": "EVENT_PHRASE",
-}
-
-GROUP_SOURCE_BUCKET = {
-    "JIO_STAR_SPORTS": "TV",
-    "KHEL": "TV",
-    "SONY_TV": "TV",
-}
-
-PROVIDER_SELECTION_POLICY = {
-    "HOTSTAR": SelectionPolicy(
-        mandatory_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        upgrade_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        allow_unknown_expiry=False,
-    ),
-    "SONYLIV": SelectionPolicy(
-        mandatory_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        upgrade_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        allow_unknown_expiry=True,
-    ),
-    "FANCODE": SelectionPolicy(
-        mandatory_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        upgrade_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        allow_unknown_expiry=True,
-        prefer_unknown_expiry_on_equal_quality=True,
-    ),
-    "JIO": SelectionPolicy(
-        mandatory_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        upgrade_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        allow_unknown_expiry=True,
-    ),
-    "KHEL": SelectionPolicy(
-        mandatory_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        upgrade_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
-        allow_unknown_expiry=True,
-    ),
-}
 
 
 @dataclass(frozen=True)
