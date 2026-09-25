@@ -586,11 +586,13 @@ def render_dashboard(
                         if state_text == "WORKING"
                         else " | " + _off_text(state_text, color)
                     )
-                    trailing_selection = (
-                        " | " + _secondary_text(selection_reason, color)
-                        if selection_reason
-                        else ""
-                    )
+                    trailing_selection = ""
+                    if selection_marker:
+                        trailing_selection = " | " + selection_marker.strip()
+                    elif selection_reason:
+                        trailing_selection = (
+                            " | " + _secondary_text(selection_reason, color)
+                        )
                     source_reference = effective_source_references.get(
                         str(source.source_id)
                     )
@@ -601,7 +603,7 @@ def render_dashboard(
                     )
                     lines.append(
                         "        "
-                        f"{marker_prefix}{on_off}{selection_marker} "
+                        f"{marker_prefix}{on_off} "
                         f"{_event_title(event_name, color)} | "
                         f"{_secondary_text(tvg_name, color)} | "
                         f"{_group_text(group_name, color)} | "
