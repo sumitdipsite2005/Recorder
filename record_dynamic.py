@@ -430,6 +430,14 @@ class EngineResult:
 
 
 @dataclass(frozen=True)
+class RecorderProcessOutcome:
+    """Terminal outcome exposed by the mature recorder process boundary."""
+
+    status: str  # manual_stopped | ended | error
+    reason: str
+
+
+@dataclass(frozen=True)
 class RecorderEngine:
     """Lightweight engine descriptor to enable clean future splits."""
 
@@ -450,6 +458,8 @@ class RecorderState:
 
     # Stop / timing
     stop_flag: bool = False
+    manual_stop_requested: bool = False
+    normal_terminal_reason: Optional[str] = None
     start_time: float = field(default_factory=time.time)
     deadline_ts: Optional[float] = None
     alarm_linger_until: Optional[float] = None
@@ -2635,6 +2645,7 @@ def make_signal_handler(state: RecorderState):
         )
         log("")
         log("Stopping by Ctrl-C...", level="WARN")
+        state.manual_stop_requested = True
         state.stop_flag = True
         if state.nm3u8dl_stop_event is not None:
             state.nm3u8dl_stop_event.set()
@@ -13565,6 +13576,18 @@ def resolve_nm3u8dl_launch_source(
                 f"Coordinator source        : "
                 f"{source.get('playlist_url') or 'unknown'}"
             )
+            fingerprint = str(
+                source.get("stream_fingerprint")
+                or get_nm3u8dl_stream_fingerprint(source)
+                or ""
+            ).strip()
+            if fingerprint:
+                source["stream_fingerprint"] = fingerprint
+            _nm3u8dl_set_running_stream_identity(state, source)
+            state.nm3u8dl_renewal_rollover_requested = False
+            state.nm3u8dl_rollover_reason = None
+            set_terminal_activity_context(None)
+            return source
 
         elif direct_retry_source is not None:
             set_terminal_activity_context(
@@ -17918,6 +17941,7 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         log_good_beep("recording_end_ok")
         beep_good(state)
         log(f"Max duration reached {format_current_duration_for_log(state)} → stopping loop.")
+        state.normal_terminal_reason = "duration_reached"
         state.stop_flag = True
         #return backoff_sec # # DO NOT return yet — we still want to accept the last chunk and write concat_list.txt
 
@@ -17956,6 +17980,7 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
             "N_m3u8DL explicit live-end confirmed → "
             "stopping overall recorder after final chunk."
         )
+        state.normal_terminal_reason = "live_stream_ended"
         state.stop_flag = True
 
     if (
@@ -18936,7 +18961,7 @@ def _apply_identity_launch_request(
 def run_recorder_process(
     *,
     identity_launch_request: Optional[IdentityLaunchRequest] = None,
-) -> None:
+) -> RecorderProcessOutcome:
     global FINAL_FILE
     global CHUNKS_DIR
     global LIST_FILE
@@ -18978,6 +19003,21 @@ def run_recorder_process(
 
         wait_until_start(state, selected_engine)
         main(state, selected_engine)
+
+        if state.manual_stop_requested:
+            return RecorderProcessOutcome(
+                status="manual_stopped",
+                reason="Ctrl-C requested by user",
+            )
+        if state.normal_terminal_reason:
+            return RecorderProcessOutcome(
+                status="ended",
+                reason=state.normal_terminal_reason,
+            )
+        return RecorderProcessOutcome(
+            status="error",
+            reason="recorder stopped without a normal terminal reason",
+        )
     finally:
         if osSleep:
             osSleep.uninhibit()
