@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import unittest
 
 from recorder_runtime.terminal_host import build_terminal_tab_argv
@@ -40,7 +40,7 @@ class TerminalHostTests(unittest.TestCase):
         argv = build_terminal_tab_argv(
             worker,
             title="Recorder — Example",
-            cwd=Path("/Users/test/Recorder"),
+            cwd=PurePosixPath("/Users/test/Recorder"),
             platform_name="darwin",
         )
 
