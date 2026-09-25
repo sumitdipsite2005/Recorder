@@ -569,7 +569,7 @@ def watch_status_text(
     return (
         f"Watching | Last scan {last_scan} | "
         f"Next scan {_format_countdown(next_refresh_monotonic - time.monotonic())} "
-        "| i=info | r=refresh | Ctrl+C=exit"
+        "| p=record | i=info | r=refresh | Ctrl+C=exit"
     )
 
 
@@ -599,12 +599,48 @@ def render_coordinator_controls(sound_state: SoundSnoozeState) -> str:
         "================ COORDINATOR INFORMATION & CONTROLS ================",
         f"Sound state : {coordinator_sound_state_text(sound_state)}",
         "",
+        "  P  Record a MANUAL identity",
         "  S  Sound / notification snooze",
         "  r  Refresh now",
         "  Ctrl+C  Exit",
         "====================================================================",
         "",
     ])
+
+
+def render_manual_record_menu(
+    snapshot: DashboardSnapshot,
+    identity_keys: Sequence[str],
+) -> str:
+    lines = [
+        "",
+        "================ RECORD MANUAL IDENTITY ================",
+    ]
+    for number, identity_key in enumerate(identity_keys, start=1):
+        block = snapshot.blocks[(POLICY_MANUAL, identity_key)]
+        candidate = block.best_candidate
+        title = (
+            str(candidate.entry_title or "").strip()
+            if candidate is not None
+            else ""
+        ) or (
+            str(candidate.tvg_name or "").strip()
+            if candidate is not None
+            else ""
+        ) or identity_key
+        quality = quality_text(candidate, include_provenance=False)
+        lines.append(f"  {number}. {title}")
+        lines.append(
+            f"     {block.identity.provider} | "
+            f"{block.identity.lane_key} | {quality}"
+        )
+    lines.extend([
+        "",
+        "Enter identity number and press Enter. Esc cancels.",
+        "========================================================",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 def render_sound_snooze_menu(sound_state: SoundSnoozeState) -> str:
