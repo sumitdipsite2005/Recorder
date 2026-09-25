@@ -67,6 +67,9 @@ JSON_HEADER_FIELD_ALIASES = {
 }
 JSON_HEADER_OBJECT_ALIASES = ("headers", "http_headers", "request_headers")
 
+# Playlist-document and GitHub metadata fetches use the mature default UA.
+DEFAULT_HTTP_USER_AGENT = PLAYLIST_USER_AGENTS["DEFAULT"]
+
 
 def build_effective_probe_headers(
     provider: str,
