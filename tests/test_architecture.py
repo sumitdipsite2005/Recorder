@@ -25,6 +25,23 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertNotIn('os.system("cls"', text)
         self.assertNotIn("record_dynamic_event_worker", text)
 
+    def test_manual_launch_keeps_command_building_inside_mature_recorder(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        coordinator=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
+        worker=(ROOT/"recorder_coordinator"/"worker.py").read_text(encoding="utf-8")
+        request=(ROOT/"recorder_runtime"/"identity_launch.py").read_text(encoding="utf-8")
+
+        self.assertIn("Using Coordinator-selected startup source", recorder)
+        self.assertIn("source = resolve_nm3u8dl_launch_source(state)", recorder)
+        self.assertIn('"N_m3u8DL-RE"', recorder)
+        self.assertNotIn("N_m3u8DL-RE", coordinator)
+        self.assertNotIn("N_m3u8DL-RE", worker)
+        self.assertNotIn("N_m3u8DL-RE", request)
+
+    def test_direct_dynamic_recorder_entrypoint_still_uses_same_process_runner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        self.assertIn('if __name__ == "__main__":\n    run_recorder_process()', recorder)
+
     def test_recorder_and_coordinator_share_sound_snooze_runtime_core(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         coordinator=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
