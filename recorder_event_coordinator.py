@@ -1007,6 +1007,7 @@ def _launch_manual_identity(
     *,
     registry_session_id: str,
     registry_store: IdentityRegistryStore,
+    config_path: Path,
 ):
     plan = build_manual_launch_plan(snapshot, identity_key)
     request = IdentityLaunchRequest(
@@ -1019,7 +1020,11 @@ def _launch_manual_identity(
         recording_duration_min=plan.recording_duration_min,
         base_name=plan.base_name,
     )
-    result = launch_identity_worker(request, registry_store)
+    result = launch_identity_worker(
+        request,
+        registry_store,
+        config_path=config_path,
+    )
     return plan, result
 
 
@@ -1403,6 +1408,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             identity_key,
                             registry_session_id=registry_status.session_id,
                             registry_store=registry_store,
+                            config_path=config_path,
                         )
                         message = (
                             f"Recording launched: {plan.base_name} "
