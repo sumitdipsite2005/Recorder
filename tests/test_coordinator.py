@@ -974,6 +974,10 @@ class SnapshotAndChangeTests(unittest.TestCase):
             f"{muted}  [S1] https://src1.test/list.m3u{reset}",
             rendered,
         )
+        self.assertIn(
+            f"{muted}SOURCE REFERENCES{reset}",
+            rendered,
+        )
 
     def test_update_delta_is_highlighted_yellow(self):
         old=snapshot([sony_candidate(title="Shooting")])
@@ -1155,6 +1159,102 @@ class SnapshotAndChangeTests(unittest.TestCase):
         a_id=next(x for x in ids if "lane:1/A/ENG" in x)
         b_id=next(x for x in ids if "lane:2/B/ENG" in x)
         self.assertEqual(order2[coord.POLICY_MANUAL],[b_id,a_id])
+
+    def test_display_order_ranks_identities_by_unusable_observation_count(self):
+        clean=[
+            sony_candidate(
+                lane="1/Clean/ENG",
+                playlist="https://clean-1/list",
+                source_name="clean-1",
+            ),
+            sony_candidate(
+                lane="1/Clean/ENG",
+                playlist="https://clean-2/list",
+                source_name="clean-2",
+            ),
+        ]
+        partial_one=[
+            sony_candidate(
+                lane="2/PartialOne/ENG",
+                playlist="https://partial-one-on/list",
+                source_name="partial-one-on",
+            ),
+            sony_candidate(
+                lane="2/PartialOne/ENG",
+                playlist="https://partial-one-off/list",
+                source_name="partial-one-off",
+                launchable=False,
+                status="hls_variant_unavailable",
+            ),
+        ]
+        partial_two=[
+            sony_candidate(
+                lane="3/PartialTwo/ENG",
+                playlist="https://partial-two-on/list",
+                source_name="partial-two-on",
+            ),
+            sony_candidate(
+                lane="3/PartialTwo/ENG",
+                playlist="https://partial-two-off-1/list",
+                source_name="partial-two-off-1",
+                launchable=False,
+                status="hls_variant_unavailable",
+            ),
+            sony_candidate(
+                lane="3/PartialTwo/ENG",
+                playlist="https://partial-two-off-2/list",
+                source_name="partial-two-off-2",
+                launchable=False,
+                status="hls_variant_unavailable",
+            ),
+        ]
+        all_off=[
+            sony_candidate(
+                lane="4/AllOff/ENG",
+                playlist="https://all-off-1/list",
+                source_name="all-off-1",
+                launchable=False,
+                status="hls_variant_unavailable",
+            ),
+            sony_candidate(
+                lane="4/AllOff/ENG",
+                playlist="https://all-off-2/list",
+                source_name="all-off-2",
+                launchable=False,
+                status="hls_variant_unavailable",
+            ),
+        ]
+        snap=snapshot(all_off+partial_two+partial_one+clean)
+        order=coord.update_display_order(
+            {coord.POLICY_MANUAL:[],coord.POLICY_ALL:[]},
+            snap,
+        )
+
+        self.assertEqual(
+            order[coord.POLICY_MANUAL],
+            [
+                next(
+                    identity
+                    for identity in order[coord.POLICY_MANUAL]
+                    if "lane:1/Clean/ENG" in identity
+                ),
+                next(
+                    identity
+                    for identity in order[coord.POLICY_MANUAL]
+                    if "lane:2/PartialOne/ENG" in identity
+                ),
+                next(
+                    identity
+                    for identity in order[coord.POLICY_MANUAL]
+                    if "lane:3/PartialTwo/ENG" in identity
+                ),
+                next(
+                    identity
+                    for identity in order[coord.POLICY_MANUAL]
+                    if "lane:4/AllOff/ENG" in identity
+                ),
+            ],
+        )
 
 
     def test_windows_command_reader_accepts_sound_without_enter(self):

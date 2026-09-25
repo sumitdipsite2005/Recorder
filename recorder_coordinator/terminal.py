@@ -603,7 +603,7 @@ def render_dashboard(
     ]
     if visible_source_references:
         lines.append("")
-        lines.append(_important_text("SOURCE REFERENCES", color))
+        lines.append(_source_reference_text("SOURCE REFERENCES", color))
         for number, source_id in sorted(visible_source_references):
             lines.append(
                 _source_reference_text(f"  [S{number}] {source_id}", color)
@@ -622,18 +622,71 @@ def render_dashboard(
     return "\n".join(lines)
 
 
+def _identity_usefulness_rank(block) -> Tuple[int, int]:
+    """Rank identities by how much of their visible source evidence is usable."""
+    states = [
+        candidate_state(candidate)
+        for candidate in block.candidates
+    ]
+    total = len(states)
+    unusable = sum(state != "WORKING" for state in states)
+
+    if unusable == 0:
+        category = 0
+    elif total > 0 and unusable < total:
+        category = 1
+    else:
+        category = 2
+
+    return category, unusable
+
+
 def update_display_order(
     previous_order: Mapping[str, Sequence[str]],
     snapshot: DashboardSnapshot,
 ) -> Dict[str, List[str]]:
-    """Keep existing identities stable; place genuinely new identities at top."""
+    """Order useful identities first while preserving stable order within ties."""
     result: Dict[str, List[str]] = {}
     for policy in (POLICY_ALL, POLICY_MANUAL):
-        current = [key[1] for key in snapshot.blocks if key[0] == policy]
+        policy_blocks = [
+            block
+            for key, block in snapshot.blocks.items()
+            if key[0] == policy
+        ]
+        current = [block.identity.serialized for block in policy_blocks]
         current_set = set(current)
-        old = [identity for identity in previous_order.get(policy, ()) if identity in current_set]
-        new = [identity for identity in current if identity not in old]
-        result[policy] = new + old
+        old = [
+            identity
+            for identity in previous_order.get(policy, ())
+            if identity in current_set
+        ]
+        old_position = {
+            identity: index
+            for index, identity in enumerate(old)
+        }
+        new_position = {
+            identity: index
+            for index, identity in enumerate(
+                identity
+                for identity in current
+                if identity not in old_position
+            )
+        }
+
+        policy_blocks.sort(
+            key=lambda block: (
+                *_identity_usefulness_rank(block),
+                0 if block.identity.serialized in new_position else 1,
+                new_position.get(
+                    block.identity.serialized,
+                    old_position.get(block.identity.serialized, 0),
+                ),
+            )
+        )
+        result[policy] = [
+            block.identity.serialized
+            for block in policy_blocks
+        ]
     return result
 
 
