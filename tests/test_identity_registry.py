@@ -116,7 +116,7 @@ class IdentityRegistryTests(unittest.TestCase):
             )
             self.assertEqual(list(store.paths.archive.iterdir()), [])
 
-    def test_definitively_dead_owned_worker_allows_new_session(self):
+    def test_definitively_dead_owned_worker_blocks_session_rollover(self):
         with tempfile.TemporaryDirectory() as td:
             store = self.make_store(td)
             first = store.prepare_session(now=FIXED_TIME)
@@ -138,12 +138,13 @@ class IdentityRegistryTests(unittest.TestCase):
                 now=FIXED_TIME,
             )
 
-            self.assertEqual(second.action, "ROLLED_OVER")
-            self.assertNotEqual(second.session_id, first.session_id)
+            self.assertEqual(second.action, "CONTINUED")
+            self.assertEqual(second.session_id, first.session_id)
             self.assertEqual(
-                len(list(store.paths.archive.glob("identity_registry_*.json"))),
-                1,
+                second.unresolved_identities,
+                ("sony|lane-a|english",),
             )
+            self.assertEqual(list(store.paths.archive.iterdir()), [])
 
     def test_claim_is_atomic_duplicate_prevention_boundary(self):
         with tempfile.TemporaryDirectory() as td:
