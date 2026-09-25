@@ -20,6 +20,8 @@ class RecorderOutputPaths:
     recording_logs: Path
     playlist_history: Path
     coordinator_logs: Path
+    identity_registry: Path
+    identity_registry_archive: Path
 
 
 def build_recorder_output_paths(value: PathValue) -> RecorderOutputPaths:
@@ -39,10 +41,13 @@ def build_recorder_output_paths(value: PathValue) -> RecorderOutputPaths:
         )
 
     recorder_logs = root / "recorder_logs"
+    identity_registry = recorder_logs / "identity_registry"
     return RecorderOutputPaths(
         root=root,
         recorder_logs=recorder_logs,
         recording_logs=recorder_logs / "recording_logs",
         playlist_history=recorder_logs / "playlist_history",
         coordinator_logs=recorder_logs / "coordinator_logs",
+        identity_registry=identity_registry,
+        identity_registry_archive=identity_registry / "archive",
     )
