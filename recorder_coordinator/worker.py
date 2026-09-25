@@ -44,8 +44,6 @@ def launch_identity_worker(
     """Claim one identity and create its independent recorder process."""
     request_path = write_launch_request_temp(request)
     claimed = False
-    popen = popen_factory or subprocess.Popen
-
     try:
         registry_store.claim(
             identity_key=request.identity_key,
@@ -112,10 +110,21 @@ def launch_identity_worker(
             pass
 
         if claimed:
-            registry_store.transition(
-                identity_key=request.identity_key,
-                new_state=STATE_CRASHED,
-                reason=f"worker creation failed: {type(error).__name__}: {error}",
-                expected_session_id=request.registry_session_id,
-            )
+            try:
+                registry = registry_store.read()
+                entry = registry["entries"].get(request.identity_key)
+                if isinstance(entry, dict) and entry.get("state") == "LAUNCHING":
+                    registry_store.transition(
+                        identity_key=request.identity_key,
+                        new_state=STATE_CRASHED,
+                        reason=(
+                            "worker creation failed: "
+                            f"{type(error).__name__}: {error}"
+                        ),
+                        expected_session_id=request.registry_session_id,
+                    )
+            except Exception:
+                # Preserve the original launch failure. Any unresolved ownership
+                # will be surfaced by the registry's fail-safe startup checks.
+                pass
         raise
