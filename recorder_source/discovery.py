@@ -14,9 +14,11 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
@@ -525,6 +527,189 @@ def discover_playlist_text(
     )
 
 
+def _parse_source_timestamp(value: object) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    upper = text.upper()
+    if upper.endswith(" IST"):
+        text = text[:-4].rstrip() + "+05:30"
+    elif upper.endswith(" UTC") or upper.endswith(" GMT"):
+        text = text[:-4].rstrip() + "+00:00"
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        pass
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+    ):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _embedded_playlist_generated_timestamp(text: str) -> Optional[float]:
+    """Extract an explicit generated/updated timestamp near the document header."""
+    timestamp_pattern = re.compile(
+        r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?"
+        r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}|\s+(?:UTC|GMT|IST))?"
+        r"|\d{2}[-/]\d{2}[-/]\d{4}\s+\d{2}:\d{2}(?::\d{2})?)",
+        re.IGNORECASE,
+    )
+    freshness_words = re.compile(
+        r"\b(?:generated|generated\s+at|generated\s+on|updated|updated\s+at|"
+        r"updated\s+on|last\s+updated)\b",
+        re.IGNORECASE,
+    )
+    for line in str(text or "").splitlines()[:80]:
+        if not freshness_words.search(line):
+            continue
+        match = timestamp_pattern.search(line)
+        if not match:
+            continue
+        parsed = _parse_source_timestamp(match.group(1))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _github_raw_file_parts(url: str) -> Optional[Tuple[str, str, str, str]]:
+    try:
+        parsed = urlsplit(str(url or ""))
+    except Exception:
+        return None
+    if parsed.netloc.casefold() != "raw.githubusercontent.com":
+        return None
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) < 4:
+        return None
+    owner, repo = parts[0], parts[1]
+    if len(parts) >= 6 and parts[2:4] == ["refs", "heads"]:
+        branch = parts[4]
+        file_parts = parts[5:]
+    else:
+        branch = parts[2]
+        file_parts = parts[3:]
+    if not branch or not file_parts:
+        return None
+    return owner, repo, branch, "/".join(file_parts)
+
+
+def _github_file_commit_timestamp(
+    playlist_url: str,
+    *,
+    timeout_sec: float = 8.0,
+) -> Optional[float]:
+    parts = _github_raw_file_parts(playlist_url)
+    if parts is None:
+        return None
+    owner, repo, branch, path = parts
+    api_url = (
+        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/commits"
+        f"?path={quote(path, safe='/')}&sha={quote(branch, safe='')}&per_page=1"
+    )
+    request = Request(
+        api_url,
+        headers={
+            "User-Agent": DEFAULT_HTTP_USER_AGENT,
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=float(timeout_sec)) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(payload, list) or not payload:
+        return None
+    commit = payload[0].get("commit") if isinstance(payload[0], dict) else None
+    if not isinstance(commit, dict):
+        return None
+    for section_name in ("committer", "author"):
+        section = commit.get(section_name)
+        if isinstance(section, dict):
+            parsed = _parse_source_timestamp(section.get("date"))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def resolve_playlist_source_freshness(
+    playlist_url: str,
+    text: str,
+    fetch_diagnostic: Optional[Mapping[str, object]] = None,
+    *,
+    previous: Optional[Mapping[str, object]] = None,
+    now_ts: Optional[float] = None,
+) -> Mapping[str, object]:
+    """Resolve best-known document freshness and preserve witnessed ordering.
+
+    On the first observation, prefer GitHub file commit time, then an explicit
+    generated/updated timestamp in the document, then HTTP Last-Modified.
+    During one Coordinator run, a changed document is stronger evidence: we
+    witnessed the newer version ourselves, so its observation time becomes the
+    freshness timestamp without another external lookup.
+    """
+    payload = str(text or "")
+    content_hash = hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+    previous_hash = str((previous or {}).get("content_hash") or "")
+    if previous_hash:
+        if previous_hash == content_hash:
+            return dict(previous or {})
+        return {
+            "timestamp": float(time.time() if now_ts is None else now_ts),
+            "source": "observed",
+            "content_hash": content_hash,
+        }
+
+    commit_ts = _github_file_commit_timestamp(playlist_url)
+    if commit_ts is not None:
+        return {
+            "timestamp": commit_ts,
+            "source": "commit",
+            "content_hash": content_hash,
+        }
+
+    generated_ts = _embedded_playlist_generated_timestamp(payload)
+    if generated_ts is not None:
+        return {
+            "timestamp": generated_ts,
+            "source": "generated",
+            "content_hash": content_hash,
+        }
+
+    last_modified = str((fetch_diagnostic or {}).get("last_modified") or "").strip()
+    if last_modified:
+        try:
+            parsed = parsedate_to_datetime(last_modified)
+            if parsed is not None:
+                return {
+                    "timestamp": parsed.timestamp(),
+                    "source": "last-modified",
+                    "content_hash": content_hash,
+                }
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    return {
+        "timestamp": None,
+        "source": "unknown",
+        "content_hash": content_hash,
+    }
+
+
 def fetch_playlist_documents(
     sources: Sequence[PlaylistSourceSpec],
     *,
@@ -553,7 +738,20 @@ def fetch_playlist_documents(
             payload = response.read()
             final_url = response.geturl()
             charset = response.headers.get_content_charset() or "utf-8"
-        return payload.decode(charset, errors="replace"), final_url, time.monotonic() - started
+            header_get = getattr(response.headers, "get", None)
+            last_modified = (
+                header_get("Last-Modified")
+                if callable(header_get)
+                else None
+            )
+            etag = header_get("ETag") if callable(header_get) else None
+        return (
+            payload.decode(charset, errors="replace"),
+            final_url,
+            time.monotonic() - started,
+            last_modified,
+            etag,
+        )
 
     worker_count = min(max(1, int(max_workers)), max(1, len(unique_sources)))
     if not unique_sources:
@@ -589,7 +787,7 @@ def fetch_playlist_documents(
                 "error": str(result),
             }
             continue
-        text, final_url, duration = result
+        text, final_url, duration, last_modified, etag = result
         documents[source.url] = text
         diagnostics[source.url] = {
             "ok": True,
@@ -597,6 +795,8 @@ def fetch_playlist_documents(
             "final_url": final_url,
             "fetch_duration_sec": round(float(duration), 4),
             "size_bytes": len(text.encode("utf-8", errors="replace")),
+            "last_modified": str(last_modified or ""),
+            "etag": str(etag or ""),
         }
 
     return documents, tuple(errors), diagnostics

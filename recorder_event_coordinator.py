@@ -64,6 +64,7 @@ from recorder_source.discovery import (
     fetch_playlist_documents,
     parse_playlist_text,
     probe_candidates,
+    resolve_playlist_source_freshness,
 )
 from recorder_source.identity import derive_feed_identity
 from recorder_source.matching import evaluate_match, make_match_definition
@@ -584,6 +585,7 @@ def acquire_active_targets(
     target_views: Sequence[TargetView],
     *,
     progress_callback: Optional[Callable[[str], None]] = None,
+    source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
 ) -> Tuple[Dict[str, Tuple[SourceCandidate, ...]], Tuple[str, ...]]:
     active = [view for view in target_views if view.status == "ACTIVE"]
     if not active:
@@ -612,10 +614,10 @@ def acquire_active_targets(
         url_source_specs.setdefault(spec.url, spec)
     source_specs = tuple(url_source_specs.values())
     if progress_callback is None:
-        documents, fetch_errors, _ = fetch_playlist_documents(source_specs)
+        documents, fetch_errors, fetch_diagnostics = fetch_playlist_documents(source_specs)
     else:
         progress_callback(f"Scanning playlists 0/{len(source_specs)}")
-        documents, fetch_errors, _ = fetch_playlist_documents(
+        documents, fetch_errors, fetch_diagnostics = fetch_playlist_documents(
             source_specs,
             progress_callback=(
                 lambda done, total: progress_callback(
@@ -623,6 +625,28 @@ def acquire_active_targets(
                 )
             ),
         )
+
+    freshness_by_url: Dict[str, Mapping[str, object]] = {}
+    freshness_now = time.time()
+    for spec in source_specs:
+        text = documents.get(spec.url)
+        if text is None:
+            continue
+        previous_freshness = (
+            source_freshness_registry.get(spec.url)
+            if source_freshness_registry is not None
+            else None
+        )
+        freshness = resolve_playlist_source_freshness(
+            spec.url,
+            text,
+            fetch_diagnostics.get(spec.url),
+            previous=previous_freshness,
+            now_ts=freshness_now,
+        )
+        freshness_by_url[spec.url] = freshness
+        if source_freshness_registry is not None:
+            source_freshness_registry[spec.url] = freshness
 
     parsed_by_key: Dict[Tuple[str, str, str], Tuple[SourceCandidate, ...]] = {}
     errors: List[str] = list(fetch_errors)
@@ -644,7 +668,21 @@ def acquire_active_targets(
                 f"{spec.name}: discovery parse failed ({type(error).__name__}: {error})"
             )
             continue
-        parsed_by_key[key] = result.candidates
+        freshness = freshness_by_url.get(
+            spec.url,
+            {"timestamp": None, "source": "unknown"},
+        )
+        parsed_by_key[key] = tuple(
+            replace(
+                candidate,
+                extra={
+                    **dict(candidate.extra),
+                    "source_freshness_ts": freshness.get("timestamp"),
+                    "source_freshness_source": freshness.get("source") or "unknown",
+                },
+            )
+            for candidate in result.candidates
+        )
 
     raw_candidates_by_target: Dict[str, List[SourceCandidate]] = {
         view.target.name: [] for view in active
@@ -756,6 +794,7 @@ def run_once(
     progress_callback: Optional[Callable[[str], None]] = None,
     context_callback: Optional[Callable[[DashboardSnapshot], None]] = None,
     row_update_registry: Optional[Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]]] = None,
+    source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
 ) -> Tuple[DashboardSnapshot, Tuple[ChangeEvent, ...]]:
     now = datetime.now()
     config_messages, _ = config_state.reload(now)
@@ -779,6 +818,7 @@ def run_once(
             raw,
             target_views,
             progress_callback=progress_callback,
+            source_freshness_registry=source_freshness_registry,
         )
     else:
         candidates_by_target, source_errors = {}, ()
@@ -884,6 +924,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
     previous: Optional[DashboardSnapshot] = None
     display_order: Dict[str, List[str]] = {POLICY_ALL: [], POLICY_MANUAL: []}
     row_update_registry: Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]] = {}
+    source_freshness_registry: Dict[str, Mapping[str, object]] = {}
     started = datetime.now()
     log_path = Path.cwd() / f"IDENTITY_COORDINATOR_{started:%Y%m%d_%H%M%S}.log"
 
@@ -941,6 +982,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             else None
                         ),
                         row_update_registry=row_update_registry,
+                        source_freshness_registry=source_freshness_registry,
                     )
                 except KeyboardInterrupt:
                     raise

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 import json
 import time
 import unittest
@@ -15,6 +16,7 @@ from recorder_source.discovery import (
     parse_playlist_text,
     probe_candidate_hls,
     probe_candidates,
+    resolve_playlist_source_freshness,
 )
 from recorder_source.quality import (
     format_candidate_quality,
@@ -331,6 +333,12 @@ https://cdn.test/live.mpd
         class Headers:
             def get_content_charset(self):
                 return "utf-8"
+            def get(self, name, default=None):
+                if name == "Last-Modified":
+                    return "Thu, 24 Sep 2026 15:30:00 GMT"
+                if name == "ETag":
+                    return '"abc"'
+                return default
         class Response:
             headers = Headers()
             def __init__(self, url): self.url = url
@@ -352,7 +360,81 @@ https://cdn.test/live.mpd
         self.assertIn("https://good.test/list.m3u", docs)
         self.assertEqual(len(errors), 1)
         self.assertTrue(diag["https://good.test/list.m3u"]["ok"])
+        self.assertEqual(
+            diag["https://good.test/list.m3u"]["last_modified"],
+            "Thu, 24 Sep 2026 15:30:00 GMT",
+        )
+        self.assertEqual(diag["https://good.test/list.m3u"]["etag"], '"abc"')
         self.assertFalse(diag["https://bad.test/list.m3u"]["ok"])
+
+    def test_playlist_freshness_prefers_github_commit_on_first_observation(self):
+        with patch(
+            "recorder_source.discovery._github_file_commit_timestamp",
+            return_value=1234.0,
+        ):
+            result=resolve_playlist_source_freshness(
+                "https://raw.githubusercontent.com/user/repo/main/list.m3u",
+                "# generated 2026-09-24 12:00:00\n",
+                {"last_modified":"Thu, 24 Sep 2026 11:00:00 GMT"},
+            )
+        self.assertEqual(result["timestamp"],1234.0)
+        self.assertEqual(result["source"],"commit")
+
+    def test_playlist_freshness_uses_generated_before_last_modified(self):
+        with patch(
+            "recorder_source.discovery._github_file_commit_timestamp",
+            return_value=None,
+        ):
+            result=resolve_playlist_source_freshness(
+                "https://example.test/list.m3u",
+                "# Generated at 2026-09-24 12:30:00+00:00\n#EXTM3U\n",
+                {"last_modified":"Thu, 24 Sep 2026 11:00:00 GMT"},
+            )
+        self.assertEqual(result["source"],"generated")
+        self.assertEqual(
+            result["timestamp"],
+            datetime.fromisoformat("2026-09-24 12:30:00+00:00").timestamp(),
+        )
+
+    def test_playlist_freshness_uses_last_modified_when_no_stronger_signal(self):
+        with patch(
+            "recorder_source.discovery._github_file_commit_timestamp",
+            return_value=None,
+        ):
+            result=resolve_playlist_source_freshness(
+                "https://example.test/list.m3u",
+                "#EXTM3U\n",
+                {"last_modified":"Thu, 24 Sep 2026 11:00:00 GMT"},
+            )
+        self.assertEqual(result["source"],"last-modified")
+
+    def test_playlist_freshness_reuses_same_document_and_observes_changed_document(self):
+        with patch(
+            "recorder_source.discovery._github_file_commit_timestamp",
+            return_value=None,
+        ):
+            first=resolve_playlist_source_freshness(
+                "https://example.test/list.m3u",
+                "#EXTM3U\n",
+                {},
+            )
+        same=resolve_playlist_source_freshness(
+            "https://example.test/list.m3u",
+            "#EXTM3U\n",
+            {},
+            previous=first,
+            now_ts=2000,
+        )
+        changed=resolve_playlist_source_freshness(
+            "https://example.test/list.m3u",
+            "#EXTM3U\n# changed\n",
+            {},
+            previous=first,
+            now_ts=2000,
+        )
+        self.assertEqual(same["source"],"unknown")
+        self.assertEqual(changed["source"],"observed")
+        self.assertEqual(changed["timestamp"],2000.0)
 
     def test_probe_no_playable_source_does_not_make_network_request(self):
         c = candidate(stream_url="", launchable=False, probe_status="unprobed")

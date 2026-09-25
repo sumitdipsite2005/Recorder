@@ -554,6 +554,61 @@ class SnapshotAndChangeTests(unittest.TestCase):
         rendered=coord.render_dashboard(snap,())
         self.assertLess(rendered.index("[ON] Newer"),rendered.index("[ON] Older"))
 
+    def test_dashboard_shows_source_freshness_time_and_evidence(self):
+        item=sony_candidate()
+        source_time=datetime(2026,9,24,9,45,30).timestamp()
+        item=replace(
+            item,
+            extra={
+                **dict(item.extra),
+                "source_freshness_ts":source_time,
+                "source_freshness_source":"commit",
+            },
+        )
+        rendered=coord.render_dashboard(snapshot([item]),())
+        self.assertIn(
+            "Source Updated 2026-09-24 09:45:30 [commit]",
+            rendered,
+        )
+
+    def test_equal_last_updated_rows_use_source_freshness_as_tiebreaker(self):
+        older=sony_candidate(
+            playlist="https://older/list",
+            source_name="older",
+            title="Older source",
+        )
+        newer=sony_candidate(
+            playlist="https://newer/list",
+            source_name="newer",
+            title="Newer source",
+        )
+        older=replace(
+            older,
+            extra={
+                **dict(older.extra),
+                "source_freshness_ts":1000.0,
+                "source_freshness_source":"commit",
+            },
+        )
+        newer=replace(
+            newer,
+            extra={
+                **dict(newer.extra),
+                "source_freshness_ts":2000.0,
+                "source_freshness_source":"commit",
+            },
+        )
+        snap=snapshot([older,newer])
+        block=next(iter(snap.blocks.values()))
+        tied=datetime(2026,9,24,10,0,0)
+        block.row_last_updated[candidate_row_key(older)]=tied
+        block.row_last_updated[candidate_row_key(newer)]=tied
+        rendered=coord.render_dashboard(snap,())
+        self.assertLess(
+            rendered.index("[ON] Newer source"),
+            rendered.index("[ON] Older source"),
+        )
+
     def test_coordinator_info_does_not_repeat_info_entry_control(self):
         state=coord.SoundSnoozeState()
         rendered=coord.render_coordinator_controls(state)

@@ -380,6 +380,7 @@ def render_dashboard(
                             candidate_row_key(item[1]),
                             datetime.min,
                         ),
+                        float(item[1].extra.get("source_freshness_ts") or 0.0),
                     ),
                     reverse=True,
                 )
@@ -433,6 +434,21 @@ def render_dashboard(
                         if last_updated is not None
                         else "Last Updated -"
                     )
+                    freshness_ts = candidate.extra.get("source_freshness_ts")
+                    freshness_source = str(
+                        candidate.extra.get("source_freshness_source") or "unknown"
+                    )
+                    if freshness_ts is not None:
+                        try:
+                            freshness_time = datetime.fromtimestamp(float(freshness_ts))
+                            freshness_text = (
+                                f"Source Updated {freshness_time:%Y-%m-%d %H:%M:%S} "
+                                f"[{freshness_source}]"
+                            )
+                        except (TypeError, ValueError, OSError, OverflowError):
+                            freshness_text = "Source Updated - [unknown]"
+                    else:
+                        freshness_text = f"Source Updated - [{freshness_source}]"
                     trailing_state = (
                         ""
                         if state_text == "WORKING"
@@ -445,7 +461,8 @@ def render_dashboard(
                         f"{_secondary_text(tvg_name, color)} | "
                         f"{_group_text(group_name, color)} | "
                         f"{_muted_text(source.source_name, color)} | "
-                        f"{_secondary_text(last_updated_text, color)}"
+                        f"{_secondary_text(last_updated_text, color)} | "
+                        f"{_secondary_text(freshness_text, color)}"
                         f"{trailing_state}"
                     )
                     for detail in details_to_show:
