@@ -25,8 +25,10 @@ import xml.etree.ElementTree as ET
 
 from .matching import evaluate_match
 from .quality import (
+    extract_auth_expiry,
     inspect_dash_manifest_drm,
     inspect_hls_manifest_drm,
+    parse_dash_manifest_quality,
     parse_hls_manifest_quality,
     probe_stream_quality_ffprobe,
     quality_probe_identity,
@@ -929,15 +931,8 @@ def fetch_playlist_documents(
 
 
 def _extract_expiry(*values: str) -> Optional[float]:
-    expiries: List[int] = []
-    for value in values:
-        text = str(value or "")
-        for match in re.finditer(r"(?i)(?:^|[?&/~=/])(?:exp|expires|expiry)=(\d{9,12})", text):
-            try:
-                expiries.append(int(match.group(1)))
-            except ValueError:
-                continue
-    return float(min(expiries)) if expiries else None
+    value = extract_auth_expiry(*values)
+    return float(value) if value is not None else None
 
 
 def _parse_hls_quality(text: str, manifest_url: str = "") -> Optional[dict]:
@@ -947,85 +942,6 @@ def _parse_hls_quality(text: str, manifest_url: str = "") -> Optional[dict]:
         motion_cap_fps=50.0,
         expiry_parser=lambda value: _extract_expiry(value),
     )
-
-
-def _parse_dash_frame_rate(value: str) -> float:
-    text = str(value or "").strip()
-    if not text:
-        return 0.0
-    if "/" in text:
-        left, right = text.split("/", 1)
-        try:
-            denominator = float(right)
-            return float(left) / denominator if denominator else 0.0
-        except ValueError:
-            return 0.0
-    try:
-        return float(text)
-    except ValueError:
-        return 0.0
-
-
-def _parse_dash_quality(text: str) -> Tuple[bool, int, int, float, int, str, bool]:
-    """Parse the best advertised DASH video representation conservatively."""
-    try:
-        root = ET.fromstring(text)
-    except ET.ParseError:
-        return False, 0, 0, 0.0, 0, "", False
-
-    widevine = "edef8ba9" in text.casefold() or "widevine" in text.casefold()
-    best = None
-    for adaptation in root.iter():
-        if adaptation.tag.rsplit("}", 1)[-1] != "AdaptationSet":
-            continue
-        try:
-            adaptation_width = int(adaptation.attrib.get("width") or 0)
-            adaptation_height = int(adaptation.attrib.get("height") or 0)
-        except ValueError:
-            adaptation_width = adaptation_height = 0
-        adaptation_fps = adaptation.attrib.get("frameRate") or ""
-        adaptation_scan = normalize_video_scan_type(
-            adaptation.attrib.get("scanType") or ""
-        )
-        adaptation_type = str(adaptation.attrib.get("contentType") or "").casefold()
-        adaptation_mime = str(adaptation.attrib.get("mimeType") or "").casefold()
-
-        for element in adaptation:
-            if element.tag.rsplit("}", 1)[-1] != "Representation":
-                continue
-            try:
-                width = int(element.attrib.get("width") or adaptation_width or 0)
-                height = int(element.attrib.get("height") or adaptation_height or 0)
-                bitrate = int(element.attrib.get("bandwidth") or 0)
-            except ValueError:
-                width = height = bitrate = 0
-            fps = _parse_dash_frame_rate(
-                element.attrib.get("frameRate") or adaptation_fps
-            )
-            mime = str(
-                element.attrib.get("mimeType") or adaptation_mime or ""
-            ).casefold()
-            is_video = (
-                adaptation_type == "video"
-                or "video" in adaptation_mime
-                or "video" in mime
-                or (width > 0 and height > 0)
-                or fps > 0
-            )
-            if not is_video:
-                continue
-            scan_type = (
-                normalize_video_scan_type(element.attrib.get("scanType") or "")
-                or adaptation_scan
-            )
-            rank = (1 if fps >= 49 else 0, height, fps, width * height, bitrate)
-            if best is None or rank > best[0]:
-                best = (rank, width, height, fps, bitrate, scan_type)
-
-    if best is None:
-        return False, 0, 0, 0.0, 0, "", widevine
-    _, width, height, fps, bitrate, scan_type = best
-    return True, width, height, fps, bitrate, scan_type, widevine
 
 
 def _effective_probe_headers(candidate: SourceCandidate) -> Dict[str, str]:
@@ -1097,16 +1013,30 @@ def probe_candidate_hls(
         is_hls = "#EXTM3U" in text or "mpegurl" in content_type.casefold()
         is_dash = "<MPD" in text[:500] or "dash+xml" in content_type.casefold()
         hls_quality = None
+        dash_quality = None
         if is_dash:
-            (
-                quality_known,
-                width,
-                height,
-                fps,
-                bitrate,
-                scan_type,
-                _widevine_signal,
-            ) = _parse_dash_quality(text)
+            dash_quality = parse_dash_manifest_quality(
+                text,
+                final_url,
+                motion_cap_fps=50.0,
+            )
+            if dash_quality:
+                quality_known = bool(dash_quality.get("quality_known"))
+                width = int(dash_quality.get("video_width") or 0)
+                height = int(dash_quality.get("video_height") or 0)
+                fps = float(dash_quality.get("video_fps") or 0.0)
+                bitrate = int(dash_quality.get("video_bitrate_bps") or 0)
+                scan_type = str(dash_quality.get("video_scan_type") or "")
+                manifest_expiry = _merge_expiries(
+                    manifest_expiry,
+                    dash_quality.get("manifest_expiry"),
+                )
+                expiry = _merge_expiries(url_header_expiry, manifest_expiry)
+            else:
+                quality_known = False
+                width = height = bitrate = 0
+                fps = 0.0
+                scan_type = ""
             manifest_drm = inspect_dash_manifest_drm(text)
         else:
             hls_quality = _parse_hls_quality(text, final_url)
@@ -1387,6 +1317,11 @@ def probe_candidate_hls(
                     else ""
                 ),
                 "manifest_expiry": manifest_expiry,
+                **({
+                    key: value
+                    for key, value in dict(dash_quality or {}).items()
+                    if str(key).startswith("_dash_")
+                }),
                 "drm_protected": bool(manifest_drm.get("drm_protected")),
                 "drm_key_required": drm_key_required,
                 "drm_key_missing": drm_key_missing,
