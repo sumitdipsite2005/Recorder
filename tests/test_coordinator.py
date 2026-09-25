@@ -554,6 +554,18 @@ class SnapshotAndChangeTests(unittest.TestCase):
         rendered=coord.render_dashboard(snap,())
         self.assertLess(rendered.index("[ON] Newer"),rendered.index("[ON] Older"))
 
+    def test_coordinator_info_does_not_repeat_info_entry_control(self):
+        state=coord.SoundSnoozeState()
+        rendered=coord.render_coordinator_controls(state)
+        self.assertNotIn("I  Coordinator information & controls",rendered)
+        self.assertIn("S  Sound / notification snooze",rendered)
+
+    def test_watch_footer_advertises_info_not_nested_sound_control(self):
+        rendered=coord.watch_status_text(0.0,coord.time.monotonic()+60)
+        self.assertIn("i=info",rendered)
+        self.assertNotIn("s=sound",rendered)
+        self.assertIn("r=refresh",rendered)
+
     def test_sound_snooze_menu_has_coordinator_scopes_only(self):
         state=coord.SoundSnoozeState()
         rendered=coord.render_sound_snooze_menu(state)
