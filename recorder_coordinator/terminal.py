@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -37,6 +38,7 @@ def _terminal_is_interactive() -> bool:
 # Palette sampled from the user's NextPVR reference and deliberately kept soft.
 _EVENT_RGB = (41, 159, 214)       # #299FD6
 _MARKER_RGB = (255, 135, 3)       # #FF8703
+_CHANGE_DETAIL_RGB = (255, 215, 0)
 _SECONDARY_RGB = (176, 176, 176)
 _MUTED_RGB = (118, 118, 118)
 _IDENTITY_RGB = (145, 153, 160)
@@ -64,7 +66,11 @@ def _identity_text(text: str, use_color: bool) -> str:
 
 
 def _group_text(text: str, use_color: bool) -> str:
-    return _paint_rgb(text, _IDENTITY_RGB, use_color)
+    return _paint_rgb(text, _EVENT_RGB, use_color)
+
+
+def _change_detail_text(text: str, use_color: bool) -> str:
+    return _paint_rgb(text, _CHANGE_DETAIL_RGB, use_color)
 
 
 def _important_text(text: str, use_color: bool) -> str:
@@ -365,6 +371,15 @@ def render_dashboard(
             source_marker_consumed = set()
             for quality_key in quality_keys:
                 rows = grouped[quality_key]
+                rows.sort(
+                    key=lambda item: (
+                        block.row_last_updated.get(
+                            candidate_row_key(item[1]),
+                            datetime.min,
+                        ),
+                    ),
+                    reverse=True,
+                )
                 representative = rows[0][1]
                 quality_label = quality_text(
                     representative if representative.quality_known else None
@@ -389,7 +404,9 @@ def render_dashboard(
                 if block.best_candidate is not None and quality_key == best_key:
                     for event in quality_events.get(block_key, ()):
                         for detail in event.details:
-                            lines.append(f"              {_secondary_text(detail, color)}")
+                            lines.append(
+                                f"              {_change_detail_text(detail, color)}"
+                            )
 
                 for source, candidate in rows:
                     row_events = source_events.get((block_key, source.source_id), ())
@@ -429,7 +446,9 @@ def render_dashboard(
                         f"{trailing_state}"
                     )
                     for detail in details_to_show:
-                        lines.append(f"             {_secondary_text(detail, color)}")
+                        lines.append(
+                            f"             {_change_detail_text(detail, color)}"
+                        )
 
             if index != len(policy_blocks):
                 lines.append("")
@@ -528,11 +547,27 @@ def write_log(path: Path, text: str) -> None:
         handle.write(text.rstrip() + "\n")
 
 
+COORDINATOR_NOTIFICATION_SOUND_FILENAME = "coordinator_notification.wav"
+
+
+def _coordinator_notification_sound_path() -> Path:
+    """Resolve the optional one-shot Coordinator sound beside the repo scripts."""
+    return Path(__file__).resolve().parent.parent / COORDINATOR_NOTIFICATION_SOUND_FILENAME
+
+
 def beep(events: Sequence[ChangeEvent]) -> None:
     if winsound is None or not any(event.beep for event in events):
         return
     try:
-        # Lower, longer notes than the recorder GOOD alert: noticeable but less sharp.
+        sound_path = _coordinator_notification_sound_path()
+        if sound_path.is_file():
+            winsound.PlaySound(
+                str(sound_path),
+                winsound.SND_FILENAME | winsound.SND_ASYNC,
+            )
+            return
+
+        # Safe fallback when the custom WAV is not installed on this machine.
         winsound.Beep(523, 180)
         winsound.Beep(659, 320)
     except Exception:

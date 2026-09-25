@@ -501,19 +501,62 @@ class SnapshotAndChangeTests(unittest.TestCase):
             coord.run_once(FakeState(),None,context_callback=context)
         self.assertEqual(order[:2],["header","acquire"])
 
-    def test_nextpvr_reference_palette_is_used_for_event_and_marker(self):
-        snap=snapshot([sony_candidate()])
+    def test_nextpvr_reference_palette_is_used_for_event_group_and_marker(self):
+        snap=snapshot([sony_candidate(group="Hockey")])
         rendered=coord.render_dashboard(
             snap,
             (coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,next(iter(snap.blocks))[1]),("x",),True),),
             use_color=True,
         )
         self.assertIn("\033[38;2;41;159;214mAsian Games\033[0m",rendered)
+        self.assertIn("\033[38;2;41;159;214mHockey\033[0m",rendered)
         self.assertIn("\033[38;2;255;135;3m[NEW]\033[0m",rendered)
 
-    def test_coordinator_notification_uses_softer_two_note_pattern(self):
+    def test_update_delta_is_highlighted_yellow(self):
+        old=snapshot([sony_candidate(title="Shooting")])
+        new=snapshot([sony_candidate(title="Athletics")])
+        events=coord.diff_snapshots(old,new)
+        rendered=coord.render_dashboard(new,events,use_color=True)
+        self.assertIn(
+            "\033[38;2;255;215;0mEvent Shooting -> Athletics\033[0m",
+            rendered,
+        )
+
+    def test_rows_within_quality_group_sort_by_last_updated_newest_first(self):
+        older=sony_candidate(
+            playlist="https://older/list",
+            source_name="older",
+            title="Older",
+        )
+        newer=sony_candidate(
+            playlist="https://newer/list",
+            source_name="newer",
+            title="Newer",
+        )
+        snap=snapshot([older,newer])
+        block=next(iter(snap.blocks.values()))
+        block.row_last_updated[coord.candidate_row_key(older)]=datetime(2026,9,24,10,0,0)
+        block.row_last_updated[coord.candidate_row_key(newer)]=datetime(2026,9,24,10,5,0)
+        rendered=coord.render_dashboard(snap,())
+        self.assertLess(rendered.index("[ON] Newer"),rendered.index("[ON] Older"))
+
+    def test_coordinator_notification_prefers_custom_wav(self):
         event=coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,"id"),("appeared",),beep=True)
-        with patch("recorder_coordinator.terminal.winsound") as sound:
+        with patch("recorder_coordinator.terminal.winsound") as sound, patch(
+            "recorder_coordinator.terminal._coordinator_notification_sound_path"
+        ) as path:
+            path.return_value.is_file.return_value=True
+            path.return_value.__str__.return_value="coordinator_notification.wav"
+            coord.beep((event,))
+        sound.PlaySound.assert_called_once()
+        sound.Beep.assert_not_called()
+
+    def test_coordinator_notification_falls_back_to_two_note_pattern(self):
+        event=coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,"id"),("appeared",),beep=True)
+        with patch("recorder_coordinator.terminal.winsound") as sound, patch(
+            "recorder_coordinator.terminal._coordinator_notification_sound_path"
+        ) as path:
+            path.return_value.is_file.return_value=False
             coord.beep((event,))
         self.assertEqual(
             [call.args for call in sound.Beep.call_args_list],
