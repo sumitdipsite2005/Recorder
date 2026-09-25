@@ -7472,131 +7472,26 @@ def _fetch_nm3u8dl_stream_manifest_text(
     include_final_url: bool = False,
     stop_requested: Optional[Callable[[], bool]] = None,
 ):
-    if _is_nm3u8dl_drmlive_host(stream_url):
-        if stop_requested is not None and stop_requested():
-            raise RuntimeError(
-                "Quality probe cancelled by stop request"
-            )
-
-        curl_user_agent = "OTT Navigator/1.7.1.4"
-        curl_headers = None
-
-        # Preserve the proven HLS behavior. Direct DRMLive DASH wrappers are
-        # different: after IP activation they require the playlist entry's own
-        # headers to redirect to the real signed upstream MPD.
-        if _get_nm3u8dl_stream_type_from_url(stream_url) == "DASH":
-            request_headers = get_nm3u8dl_ascii_safe_request_headers(
-                headers,
-                emit_logs=False,
-            )
-            curl_headers = request_headers
-
-            for name, value in request_headers.items():
-                if str(name).casefold() == "user-agent":
-                    curl_user_agent = str(value)
-                    break
-
-        def fetch_curl_once():
-            return _run_nm3u8dl_curl_get_text(
-                stream_url,
-                curl_user_agent,
-                headers=curl_headers,
-                timeout_sec=(
-                    NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC
-                    + 5
-                ),
-            )
-
-        manifest_text, _, final_url, _ = (
-            _run_nm3u8dl_retryable_http_get(
-                fetch_curl_once,
-                stop_requested=stop_requested,
-            )
+    def on_curl_timeout(error, timeout_sec, source_url):
+        log_timeout_exception(
+            error,
+            "curl",
+            timeout_sec,
+            context="GET",
+            source=source_url,
         )
 
-        if include_final_url:
-            return manifest_text, final_url
-
-        return manifest_text
-
-    request_headers = get_nm3u8dl_ascii_safe_request_headers(
+    manifest_text, final_url = source_transport.fetch_stream_manifest_text(
+        stream_url,
         headers,
-        emit_logs=False,
-    )
-
-    if not any(
-        str(name).casefold() == "user-agent"
-        and str(value).strip()
-        for name, value in request_headers.items()
-    ):
-        request_headers["User-Agent"] = str(
-            NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"]
-        )
-
-    def fetch_urllib_once():
-        request = Request(stream_url, headers=request_headers)
-
-        with urlopen(
-            request,
-            timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-        ) as response:
-            # read1() may return an arbitrarily short prefix (for example only the
-            # XML declaration), which can make a valid DASH MPD look like a
-            # non-manifest. read() fills the bounded 64 KiB sniff unless EOF.
-            read_chunk = response.read
-
-            if stop_requested is not None and stop_requested():
-                raise RuntimeError("Quality probe cancelled by stop request")
-
-            # A bad redirect can point at a large media/file payload instead of a
-            # manifest. One bounded 64 KiB read is enough to reject that response
-            # without downloading the entire file. Real HLS/DASH manifests are still
-            # read completely, in chunks, so normal manifest parsing is unchanged.
-            first_bytes = read_chunk(64 * 1024)
-            first_text = first_bytes.decode(
-                "utf-8-sig",
-                errors="replace",
-            )
-            stripped_first = first_text.lstrip()
-            looks_like_manifest = (
-                stripped_first.startswith("#EXTM3U")
-                or re.search(
-                    r'<(?:[A-Za-z_][\w.-]*:)?MPD\b',
-                    stripped_first,
-                    re.IGNORECASE,
-                )
-                is not None
-            )
-
-            manifest_chunks = [first_bytes]
-
-            if looks_like_manifest:
-                while True:
-                    if stop_requested is not None and stop_requested():
-                        raise RuntimeError("Quality probe cancelled by stop request")
-
-                    chunk = read_chunk(64 * 1024)
-                    if not chunk:
-                        break
-
-                    manifest_chunks.append(chunk)
-
-            manifest_text = b"".join(manifest_chunks).decode(
-                "utf-8-sig",
-                errors="replace",
-            )
-            final_url = str(response.geturl() or stream_url).strip()
-
-        return manifest_text, final_url
-
-    manifest_text, final_url = _run_nm3u8dl_retryable_http_get(
-        fetch_urllib_once,
+        default_user_agent=NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"],
         stop_requested=stop_requested,
+        urlopen_fn=urlopen,
+        subprocess_runner=subprocess.run,
+        timeout_callback=on_curl_timeout,
     )
-
     if include_final_url:
         return manifest_text, final_url
-
     return manifest_text
 
 
@@ -8041,88 +7936,7 @@ def _run_nm3u8dl_external_capture_redacted(
 
 
 def _get_nm3u8dl_dash_resource_routes(quality: dict) -> List[dict]:
-    """Return DASH representation routes, selected route first when known."""
-    routes = []
-
-    for original_index, route in enumerate(quality.get("_dash_resource_routes") or []):
-        if not isinstance(route, dict):
-            continue
-        normalized = {
-            "_route_index": int(original_index),
-            "base_url": str(route.get("base_url") or "").strip(),
-            "initialization_url": str(
-                route.get("initialization_url") or ""
-            ).strip(),
-            "initialization_range": str(
-                route.get("initialization_range") or ""
-            ).strip(),
-            "media_urls": [
-                str(value or "").strip()
-                for value in (route.get("media_urls") or [])
-                if str(value or "").strip()
-            ],
-            "media_ranges": list(route.get("media_ranges") or []),
-            "media_self_contained": bool(
-                route.get("media_self_contained", False)
-            ),
-        }
-        if normalized not in routes:
-            routes.append(normalized)
-
-    if not routes:
-        routes.append({
-            "_route_index": 0,
-            "base_url": str(
-                quality.get("_dash_representation_base_url") or ""
-            ).strip(),
-            "initialization_url": str(
-                quality.get("_dash_initialization_url") or ""
-            ).strip(),
-            "initialization_range": str(
-                quality.get("_dash_initialization_range") or ""
-            ).strip(),
-            "media_urls": [
-                str(value or "").strip()
-                for value in (quality.get("_dash_media_urls") or [])
-                if str(value or "").strip()
-            ],
-            "media_ranges": list(quality.get("_dash_media_ranges") or []),
-            "media_self_contained": bool(
-                quality.get("_dash_media_self_contained", False)
-            ),
-        })
-
-    try:
-        selected_index = int(quality.get("_dash_selected_route_index"))
-    except Exception:
-        selected_index = -1
-
-    selected_route = next(
-        (
-            route
-            for route in routes
-            if int(route.get("_route_index", -1)) == selected_index
-        ),
-        None,
-    )
-    if selected_route is not None:
-        routes = [selected_route] + [
-            route
-            for route in routes
-            if route is not selected_route
-        ]
-
-    return routes
-
-
-def _nm3u8dl_single_byte_range(byte_range: str = "") -> str:
-    """Reduce a DASH byte range to one byte for redirect/effective-URL probing."""
-    range_text = str(byte_range or "").strip()
-    match = re.fullmatch(r"(\d+)\s*-\s*(\d+)?", range_text)
-    if match:
-        start = match.group(1)
-        return f"{start}-{start}"
-    return "0-0"
+    return source_transport.dash_resource_routes(quality)
 
 
 def _build_nm3u8dl_http_request_headers(
@@ -8130,77 +7944,11 @@ def _build_nm3u8dl_http_request_headers(
     *,
     byte_range: str = "",
 ) -> dict:
-    request_headers = get_nm3u8dl_ascii_safe_request_headers(
+    return source_transport.build_resource_request_headers(
         headers,
-        emit_logs=False,
+        default_user_agent=NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"],
+        byte_range=byte_range,
     )
-    if not any(
-        str(name).casefold() == "user-agent" and str(value).strip()
-        for name, value in request_headers.items()
-    ):
-        request_headers["User-Agent"] = str(
-            NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"]
-        )
-    if byte_range:
-        request_headers["Range"] = f"bytes={byte_range}"
-    return request_headers
-
-
-def _resolve_nm3u8dl_http_resource_final_url(
-    resource_url: str,
-    headers: dict,
-    *,
-    byte_range: str = "",
-    stop_requested: Optional[Callable[[], bool]] = None,
-) -> str:
-    """Follow one media-resource GET and return the final effective URL."""
-    request_headers = _build_nm3u8dl_http_request_headers(
-        headers,
-        byte_range=_nm3u8dl_single_byte_range(byte_range),
-    )
-
-    def fetch_once():
-        request = Request(resource_url, headers=request_headers)
-        with urlopen(
-            request,
-            timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-        ) as response:
-            # Read only enough to make the GET real. Servers that ignore Range
-            # are still bounded because the response is closed immediately.
-            response.read(1)
-            return str(response.geturl() or resource_url).strip()
-
-    try:
-        return str(
-            _run_nm3u8dl_retryable_http_get(
-                fetch_once,
-                stop_requested=stop_requested,
-            )
-            or resource_url
-        ).strip()
-    except HTTPError as error:
-        # Some origins reject Range requests even though a normal GET works.
-        if int(getattr(error, "code", 0) or 0) != 416:
-            raise
-
-    request_headers = _build_nm3u8dl_http_request_headers(headers)
-
-    def fetch_without_range_once():
-        request = Request(resource_url, headers=request_headers)
-        with urlopen(
-            request,
-            timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-        ) as response:
-            response.read(1)
-            return str(response.geturl() or resource_url).strip()
-
-    return str(
-        _run_nm3u8dl_retryable_http_get(
-            fetch_without_range_once,
-            stop_requested=stop_requested,
-        )
-        or resource_url
-    ).strip()
 
 
 def _resolve_nm3u8dl_selected_dash_resource_route(
@@ -8209,67 +7957,15 @@ def _resolve_nm3u8dl_selected_dash_resource_route(
     *,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> dict:
-    """Resolve one usable selected-representation resource across BaseURL alternatives."""
-    routes = _get_nm3u8dl_dash_resource_routes(quality)
-    failures = []
-
-    for route in routes:
-        route_index = int(route.get("_route_index", 0) or 0)
-        media_urls = list(route.get("media_urls") or [])
-        media_ranges = list(route.get("media_ranges") or [])
-        resource_candidates = []
-
-        for index, media_url in enumerate(media_urls[:3]):
-            resource_candidates.append((
-                str(media_url or "").strip(),
-                (
-                    str(media_ranges[index] or "").strip()
-                    if index < len(media_ranges)
-                    else ""
-                ),
-            ))
-
-        if not resource_candidates and route.get("initialization_url"):
-            resource_candidates.append((
-                str(route.get("initialization_url") or "").strip(),
-                str(route.get("initialization_range") or "").strip(),
-            ))
-
-        for request_url, request_range in resource_candidates:
-            if not request_url:
-                continue
-
-            try:
-                final_url = _resolve_nm3u8dl_http_resource_final_url(
-                    request_url,
-                    headers,
-                    byte_range=request_range,
-                    stop_requested=stop_requested,
-                )
-                return {
-                    "route_index": route_index,
-                    "request_url": request_url,
-                    "final_url": final_url,
-                    "resource_expiry": _merge_nm3u8dl_auth_expiries(
-                        get_nm3u8dl_auth_expiry(request_url),
-                        get_nm3u8dl_auth_expiry(final_url),
-                    ),
-                    "failure": "",
-                }
-            except Exception as error:
-                if stop_requested is not None and stop_requested():
-                    raise
-                failure = _describe_nm3u8dl_probe_exception(error)
-                if failure:
-                    failures.append(failure)
-
-    return {
-        "route_index": None,
-        "request_url": "",
-        "final_url": "",
-        "resource_expiry": None,
-        "failure": next((value for value in failures if value), ""),
-    }
+    return source_transport.resolve_selected_dash_resource_route(
+        quality,
+        headers,
+        default_user_agent=NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"],
+        expiry_parser=get_nm3u8dl_auth_expiry,
+        stop_requested=stop_requested,
+        urlopen_fn=urlopen,
+        error_describer=_describe_nm3u8dl_probe_exception,
+    )
 
 
 def _fetch_nm3u8dl_binary_resource(
