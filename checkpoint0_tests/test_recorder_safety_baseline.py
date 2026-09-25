@@ -38,6 +38,7 @@ def _load_recorder():
                 "SCHEDULE_START = None",
                 "RUN_DURATION_MIN = 1",
                 'BASE_NAME = "CHECKPOINT0"',
+                f"RECORDING_OUTPUT_DIR = {str(Path(temp_root.name) / 'Manual Recordings')!r}",
                 "",
             ]
         ),
