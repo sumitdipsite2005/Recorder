@@ -541,7 +541,7 @@ def watch_status_text(
     return (
         f"Watching | Last scan {last_scan} | "
         f"Next scan {_format_countdown(next_refresh_monotonic - time.monotonic())} "
-        "| i=info | s=sound | r=refresh | Ctrl+C=exit"
+        "| i=info | r=refresh | Ctrl+C=exit"
     )
 
 
@@ -571,7 +571,6 @@ def render_coordinator_controls(sound_state: SoundSnoozeState) -> str:
         "================ COORDINATOR INFORMATION & CONTROLS ================",
         f"Sound state : {coordinator_sound_state_text(sound_state)}",
         "",
-        "  I  Coordinator information & controls",
         "  S  Sound / notification snooze",
         "  r  Refresh now",
         "  Ctrl+C  Exit",
