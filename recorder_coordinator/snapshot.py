@@ -289,6 +289,10 @@ def build_snapshot(
         target_views=tuple(target_views),
         coordinator_window=coordinator_window,
         blocks=blocks,
+        candidates_by_target={
+            name: tuple(items)
+            for name, items in candidates_by_target.items()
+        },
         source_errors=tuple(source_errors),
         config_messages=tuple(config_messages),
     )
