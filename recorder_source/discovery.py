@@ -994,24 +994,25 @@ def probe_candidate_hls(
         )
 
     try:
-        def fetch_manifest_once():
-            request = Request(candidate.stream_url, headers=headers)
-            with urlopen(request, timeout=timeout_value) as response:
-                return (
-                    response.read(1024 * 1024),
-                    response.geturl(),
-                    str(response.headers.get("Content-Type") or ""),
-                )
-
-        payload, final_url, content_type = source_transport.run_retryable_http_get(
-            fetch_manifest_once,
+        text, final_url = source_transport.fetch_stream_manifest_text(
+            candidate.stream_url,
+            headers,
+            default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
+            urlopen_fn=urlopen,
         )
-        text = payload.decode("utf-8", errors="replace")
         manifest_expiry = _extract_expiry(final_url, text)
         expiry = _merge_expiries(url_header_expiry, manifest_expiry)
 
-        is_hls = "#EXTM3U" in text or "mpegurl" in content_type.casefold()
-        is_dash = "<MPD" in text[:500] or "dash+xml" in content_type.casefold()
+        stripped_manifest = text.lstrip()
+        is_hls = stripped_manifest.startswith("#EXTM3U")
+        is_dash = (
+            re.search(
+                r'<(?:[A-Za-z_][\w.-]*:)?MPD\b',
+                stripped_manifest,
+                re.IGNORECASE,
+            )
+            is not None
+        )
         hls_quality = None
         dash_quality = None
         if is_dash:
@@ -1038,7 +1039,23 @@ def probe_candidate_hls(
                 fps = 0.0
                 scan_type = ""
             manifest_drm = inspect_dash_manifest_drm(text)
+
+            resource_route = source_transport.resolve_selected_dash_resource_route(
+                dash_quality or {},
+                headers,
+                default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
+                expiry_parser=_extract_expiry,
+                urlopen_fn=urlopen,
+            )
+            resource_expiry = resource_route.get("resource_expiry")
+            expiry = _merge_expiries(
+                url_header_expiry,
+                manifest_expiry,
+                resource_expiry,
+            )
         else:
+            resource_route = {}
+            resource_expiry = None
             hls_quality = _parse_hls_quality(text, final_url)
             if hls_quality:
                 quality_known = bool(hls_quality.get("quality_known"))
@@ -1058,6 +1075,8 @@ def probe_candidate_hls(
                 fps = 0.0
                 scan_type = ""
             manifest_drm = inspect_hls_manifest_drm(text)
+            resource_route = {}
+            resource_expiry = None
 
         drm_inspection_failure = ""
         if (
@@ -1073,17 +1092,12 @@ def probe_candidate_hls(
                 child_text = ""
                 child_error = None
 
-                def fetch_child_once():
-                    request = Request(variant_url, headers=headers)
-                    with urlopen(request, timeout=timeout_value) as response:
-                        return response.read().decode(
-                            "utf-8-sig",
-                            errors="replace",
-                        )
-
                 try:
-                    child_text = source_transport.run_retryable_http_get(
-                        fetch_child_once,
+                    child_text, _ = source_transport.fetch_stream_manifest_text(
+                        variant_url,
+                        headers,
+                        default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
+                        urlopen_fn=urlopen,
                     )
                 except HTTPError as error:
                     child_error = error
@@ -1317,6 +1331,14 @@ def probe_candidate_hls(
                     else ""
                 ),
                 "manifest_expiry": manifest_expiry,
+                "resource_expiry": resource_expiry,
+                "selected_media_final_url": str(
+                    resource_route.get("final_url") or ""
+                ),
+                "resource_probe_failure": str(
+                    resource_route.get("failure") or ""
+                ),
+                "_dash_selected_route_index": resource_route.get("route_index"),
                 **({
                     key: value
                     for key, value in dict(dash_quality or {}).items()
@@ -1390,6 +1412,7 @@ def _reuse_probe_result(
     expiry = _merge_expiries(
         _candidate_url_header_expiry(candidate),
         merged_extra.get("manifest_expiry"),
+        merged_extra.get("resource_expiry"),
     )
     expired_now = expiry is not None and expiry <= time.time()
     transport_launchable = bool(
