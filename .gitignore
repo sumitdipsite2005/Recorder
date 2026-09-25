@@ -182,4 +182,4 @@ cython_debug/
 
 # Local recorder sound files
 alarm.wav
-Happy_Notification.wav
+happy_notification.wav

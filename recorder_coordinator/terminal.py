@@ -547,7 +547,7 @@ def write_log(path: Path, text: str) -> None:
         handle.write(text.rstrip() + "\n")
 
 
-COORDINATOR_NOTIFICATION_SOUND_FILENAME = "Happy_Notification.wav"
+COORDINATOR_NOTIFICATION_SOUND_FILENAME = "happy_notification.wav"
 
 
 def _coordinator_notification_sound_path() -> Path:
