@@ -496,7 +496,11 @@ class IdentityRegistryStore:
             live = worker_liveness(pid)
             if live is True:
                 has_live_worker = True
-            elif live is None:
+            else:
+                # ACTIVE/WAITING ownership with no provably live worker is not a
+                # cleanly completed session. False means definite process loss;
+                # None means liveness could not be established. Both must block
+                # rollover until a human or lifecycle handler resolves the state.
                 unresolved.append(identity_key)
 
         return has_live_worker, tuple(sorted(unresolved))
