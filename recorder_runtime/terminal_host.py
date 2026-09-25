@@ -45,9 +45,10 @@ def _macos_tab_argv(
     title: str,
     cwd: Path,
 ) -> list[str]:
+    safe_title = shlex.quote(str(title))
     shell_command = (
         f"cd {shlex.quote(str(cwd))} && "
-        f"printf '\\033]0;{title}\\007' && "
+        f"printf '\\033]0;%s\\007' {safe_title} && "
         f"{shlex.join(list(worker_command))}"
     )
     escaped = _apple_script_string(shell_command)
