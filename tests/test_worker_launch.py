@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,20 +60,28 @@ class WorkerLaunchTests(unittest.TestCase):
             class FakeProcess:
                 pid = 4321
 
-            def fake_popen(command, **kwargs):
+            def fake_terminal_launcher(command, **kwargs):
                 registry = store.read()
                 captured["state_at_spawn"] = registry["entries"][
                     request.identity_key
                 ]["state"]
                 captured["command"] = command
                 captured["kwargs"] = kwargs
+                store.transition(
+                    identity_key=request.identity_key,
+                    new_state="ACTIVE",
+                    worker_pid=4321,
+                    reason="test worker started",
+                    expected_session_id=request.registry_session_id,
+                )
                 return FakeProcess()
 
             result = launch_identity_worker(
                 request,
                 store,
                 config_path=config_path,
-                popen_factory=fake_popen,
+                terminal_launcher=fake_terminal_launcher,
+                startup_timeout_sec=1.0,
             )
             request_index = captured["command"].index("--request") + 1
             config_index = captured["command"].index("--config") + 1
@@ -91,10 +98,11 @@ class WorkerLaunchTests(unittest.TestCase):
                     Path(captured["command"][config_index]),
                     config_path.resolve(),
                 )
-                if os.name == "nt":
-                    self.assertIn("creationflags", captured["kwargs"])
-                else:
-                    self.assertTrue(captured["kwargs"].get("start_new_session"))
+                self.assertIn("title", captured["kwargs"])
+                self.assertEqual(
+                    Path(captured["kwargs"]["cwd"]),
+                    Path(__file__).resolve().parents[1],
+                )
             finally:
                 request_path.unlink(missing_ok=True)
 
@@ -103,7 +111,7 @@ class WorkerLaunchTests(unittest.TestCase):
             store, request, config_path = self.make_store_and_request(td)
             captured_path = None
 
-            def failing_popen(command, **_kwargs):
+            def failing_terminal_launcher(command, **_kwargs):
                 nonlocal captured_path
                 captured_path = Path(
                     command[command.index("--request") + 1]
@@ -115,7 +123,8 @@ class WorkerLaunchTests(unittest.TestCase):
                     request,
                     store,
                     config_path=config_path,
-                    popen_factory=failing_popen,
+                    terminal_launcher=failing_terminal_launcher,
+                    startup_timeout_sec=1.0,
                 )
 
             registry = store.read()
