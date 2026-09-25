@@ -86,6 +86,7 @@ from recorder_source.policy import (
 
 
 DEFAULT_REFRESH_INTERVAL_SEC = 300
+REGISTRY_REFRESH_INTERVAL_SEC = 1.0
 
 
 class CoordinatorConfigState:
@@ -223,6 +224,20 @@ def _default_config_path() -> Path:
 def _coordinator_output_paths(config_path: Path):
     raw = runpy.run_path(str(config_path))
     return build_recorder_output_paths(raw.get("RECORDING_OUTPUT_DIR"))
+
+
+def _registry_entries_snapshot(
+    registry_store: IdentityRegistryStore,
+) -> Dict[str, Mapping[str, object]]:
+    registry = registry_store.read()
+    entries = registry.get("entries")
+    if not isinstance(entries, Mapping):
+        raise RuntimeError("identity registry entries are missing or invalid")
+    return {
+        str(identity_key): dict(entry)
+        for identity_key, entry in entries.items()
+        if isinstance(identity_key, str) and isinstance(entry, Mapping)
+    }
 
 
 def _coordinator_log_path(
@@ -1161,6 +1176,12 @@ def run(config_path: Path, *, once: bool = False) -> int:
         print(warning)
         write_log(log_path, warning)
 
+    registry_entries = _registry_entries_snapshot(registry_store)
+    next_registry_refresh_monotonic = (
+        time.monotonic() + REGISTRY_REFRESH_INTERVAL_SEC
+    )
+    registry_read_error_signature = ""
+
     command_queue: "queue.Queue[str]" = queue.Queue()
     stop_event = threading.Event()
     if not once:
@@ -1181,6 +1202,58 @@ def run(config_path: Path, *, once: bool = False) -> int:
 
     try:
         while not stop_event.is_set():
+            now_monotonic = time.monotonic()
+            if now_monotonic >= next_registry_refresh_monotonic:
+                next_registry_refresh_monotonic = (
+                    now_monotonic + REGISTRY_REFRESH_INTERVAL_SEC
+                )
+                try:
+                    fresh_registry_entries = _registry_entries_snapshot(
+                        registry_store
+                    )
+                except Exception as error:
+                    signature = f"{type(error).__name__}: {error}"
+                    if signature != registry_read_error_signature:
+                        write_log(
+                            log_path,
+                            (
+                                f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                                "REGISTRY STATUS READ WARNING — "
+                                f"{signature}"
+                            ),
+                        )
+                    registry_read_error_signature = signature
+                else:
+                    registry_read_error_signature = ""
+                    if fresh_registry_entries != registry_entries:
+                        registry_entries = fresh_registry_entries
+                        if (
+                            previous is not None
+                            and not force_refresh
+                            and not record_menu_open
+                            and not sound_menu_open
+                        ):
+                            clear_live_status_line()
+                            terminal_text = render_dashboard(
+                                previous,
+                                (),
+                                display_order,
+                                config_path=config_path,
+                                refresh_interval_sec=state.refresh_interval_sec,
+                                use_color=True,
+                                registry_entries=registry_entries,
+                            )
+                            clear_dashboard_terminal()
+                            print(terminal_text)
+                            dashboard_has_transient = False
+                            if next_refresh_monotonic > 0:
+                                set_live_status_line(
+                                    watch_status_text(
+                                        last_scan_wall_time,
+                                        next_refresh_monotonic,
+                                    )
+                                )
+
             if sound_state.sound_snooze_mode == "timed":
                 before = sound_state.sound_snooze_mode
                 if not runtime_sound.is_sound_snoozed(
@@ -1276,6 +1349,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         config_path=config_path,
                         refresh_interval_sec=state.refresh_interval_sec,
                         use_color=True,
+                        registry_entries=registry_entries,
                     )
                     clear_dashboard_terminal()
                     print(terminal_text)
@@ -1288,6 +1362,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             config_path=config_path,
                             refresh_interval_sec=state.refresh_interval_sec,
                             use_color=False,
+                            registry_entries=registry_entries,
                         )
                         write_log(log_path, log_text)
                         for event in events:
@@ -1490,7 +1565,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             ),
                         )
 
-                    force_refresh = True
+                    next_registry_refresh_monotonic = 0.0
                     continue
 
                 if next_refresh_monotonic > 0:

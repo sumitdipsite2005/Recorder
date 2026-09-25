@@ -33,6 +33,10 @@ from .snapshot import candidate_row_key, candidate_state, quality_text
 _LIVE_STATUS_ACTIVE = False
 _LIVE_STATUS_TEXT = ""
 
+_RUNTIME_REGISTRY_STATES = frozenset(
+    {"LAUNCHING", "ACTIVE", "WAITING_FOR_SOURCE"}
+)
+
 
 def _terminal_is_interactive() -> bool:
     try:
@@ -289,6 +293,7 @@ def render_dashboard(
     config_path: Optional[Path] = None,
     refresh_interval_sec: Optional[float] = None,
     use_color: Optional[bool] = None,
+    registry_entries: Optional[Mapping[str, Mapping[str, object]]] = None,
 ) -> str:
     color = _terminal_is_interactive() if use_color is None else bool(use_color)
     identity_events, source_events, quality_events = _event_maps(events)
@@ -298,6 +303,38 @@ def render_dashboard(
         config_path=config_path,
         refresh_interval_sec=refresh_interval_sec,
     )
+
+    current_registry = registry_entries or {}
+    active_entries = []
+    for identity_key, entry in current_registry.items():
+        if not isinstance(entry, Mapping):
+            continue
+        state = str(entry.get("state") or "").strip().upper()
+        if state not in _RUNTIME_REGISTRY_STATES:
+            continue
+        active_entries.append((identity_key, entry, state))
+
+    if active_entries:
+        lines.append("")
+        lines.append("ACTIVE RECORDINGS")
+        for identity_key, entry, state in sorted(
+            active_entries,
+            key=lambda item: (
+                str(item[1].get("display_name") or item[0]).casefold(),
+                item[0],
+            ),
+        ):
+            display_name = str(entry.get("display_name") or identity_key)
+            provider = str(entry.get("provider") or "-")
+            pid = entry.get("worker_pid")
+            pid_text = (
+                str(pid)
+                if isinstance(pid, int) and not isinstance(pid, bool)
+                else "-"
+            )
+            lines.append(
+                f"  [{state}] {display_name} | {provider} | PID {pid_text}"
+            )
 
     lines.append("")
     lines.append("=" * 88)
@@ -337,11 +374,24 @@ def render_dashboard(
                 else serialized
             )
             identity_marker = _marker_text(identity_events.get(block_key, ()), color)
-            state_label = (
-                _important_text(block.overall_state, color)
-                if block.overall_state == "AVAILABLE"
-                else _off_text(block.overall_state, color)
+            registry_entry = current_registry.get(serialized)
+            registry_state = (
+                str(registry_entry.get("state") or "").strip().upper()
+                if isinstance(registry_entry, Mapping)
+                else ""
             )
+            visible_state = registry_state or block.overall_state
+            if visible_state in {
+                "AVAILABLE",
+                "LAUNCHING",
+                "ACTIVE",
+                "WAITING_FOR_SOURCE",
+            }:
+                state_label = _important_text(visible_state, color)
+            elif visible_state in {"ENDED", "MANUALLY_STOPPED"}:
+                state_label = _muted_text(visible_state, color)
+            else:
+                state_label = _off_text(visible_state, color)
             lines.append(
                 f"{identity_marker}[{index}] {state_label} {block.identity.provider} "
                 f"| Identity: {_identity_text(identity_value, color)} "

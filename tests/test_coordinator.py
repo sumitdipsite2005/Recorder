@@ -529,6 +529,59 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps",rendered)
         self.assertIn("Identity: lane:2120305/AG_Strea2309/ENG",rendered)
 
+    def test_dashboard_overlays_registry_state_and_active_recordings(self):
+        snap=snapshot([sony_candidate()])
+        identity_key=next(
+            identity
+            for policy,identity in snap.blocks
+            if policy==coord.POLICY_MANUAL
+        )
+        rendered=coord.render_dashboard(
+            snap,
+            (),
+            registry_entries={
+                identity_key:{
+                    "identity":identity_key,
+                    "provider":"SONYLIV",
+                    "display_name":"ENG _ Asian Games",
+                    "state":"ACTIVE",
+                    "worker_pid":4321,
+                }
+            },
+        )
+        identity_line=next(
+            line for line in rendered.splitlines() if "Identity:" in line
+        )
+        self.assertIn("[1] ACTIVE SONYLIV",identity_line)
+        self.assertIn("ACTIVE RECORDINGS",rendered)
+        self.assertIn("[ACTIVE] ENG _ Asian Games | SONYLIV | PID 4321",rendered)
+
+    def test_dashboard_terminal_registry_state_suppresses_available_label(self):
+        snap=snapshot([sony_candidate()])
+        identity_key=next(
+            identity
+            for policy,identity in snap.blocks
+            if policy==coord.POLICY_MANUAL
+        )
+        rendered=coord.render_dashboard(
+            snap,
+            (),
+            registry_entries={
+                identity_key:{
+                    "identity":identity_key,
+                    "provider":"SONYLIV",
+                    "display_name":"ENG _ Asian Games",
+                    "state":"MANUALLY_STOPPED",
+                    "worker_pid":4321,
+                }
+            },
+        )
+        identity_line=next(
+            line for line in rendered.splitlines() if "Identity:" in line
+        )
+        self.assertIn("[1] MANUALLY_STOPPED SONYLIV",identity_line)
+        self.assertNotIn("ACTIVE RECORDINGS",rendered)
+
     def test_dashboard_quality_shows_shared_quality_evidence(self):
         item=replace(
             sony_candidate(),
