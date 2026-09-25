@@ -97,6 +97,88 @@ class OutputPathTests(unittest.TestCase):
             self.assertTrue(log_path.parent.is_dir())
 
 
+class ManualRecordLaunchTests(unittest.TestCase):
+    def test_registry_blocks_duplicate_launch_without_hiding_dashboard_identity(self):
+        snap = snapshot([sony_candidate()])
+        identity_key = next(
+            identity
+            for policy, identity in snap.blocks
+            if policy == coord.POLICY_MANUAL
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = coord.build_recorder_output_paths(Path(td) / "Recordings")
+            store = coord.IdentityRegistryStore(paths)
+            status = store.prepare_session()
+            display_order = {
+                coord.POLICY_ALL: [],
+                coord.POLICY_MANUAL: [identity_key],
+            }
+
+            self.assertEqual(
+                coord._manual_record_choices(snap, display_order, store),
+                (identity_key,),
+            )
+            store.claim(
+                identity_key=identity_key,
+                provider="SONYLIV",
+                display_name="Asian Games",
+                expected_session_id=status.session_id,
+            )
+
+            self.assertEqual(
+                coord._manual_record_choices(snap, display_order, store),
+                (),
+            )
+            self.assertIn(
+                (coord.POLICY_MANUAL, identity_key),
+                snap.blocks,
+            )
+
+    def test_manual_launch_handoff_contains_selected_exact_source_and_identity(self):
+        snap = snapshot([sony_candidate()])
+        identity_key = next(
+            identity
+            for policy, identity in snap.blocks
+            if policy == coord.POLICY_MANUAL
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = coord.build_recorder_output_paths(Path(td) / "Recordings")
+            store = coord.IdentityRegistryStore(paths)
+            status = store.prepare_session()
+            captured = {}
+
+            def fake_launch(request, registry_store):
+                captured["request"] = request
+                captured["store"] = registry_store
+                return type("Result", (), {"pid": 4321})()
+
+            with patch.object(coord, "launch_identity_worker", fake_launch):
+                plan, result = coord._launch_manual_identity(
+                    snap,
+                    identity_key,
+                    registry_session_id=status.session_id,
+                    registry_store=store,
+                )
+
+            request = captured["request"]
+            self.assertEqual(result.pid, 4321)
+            self.assertEqual(request.identity_key, identity_key)
+            self.assertEqual(
+                request.selected_candidate.stream_url,
+                plan.selected_candidate.stream_url,
+            )
+            self.assertEqual(
+                request.selected_source_group,
+                "SONYLIV_EVENTS",
+            )
+            self.assertEqual(
+                request.registry_session_id,
+                status.session_id,
+            )
+
+
 class TargetConfigTests(unittest.TestCase):
     def test_parse_manual_target(self):
         items = coord.parse_targets({"IDENTITY_COORDINATOR_TARGETS":[{
