@@ -38,6 +38,23 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertNotIn("N_m3u8DL-RE", worker)
         self.assertNotIn("N_m3u8DL-RE", request)
 
+    def test_identity_initial_source_returns_before_any_playlist_rescan(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        start=recorder.index("if state.identity_initial_source is not None:")
+        end=recorder.index("elif direct_retry_source is not None:", start)
+        branch=recorder[start:end]
+        self.assertIn("return source", branch)
+        self.assertNotIn("resolve_nm3u8dl_playlist_source(", branch)
+
+    def test_identity_worker_launcher_does_not_create_separate_console_windows(self):
+        worker=(ROOT/"recorder_coordinator"/"worker.py").read_text(encoding="utf-8")
+        terminal_host=(ROOT/"recorder_runtime"/"terminal_host.py").read_text(encoding="utf-8")
+        self.assertNotIn("CREATE_NEW_CONSOLE", worker)
+        self.assertIn('"wt.exe"', terminal_host)
+        self.assertIn('"-w"', terminal_host)
+        self.assertIn('"0"', terminal_host)
+        self.assertIn('"new-tab"', terminal_host)
+
     def test_direct_dynamic_recorder_entrypoint_still_uses_same_process_runner(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         self.assertIn('if __name__ == "__main__":\n    run_recorder_process()', recorder)
