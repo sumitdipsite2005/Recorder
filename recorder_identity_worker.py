@@ -28,12 +28,25 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         required=True,
         help="temporary identity launch request JSON",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="same recorder_dynamic_user_config.py used by the Coordinator",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     request = read_launch_request(args.request, delete_after_read=True)
+    config_path = args.config.resolve()
+    if not config_path.is_file():
+        raise RuntimeError(f"Recorder config not found: {config_path}")
+
+    # record_dynamic still owns its normal configuration load. The worker only
+    # points that existing loader at the exact config file used by Coordinator.
+    os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = str(config_path)
 
     # Import only inside the worker process. The Coordinator itself remains
     # decoupled from the mature recorder-sized module.
