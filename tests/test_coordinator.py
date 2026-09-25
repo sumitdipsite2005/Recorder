@@ -913,6 +913,20 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("\033[38;2;41;159;214mHockey\033[0m",rendered)
         self.assertIn("\033[38;2;255;135;3m[NEW]\033[0m",rendered)
 
+    def test_source_name_reference_and_footer_share_muted_treatment(self):
+        snap=snapshot([sony_candidate()])
+        rendered=coord.render_dashboard(snap,(),use_color=True)
+        muted="\033[38;2;118;118;118m"
+        reset="\033[0m"
+        self.assertIn(
+            f"{muted}src1{reset} {muted}[S1]{reset}",
+            rendered,
+        )
+        self.assertIn(
+            f"{muted}  [S1] https://src1.test/list.m3u{reset}",
+            rendered,
+        )
+
     def test_update_delta_is_highlighted_yellow(self):
         old=snapshot([sony_candidate(title="Shooting")])
         new=snapshot([sony_candidate(title="Athletics")])

@@ -105,6 +105,10 @@ def _muted_text(text: str, use_color: bool) -> str:
     return _paint_rgb(text, _MUTED_RGB, use_color)
 
 
+def _source_reference_text(text: str, use_color: bool) -> str:
+    return _paint_rgb(text, _MUTED_RGB, use_color)
+
+
 def _compact_timestamp(value: datetime, reference: datetime) -> str:
     """Show HH:MM today; include the date only when it differs from today."""
     if value.date() == reference.date():
@@ -569,7 +573,7 @@ def render_dashboard(
                         str(source.source_id)
                     )
                     source_reference_text = (
-                        " " + _important_text(f"[S{source_reference}]", color)
+                        " " + _source_reference_text(f"[S{source_reference}]", color)
                         if source_reference is not None
                         else ""
                     )
@@ -579,7 +583,7 @@ def render_dashboard(
                         f"{_event_title(event_name, color)} | "
                         f"{_secondary_text(tvg_name, color)} | "
                         f"{_group_text(group_name, color)} | "
-                        f"{_muted_text(source.source_name, color)}{source_reference_text} | "
+                        f"{_source_reference_text(source.source_name, color)}{source_reference_text} | "
                         f"{_secondary_text(last_updated_text, color)} | "
                         f"{_secondary_text(freshness_text, color)}"
                         f"{trailing_state}"
@@ -601,7 +605,9 @@ def render_dashboard(
         lines.append("")
         lines.append(_important_text("SOURCE REFERENCES", color))
         for number, source_id in sorted(visible_source_references):
-            lines.append(_important_text(f"  [S{number}] {source_id}", color))
+            lines.append(
+                _source_reference_text(f"  [S{number}] {source_id}", color)
+            )
 
     if snapshot.source_errors:
         lines.append("")
