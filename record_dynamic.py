@@ -69,6 +69,7 @@ from recorder_source.models import (
     SourceCandidate,
 )
 from recorder_source.policy import (
+    PLAYLIST_GROUP_LIFECYCLES as SHARED_PLAYLIST_GROUP_LIFECYCLES,
     PLAYLIST_GROUP_MATCH_MODES as SHARED_PLAYLIST_GROUP_MATCH_MODES,
     PLAYLIST_GROUP_PROFILES as SHARED_PLAYLIST_GROUP_PROFILES,
     PLAYLIST_GROUP_SOURCE_BUCKETS as SHARED_PLAYLIST_GROUP_SOURCE_BUCKETS,
@@ -156,14 +157,7 @@ NM3U8DL_PLAYLIST_GROUP_MATCH_MODES = dict(SHARED_PLAYLIST_GROUP_MATCH_MODES)
 # Stream lifecycle belongs to the playlist group, independently of matching or
 # downloader profile. Event streams may genuinely end; linear TV channels should
 # recover by resolving a fresh source instead of ending the overall recording.
-NM3U8DL_PLAYLIST_GROUP_LIFECYCLES = {
-    "HOTSTAR_EVENTS": "EVENT",
-    "SONYLIV_EVENTS": "EVENT",
-    "FANCODE": "EVENT",
-    "JIO_STAR_SPORTS": "LINEAR_TV",
-    "KHEL": "LINEAR_TV",
-    "SONY_TV": "LINEAR_TV",
-}
+NM3U8DL_PLAYLIST_GROUP_LIFECYCLES = dict(SHARED_PLAYLIST_GROUP_LIFECYCLES)
 
 # Cookie handling is universal by default:
 # if a canonical Cookie exists, send it once.
@@ -7673,122 +7667,10 @@ def get_nm3u8dl_join_candidate(
 
 
 def format_nm3u8dl_candidate_quality(candidate: dict) -> str:
-    """Render Resolution | FPS/P-I | Bitrate with per-value provenance."""
-    fps = float(candidate.get("video_fps") or 0.0)
-    width = int(candidate.get("video_width") or 0)
-    height = int(candidate.get("video_height") or 0)
-    bitrate = int(candidate.get("video_bitrate_bps") or 0)
-
-    scan_type = _normalize_nm3u8dl_video_scan_type(
-        candidate.get("video_scan_type")
-    )
-
-    if not _nm3u8dl_has_quality_evidence(candidate):
-        return "unknown"
-
-    def _source_labels(*source_values):
-        labels = []
-
-        source_name_map = {
-            "manifest": "manifest",
-            "ffprobe": "FFprobe",
-            "stream": "FFprobe",
-            "format": "FFprobe",
-            "sps": "SPS",
-            "h264-picture": "picture",
-            "idet": "idet",
-            "sample": "FFmpeg sample",
-        }
-
-        for source_value in source_values:
-            for raw_part in re.split(
-                r"[+,]",
-                str(source_value or ""),
-            ):
-                raw_part = raw_part.strip()
-                if not raw_part:
-                    continue
-
-                label = source_name_map.get(
-                    raw_part.casefold(),
-                    raw_part,
-                )
-
-                if label not in labels:
-                    labels.append(label)
-
-        return labels
-
-    def _with_sources(text, *source_values):
-        labels = _source_labels(*source_values)
-
-        if not labels:
-            return text
-
-        # Manifest is the normal source, so hide it only when it is the
-        # sole provenance. Keep it visible when another source contributed.
-        if labels == ["manifest"]:
-            return text
-
-        return f"{text} [{', '.join(labels)}]"
-
-    resolution_text = (
-        f"{width}x{height}"
-        if width > 0 and height > 0
-        else "resolution UNKNOWN"
-    )
-    resolution_text = _with_sources(
-        resolution_text,
-        candidate.get("video_resolution_source"),
-    )
-
-    if fps > 0:
-        display_fps = (
-            _nm3u8dl_comparable_motion_fps(candidate)
-            if scan_type == "interlaced"
-            else fps
-        )
-
-        fps_text = f"{display_fps:.3f}".rstrip("0").rstrip(".")
-
-        if scan_type == "interlaced":
-            fps_text = f"{fps_text}i"
-        elif scan_type == "progressive":
-            fps_text = f"{fps_text}p"
-        else:
-            fps_text = f"{fps_text} fps (P/I UNKNOWN)"
-
-        fps_text = _with_sources(
-            fps_text,
-            candidate.get("video_fps_source"),
-            (
-                candidate.get("video_scan_type_source")
-                if scan_type
-                else ""
-            ),
-        )
-    else:
-        fps_text = "fps UNKNOWN"
-
-    if bitrate > 0:
-        bitrate_text = f"{int(round(bitrate / 1000.0))} Kbps"
-
-        if str(candidate.get("video_bitrate_source") or "") == "sample":
-            bitrate_text = "~" + bitrate_text
-
-        bitrate_text = _with_sources(
-            bitrate_text,
-            candidate.get("video_bitrate_source"),
-        )
-    else:
-        bitrate_text = "bitrate UNKNOWN"
-
-    return " | ".join(
-        (
-            resolution_text,
-            fps_text,
-            bitrate_text,
-        )
+    """Use the shared quality/evidence formatter."""
+    return source_quality.format_candidate_quality(
+        candidate,
+        motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
     )
 
 
@@ -10703,34 +10585,19 @@ def _probe_nm3u8dl_candidate_quality(
 
 
 def _get_nm3u8dl_candidate_probe_identity(candidate: dict) -> tuple:
-    """Return the exact request identity used to share one quality probe."""
-    stream_url = str(candidate.get("stream_url") or "").strip()
-
+    """Use the shared effective-stream quality-probe identity."""
     try:
         identity_headers = get_nm3u8dl_effective_headers(
             candidate.get("headers") or {},
             emit_logs=False,
         )
     except Exception:
-        # If header preparation itself is broken, identical raw request inputs
-        # should still share the same failing probe result.
         identity_headers = dict(candidate.get("headers") or {})
 
-    normalized_headers = tuple(sorted(
-        (
-            str(name or "").strip().casefold(),
-            str(value),
-        )
-        for name, value in identity_headers.items()
-        if str(name or "").strip() and value is not None
-    ))
-
-    # DRM probing is intentionally different for candidates that already
-    # supply decryption keys. Do not share one probe result across keyed and
-    # unkeyed candidates for the same URL/header identity.
-    has_decryption_keys = bool(candidate.get("keys") or [])
-
-    return stream_url, normalized_headers, has_decryption_keys
+    return source_quality.quality_probe_identity(
+        SourceCandidate.from_mapping(candidate),
+        effective_headers=identity_headers,
+    )
 
 
 def enrich_nm3u8dl_candidate_qualities(

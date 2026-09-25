@@ -49,11 +49,21 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("source_quality.parse_hls_manifest_quality(",recorder)
         self.assertIn("parse_hls_manifest_quality(",discovery)
 
+    def test_quality_probe_identity_and_formatter_are_shared(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        snapshot=(ROOT/"recorder_coordinator"/"snapshot.py").read_text(encoding="utf-8")
+        self.assertIn("source_quality.quality_probe_identity(",recorder)
+        self.assertIn("quality_probe_identity(",discovery)
+        self.assertIn("source_quality.format_candidate_quality(",recorder)
+        self.assertIn("format_candidate_quality(",snapshot)
+
     def test_mature_recorder_consumes_shared_policy(self):
         text=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         self.assertIn("from recorder_source.policy import",text)
         self.assertIn("NM3U8DL_PLAYLIST_GROUP_PROFILES = dict(SHARED_PLAYLIST_GROUP_PROFILES)",text)
         self.assertIn("NM3U8DL_PLAYLIST_GROUP_MATCH_MODES = dict(SHARED_PLAYLIST_GROUP_MATCH_MODES)",text)
+        self.assertIn("NM3U8DL_PLAYLIST_GROUP_LIFECYCLES = dict(SHARED_PLAYLIST_GROUP_LIFECYCLES)",text)
         self.assertIn("NM3U8DL_PLAYLIST_USER_AGENTS = dict(SHARED_PLAYLIST_USER_AGENTS)",text)
 
 

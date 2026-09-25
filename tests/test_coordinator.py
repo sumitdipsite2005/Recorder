@@ -323,6 +323,20 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps",rendered)
         self.assertIn("Identity: lane:2120305/AG_Strea2309/ENG",rendered)
 
+    def test_dashboard_quality_shows_shared_quality_evidence(self):
+        item=replace(
+            sony_candidate(),
+            video_resolution_source="manifest",
+            video_fps_source="manifest",
+            video_scan_type_source="event-policy",
+            video_bitrate_source="sample",
+        )
+        rendered=coord.render_dashboard(snapshot([item]),())
+        self.assertIn(
+            "Quality : 1920x1080 | 50p [manifest, event-policy] | ~5000 Kbps [FFmpeg sample]",
+            rendered,
+        )
+
     def test_dashboard_header_shows_target_search_and_source_scope(self):
         t=target(
             name="Asian Games",

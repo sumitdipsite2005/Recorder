@@ -26,8 +26,11 @@ from .quality import (
     inspect_hls_manifest_drm,
     parse_hls_manifest_quality,
     probe_stream_quality_ffprobe,
+    quality_probe_identity,
     sample_stream_video_bitrate,
 )
+from .policy import PLAYLIST_GROUP_LIFECYCLES
+from .selection import normalize_video_scan_type
 from .models import (
     PlaylistSourceSpec,
     SourceAcquisitionRequest,
@@ -638,6 +641,7 @@ def _parse_dash_frame_rate(value: str) -> float:
 
 
 def _parse_dash_quality(text: str) -> Tuple[bool, int, int, float, int, str, bool]:
+    """Parse the best advertised DASH video representation conservatively."""
     try:
         root = ET.fromstring(text)
     except ET.ParseError:
@@ -645,31 +649,88 @@ def _parse_dash_quality(text: str) -> Tuple[bool, int, int, float, int, str, boo
 
     widevine = "edef8ba9" in text.casefold() or "widevine" in text.casefold()
     best = None
-    for element in root.iter():
-        if element.tag.rsplit("}", 1)[-1] != "Representation":
+    for adaptation in root.iter():
+        if adaptation.tag.rsplit("}", 1)[-1] != "AdaptationSet":
             continue
         try:
-            width = int(element.attrib.get("width") or 0)
-            height = int(element.attrib.get("height") or 0)
-            bitrate = int(element.attrib.get("bandwidth") or 0)
+            adaptation_width = int(adaptation.attrib.get("width") or 0)
+            adaptation_height = int(adaptation.attrib.get("height") or 0)
         except ValueError:
-            width = height = bitrate = 0
-        fps = _parse_dash_frame_rate(element.attrib.get("frameRate") or "")
-        rank = (1 if fps >= 49 else 0, height, fps, width * height, bitrate)
-        if best is None or rank > best[0]:
-            best = (rank, width, height, fps, bitrate)
+            adaptation_width = adaptation_height = 0
+        adaptation_fps = adaptation.attrib.get("frameRate") or ""
+        adaptation_scan = normalize_video_scan_type(
+            adaptation.attrib.get("scanType") or ""
+        )
+        adaptation_type = str(adaptation.attrib.get("contentType") or "").casefold()
+        adaptation_mime = str(adaptation.attrib.get("mimeType") or "").casefold()
+
+        for element in adaptation:
+            if element.tag.rsplit("}", 1)[-1] != "Representation":
+                continue
+            try:
+                width = int(element.attrib.get("width") or adaptation_width or 0)
+                height = int(element.attrib.get("height") or adaptation_height or 0)
+                bitrate = int(element.attrib.get("bandwidth") or 0)
+            except ValueError:
+                width = height = bitrate = 0
+            fps = _parse_dash_frame_rate(
+                element.attrib.get("frameRate") or adaptation_fps
+            )
+            mime = str(
+                element.attrib.get("mimeType") or adaptation_mime or ""
+            ).casefold()
+            is_video = (
+                adaptation_type == "video"
+                or "video" in adaptation_mime
+                or "video" in mime
+                or (width > 0 and height > 0)
+                or fps > 0
+            )
+            if not is_video:
+                continue
+            scan_type = (
+                normalize_video_scan_type(element.attrib.get("scanType") or "")
+                or adaptation_scan
+            )
+            rank = (1 if fps >= 49 else 0, height, fps, width * height, bitrate)
+            if best is None or rank > best[0]:
+                best = (rank, width, height, fps, bitrate, scan_type)
+
     if best is None:
         return False, 0, 0, 0.0, 0, "", widevine
-    _, width, height, fps, bitrate = best
-    return True, width, height, fps, bitrate, "progressive", widevine
+    _, width, height, fps, bitrate, scan_type = best
+    return True, width, height, fps, bitrate, scan_type, widevine
+
+
+def _effective_probe_headers(candidate: SourceCandidate) -> Dict[str, str]:
+    provider = str(candidate.extra.get("provider") or "UNKNOWN").strip().upper()
+    headers = {"User-Agent": DEFAULT_HTTP_USER_AGENT}
+    headers.update(PROVIDER_PROBE_HEADERS.get(provider, {}))
+    # Playlist/source metadata wins over profile defaults, matching the mature
+    # recorder's precedence direction.
+    headers.update(dict(candidate.headers or {}))
+    return headers
+
+
+def _merge_expiries(*values: Optional[float]) -> Optional[float]:
+    known = [float(value) for value in values if value is not None]
+    return min(known) if known else None
+
+
+def _candidate_url_header_expiry(candidate: SourceCandidate) -> Optional[float]:
+    return _extract_expiry(
+        candidate.stream_url,
+        candidate.raw_stream_url,
+        *[str(value) for value in dict(candidate.headers or {}).values()],
+    )
+
 
 def probe_candidate_hls(
     candidate: SourceCandidate,
     *,
     timeout_sec: float = 15.0,
 ) -> SourceCandidate:
-    """Inspect availability and master-playlist quality without starting a recorder."""
-    provider = str(candidate.extra.get("provider") or "UNKNOWN").strip().upper()
+    """Inspect one normalized candidate and return shared quality/probe facts."""
     if not candidate.stream_url:
         return replace(
             candidate,
@@ -678,32 +739,13 @@ def probe_candidate_hls(
             reason="no playable source yet",
         )
 
-    headers = {"User-Agent": DEFAULT_HTTP_USER_AGENT}
-    headers.update(PROVIDER_PROBE_HEADERS.get(provider, {}))
-    # Playlist/source metadata wins over profile defaults, matching the mature
-    # recorder's precedence direction.
-    headers.update(dict(candidate.headers or {}))
-    expiry = _extract_expiry(
-        candidate.stream_url,
-        candidate.raw_stream_url,
-        *[str(value) for value in dict(candidate.headers or {}).values()],
-    )
-
-    if candidate.unsupported_drm:
+    headers = _effective_probe_headers(candidate)
+    url_header_expiry = _candidate_url_header_expiry(candidate)
+    if url_header_expiry is not None and url_header_expiry <= time.time():
         return replace(
             candidate,
-            expiry=expiry,
-            expiry_source="URL/header" if expiry is not None else "",
-            launchable=False,
-            probe_status="unsupported",
-            reason=f"unsupported DRM ({candidate.unsupported_drm})",
-        )
-
-    if expiry is not None and expiry <= time.time():
-        return replace(
-            candidate,
-            expiry=expiry,
-            expiry_source="URL",
+            expiry=url_header_expiry,
+            expiry_source="URL/header",
             launchable=False,
             probe_status="expired",
             reason="authorization expired",
@@ -716,15 +758,12 @@ def probe_candidate_hls(
             final_url = response.geturl()
             content_type = str(response.headers.get("Content-Type") or "")
         text = payload.decode("utf-8", errors="replace")
-        expiry = _extract_expiry(
-            candidate.stream_url,
-            final_url,
-            text,
-            *[str(value) for value in headers.values()],
-        ) or expiry
+        manifest_expiry = _extract_expiry(final_url, text)
+        expiry = _merge_expiries(url_header_expiry, manifest_expiry)
+
         is_hls = "#EXTM3U" in text or "mpegurl" in content_type.casefold()
         is_dash = "<MPD" in text[:500] or "dash+xml" in content_type.casefold()
-        unsupported_drm = candidate.unsupported_drm
+        hls_quality = None
         if is_dash:
             (
                 quality_known,
@@ -745,6 +784,11 @@ def probe_candidate_hls(
                 fps = float(hls_quality.get("video_fps") or 0.0)
                 bitrate = int(hls_quality.get("video_bitrate_bps") or 0)
                 scan_type = str(hls_quality.get("video_scan_type") or "")
+                manifest_expiry = _merge_expiries(
+                    manifest_expiry,
+                    hls_quality.get("manifest_expiry"),
+                )
+                expiry = _merge_expiries(url_header_expiry, manifest_expiry)
             else:
                 quality_known = False
                 width = height = bitrate = 0
@@ -756,16 +800,28 @@ def probe_candidate_hls(
         expired_now = expiry is not None and expiry <= time.time()
         drm_key_required = bool(manifest_drm.get("drm_key_required"))
         drm_key_missing = bool(drm_key_required and not candidate.keys)
+        probe_transport_launchable = bool(
+            is_playlist and not drm_key_missing and not expired_now
+        )
         launchable = bool(
-            is_playlist
-            and not unsupported_drm
-            and not drm_key_missing
-            and not expired_now
+            probe_transport_launchable and not candidate.unsupported_drm
         )
         decryption_key = _candidate_decryption_key(candidate)
 
         quality_source = "manifest" if quality_known else ""
+        video_resolution_source = "manifest" if width > 0 or height > 0 else ""
         video_fps_source = "manifest" if fps > 0 else ""
+        video_scan_type_source = "manifest" if scan_type else ""
+        video_bitrate_source = "manifest" if bitrate > 0 else ""
+
+        source_group = str(candidate.extra.get("source_group") or "").strip().upper()
+        if (
+            is_playlist
+            and PLAYLIST_GROUP_LIFECYCLES.get(source_group) == "EVENT"
+        ):
+            scan_type = "progressive"
+            video_scan_type_source = "event-policy"
+
         ffprobe_failure = ""
         manifest_complete = bool(
             fps > 0
@@ -773,7 +829,10 @@ def probe_candidate_hls(
             and height > 0
             and bitrate > 0
         )
-        if launchable and not manifest_complete:
+        hls_needs_scan_type = bool(is_hls and not scan_type)
+        if probe_transport_launchable and (
+            not manifest_complete or hls_needs_scan_type
+        ):
             try:
                 probe_stream_url = (
                     str(hls_quality.get("manifest_variant_url") or "").strip()
@@ -800,22 +859,35 @@ def probe_candidate_hls(
 
                     ffprobe_width = int(ffprobe_quality.get("video_width") or 0)
                     ffprobe_height = int(ffprobe_quality.get("video_height") or 0)
+                    resolution_filled = False
                     if width <= 0 and ffprobe_width > 0:
                         width = ffprobe_width
+                        resolution_filled = True
                     if height <= 0 and ffprobe_height > 0:
                         height = ffprobe_height
+                        resolution_filled = True
+                    if resolution_filled:
+                        video_resolution_source = (
+                            "manifest+ffprobe"
+                            if video_resolution_source == "manifest"
+                            else "ffprobe"
+                        )
 
                     ffprobe_bitrate = int(
                         ffprobe_quality.get("video_bitrate_bps") or 0
                     )
                     if bitrate <= 0 and ffprobe_bitrate > 0:
                         bitrate = ffprobe_bitrate
+                        video_bitrate_source = str(
+                            ffprobe_quality.get("video_bitrate_source") or "ffprobe"
+                        )
 
-                    ffprobe_scan_type = str(
+                    ffprobe_scan_type = normalize_video_scan_type(
                         ffprobe_quality.get("video_scan_type") or ""
-                    ).strip()
+                    )
                     if not scan_type and ffprobe_scan_type:
                         scan_type = ffprobe_scan_type
+                        video_scan_type_source = "ffprobe"
 
                     quality_known = bool(
                         fps > 0
@@ -826,12 +898,10 @@ def probe_candidate_hls(
                         "manifest+ffprobe" if quality_source else "ffprobe"
                     )
             except Exception as error:
-                # Availability is already proven by the manifest request. A
-                # quality fallback failure must not turn a working source OFF.
                 ffprobe_failure = f"{type(error).__name__}: {error}"
 
         bitrate_sample_failure = ""
-        if launchable and bitrate <= 0:
+        if probe_transport_launchable and bitrate <= 0:
             try:
                 sample_url = (
                     str(hls_quality.get("manifest_variant_url") or "").strip()
@@ -847,6 +917,7 @@ def probe_candidate_hls(
                 )
                 if sampled_bitrate > 0:
                     bitrate = sampled_bitrate
+                    video_bitrate_source = "sample"
                     quality_known = True
                     quality_source = (
                         quality_source + "+sample"
@@ -859,10 +930,12 @@ def probe_candidate_hls(
         probe_status = (
             "expired"
             if expired_now
-            else "working"
-            if launchable
+            else "unsupported"
+            if candidate.unsupported_drm
             else "drm_key_missing"
             if drm_key_missing
+            else "working"
+            if probe_transport_launchable
             else "unsupported"
         )
         return replace(
@@ -870,22 +943,26 @@ def probe_candidate_hls(
             final_stream_url=final_url,
             expiry=expiry,
             expiry_source="URL/manifest" if expiry is not None else "",
-            unsupported_drm=unsupported_drm,
             stream_type="DASH" if is_dash else "HLS" if is_hls else candidate.stream_type,
             playback_fingerprint=_playback_fingerprint(final_url, headers),
             quality_known=quality_known,
+            quality_source=quality_source,
             video_width=width,
             video_height=height,
+            video_resolution_source=video_resolution_source,
             video_fps=fps,
+            video_fps_source=video_fps_source,
             video_bitrate_bps=bitrate,
+            video_bitrate_source=video_bitrate_source,
             video_scan_type=scan_type,
+            video_scan_type_source=video_scan_type_source,
             launchable=launchable,
             probe_status=probe_status,
             reason=(
                 "authorization expired"
                 if expired_now
-                else f"unsupported DRM ({unsupported_drm})"
-                if unsupported_drm
+                else f"unsupported DRM ({candidate.unsupported_drm})"
+                if candidate.unsupported_drm
                 else "DRM key missing"
                 if drm_key_missing
                 else "not an HLS/DASH playlist"
@@ -900,23 +977,22 @@ def probe_candidate_hls(
                     if is_hls and hls_quality
                     else ""
                 ),
-                "quality_source": quality_source,
-                "video_fps_source": video_fps_source,
+                "manifest_expiry": manifest_expiry,
                 "drm_protected": bool(manifest_drm.get("drm_protected")),
                 "drm_key_required": drm_key_required,
                 "drm_key_missing": drm_key_missing,
                 "drm_detail": str(manifest_drm.get("drm_detail") or ""),
                 "ffprobe_probe_failure": ffprobe_failure,
-                "video_bitrate_source": "sample" if bitrate_sample_failure == "" and bitrate > 0 and "sample" in quality_source else "",
                 "bitrate_sample_failure": bitrate_sample_failure,
+                "probe_transport_launchable": probe_transport_launchable,
             },
         )
     except HTTPError as error:
         blocked = int(getattr(error, "code", 0) or 0) in (401, 403, 451)
         return replace(
             candidate,
-            expiry=expiry,
-            expiry_source="URL" if expiry is not None else "",
+            expiry=url_header_expiry,
+            expiry_source="URL/header" if url_header_expiry is not None else "",
             launchable=False,
             access_blocked=blocked,
             probe_status="access_blocked" if blocked else "probe_failed",
@@ -926,13 +1002,91 @@ def probe_candidate_hls(
     except (URLError, TimeoutError, OSError, ValueError) as error:
         return replace(
             candidate,
-            expiry=expiry,
-            expiry_source="URL" if expiry is not None else "",
+            expiry=url_header_expiry,
+            expiry_source="URL/header" if url_header_expiry is not None else "",
             launchable=False,
             probe_status="probe_failed",
             probe_error=f"{type(error).__name__}: {error}",
             reason="probe failed",
         )
+
+
+_PROBE_SOURCE_EXTRA_KEYS = frozenset({
+    "source_name",
+    "source_group",
+    "provider",
+    "provider_identity_hint",
+})
+
+
+def _reuse_probe_result(
+    candidate: SourceCandidate,
+    probed: SourceCandidate,
+) -> SourceCandidate:
+    """Apply shared probe facts without replacing source/metadata provenance."""
+    merged_extra = dict(candidate.extra)
+    merged_extra.update({
+        key: value
+        for key, value in dict(probed.extra).items()
+        if key not in _PROBE_SOURCE_EXTRA_KEYS
+    })
+
+    expiry = _merge_expiries(
+        _candidate_url_header_expiry(candidate),
+        merged_extra.get("manifest_expiry"),
+    )
+    expired_now = expiry is not None and expiry <= time.time()
+    transport_launchable = bool(
+        merged_extra.get("probe_transport_launchable", probed.launchable)
+    )
+    drm_key_missing = bool(merged_extra.get("drm_key_missing"))
+    launchable = bool(
+        transport_launchable
+        and not expired_now
+        and not drm_key_missing
+        and not candidate.unsupported_drm
+    )
+    if expired_now:
+        status = "expired"
+        reason = "authorization expired"
+    elif candidate.unsupported_drm:
+        status = "unsupported"
+        reason = f"unsupported DRM ({candidate.unsupported_drm})"
+    elif drm_key_missing:
+        status = "drm_key_missing"
+        reason = "DRM key missing"
+    elif transport_launchable:
+        status = "working"
+        reason = ""
+    else:
+        status = probed.probe_status
+        reason = probed.reason
+
+    return replace(
+        candidate,
+        final_stream_url=probed.final_stream_url,
+        expiry=expiry,
+        expiry_source="URL/manifest" if expiry is not None else "",
+        stream_type=probed.stream_type,
+        playback_fingerprint=probed.playback_fingerprint,
+        quality_known=probed.quality_known,
+        quality_source=probed.quality_source,
+        video_width=probed.video_width,
+        video_height=probed.video_height,
+        video_resolution_source=probed.video_resolution_source,
+        video_fps=probed.video_fps,
+        video_fps_source=probed.video_fps_source,
+        video_bitrate_bps=probed.video_bitrate_bps,
+        video_bitrate_source=probed.video_bitrate_source,
+        video_scan_type=probed.video_scan_type,
+        video_scan_type_source=probed.video_scan_type_source,
+        launchable=launchable,
+        probe_status=status,
+        probe_error=probed.probe_error,
+        access_blocked=probed.access_blocked,
+        reason=candidate.reason if candidate.ignored else reason,
+        extra=merged_extra,
+    )
 
 
 def probe_candidates(
@@ -942,37 +1096,65 @@ def probe_candidates(
     max_workers: int = 8,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[SourceCandidate, ...]:
+    """Probe each effective stream once and reuse that result across observations."""
     if not candidates:
         return ()
 
+    grouped: Dict[Tuple[object, ...], List[Tuple[int, SourceCandidate]]] = {}
+    for index, candidate in enumerate(candidates):
+        key = quality_probe_identity(
+            candidate,
+            effective_headers=_effective_probe_headers(candidate),
+        )
+        grouped.setdefault(key, []).append((index, candidate))
+
     result: List[Optional[SourceCandidate]] = [None] * len(candidates)
-    worker_count = min(max(1, int(max_workers)), len(candidates))
+    worker_count = min(max(1, int(max_workers)), len(grouped))
+    now = time.time()
+
+    def representative(entries: List[Tuple[int, SourceCandidate]]) -> SourceCandidate:
+        for _, candidate in entries:
+            expiry = _candidate_url_header_expiry(candidate)
+            if expiry is None or expiry > now:
+                return candidate
+        return entries[0][1]
+
     with ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="candidate_probe",
     ) as executor:
         future_map = {
-            executor.submit(probe_candidate_hls, candidate, timeout_sec=timeout_sec): index
-            for index, candidate in enumerate(candidates)
+            executor.submit(
+                probe_candidate_hls,
+                representative(entries),
+                timeout_sec=timeout_sec,
+            ): entries
+            for entries in grouped.values()
         }
         completed_count = 0
         for future in as_completed(future_map):
-            index = future_map[future]
+            entries = future_map[future]
+            representative_candidate = representative(entries)
             try:
-                result[index] = future.result()
+                probed = future.result()
             except Exception as error:
-                result[index] = replace(
-                    candidates[index],
+                probed = replace(
+                    representative_candidate,
                     launchable=False,
                     probe_status="probe_failed",
                     probe_error=f"{type(error).__name__}: {error}",
                     reason="probe failed",
                 )
-            finally:
-                completed_count += 1
-                if progress_callback is not None:
-                    progress_callback(completed_count, len(candidates))
+
+            for index, candidate in entries:
+                result[index] = _reuse_probe_result(candidate, probed)
+
+            completed_count += len(entries)
+            if progress_callback is not None:
+                progress_callback(completed_count, len(candidates))
+
     return tuple(
         item if item is not None else candidates[index]
         for index, item in enumerate(result)
     )
+

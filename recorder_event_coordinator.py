@@ -500,7 +500,7 @@ def _match_definition_for_target(target: IdentityTarget, source_group: str):
     )
 
 
-def _probe_key(candidate: SourceCandidate) -> Tuple[object, ...]:
+def _observation_key(candidate: SourceCandidate) -> Tuple[object, ...]:
     return (
         candidate.playlist_url,
         str(candidate.extra.get("provider") or "UNKNOWN"),
@@ -651,7 +651,7 @@ def acquire_active_targets(
     # First establish which identities genuinely qualify for each target.
     for view in active:
         target = view.target
-        matched_probe_keys: Set[Tuple[object, ...]] = set()
+        matched_observation_keys: Set[Tuple[object, ...]] = set()
         for group in target.source_groups:
             context_group = target_group_context[(target.name, group)]
             definition = _match_definition_for_target(target, context_group)
@@ -661,10 +661,10 @@ def acquire_active_targets(
                     matched = _matching_candidate(candidate, definition)
                     if matched is None:
                         continue
-                    probe_key = _probe_key(matched)
-                    if probe_key in matched_probe_keys:
+                    probe_key = _observation_key(matched)
+                    if probe_key in matched_observation_keys:
                         continue
-                    matched_probe_keys.add(probe_key)
+                    matched_observation_keys.add(probe_key)
                     raw_candidates_by_target[target.name].append(matched)
                     matched_identity_keys[target.name].add(_identity_serialized(matched))
 
@@ -677,7 +677,7 @@ def acquire_active_targets(
         if not target_identities:
             continue
         existing_keys = {
-            _probe_key(candidate) for candidate in raw_candidates_by_target[target.name]
+            _observation_key(candidate) for candidate in raw_candidates_by_target[target.name]
         }
         for group in target.source_groups:
             context_group = target_group_context[(target.name, group)]
@@ -685,7 +685,7 @@ def acquire_active_targets(
             for spec in target_group_sources[(target.name, group)]:
                 key = (spec.url, spec.provider, spec.group)
                 for candidate in parsed_by_key.get(key, ()):
-                    if _probe_key(candidate) in existing_keys:
+                    if _observation_key(candidate) in existing_keys:
                         continue
                     if _identity_serialized(candidate) not in target_identities:
                         continue
@@ -699,15 +699,15 @@ def acquire_active_targets(
                     if context is None:
                         continue
                     raw_candidates_by_target[target.name].append(context)
-                    existing_keys.add(_probe_key(context))
+                    existing_keys.add(_observation_key(context))
 
-    # Probe equivalent candidate/session observations once and reuse the result
-    # across targets. Metadata-only observations are retained and come back as
-    # NO_PLAYABLE_SOURCE rather than being discarded.
+    # Preserve each source observation separately here. The shared probing
+    # boundary groups equivalent effective streams internally, probes once, and
+    # copies the probe facts back without erasing source provenance.
     unique_by_key: Dict[Tuple[object, ...], SourceCandidate] = {}
     for candidates in raw_candidates_by_target.values():
         for candidate in candidates:
-            unique_by_key.setdefault(_probe_key(candidate), candidate)
+            unique_by_key.setdefault(_observation_key(candidate), candidate)
     probe_pool = tuple(unique_by_key.values())
     if progress_callback is None:
         probed = probe_candidates(probe_pool)
@@ -721,12 +721,12 @@ def acquire_active_targets(
                 )
             ),
         )
-    probed_by_key = {_probe_key(candidate): candidate for candidate in probed}
+    probed_by_key = {_observation_key(candidate): candidate for candidate in probed}
 
     final: Dict[str, Tuple[SourceCandidate, ...]] = {}
     for name, candidates in raw_candidates_by_target.items():
         resolved = tuple(
-            probed_by_key.get(_probe_key(candidate), candidate)
+            probed_by_key.get(_observation_key(candidate), candidate)
             for candidate in candidates
         )
         eligible_identities = {

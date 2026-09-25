@@ -13,10 +13,13 @@ from recorder_source.discovery import (
     parse_extinf_metadata,
     parse_playlist_text,
     probe_candidate_hls,
+    probe_candidates,
 )
 from recorder_source.quality import (
+    format_candidate_quality,
     inspect_dash_manifest_drm,
     parse_ffprobe_quality_output,
+    quality_probe_identity,
 )
 from recorder_source.matching import (
     build_match_groups,
@@ -479,8 +482,8 @@ https://cdn.test/live.mpd
             "https://final.test/video.m3u8",
         )
         self.assertEqual(out.video_fps, 50.0)
-        self.assertEqual(out.extra["video_fps_source"], "ffprobe")
-        self.assertEqual(out.extra["quality_source"], "manifest+ffprobe")
+        self.assertEqual(out.video_fps_source, "ffprobe")
+        self.assertEqual(out.quality_source, "manifest+ffprobe")
         self.assertEqual(
             out.extra["manifest_variant_url"],
             "https://final.test/video.m3u8",
@@ -521,7 +524,88 @@ https://cdn.test/live.mpd
             )
         sampler.assert_called_once()
         self.assertEqual(out.video_bitrate_bps,3_456_000)
-        self.assertEqual(out.extra["video_bitrate_source"],"sample")
+        self.assertEqual(out.video_bitrate_source,"sample")
+
+    def test_shared_quality_formatter_preserves_value_evidence(self):
+        item = candidate(
+            video_fps=50.0,
+            video_fps_source="manifest",
+            video_scan_type="progressive",
+            video_scan_type_source="event-policy",
+            video_resolution_source="manifest",
+            video_bitrate_bps=3_456_000,
+            video_bitrate_source="sample",
+        )
+        self.assertEqual(
+            format_candidate_quality(item),
+            "1920x1080 | 50p [manifest, event-policy] | ~3456 Kbps [FFmpeg sample]",
+        )
+
+    def test_quality_probe_identity_ignores_playlist_provenance(self):
+        a = candidate(
+            playlist_url="https://one.test/list.m3u",
+            matching_entry_index=1,
+            stream_url="https://cdn.test/live/master.m3u8",
+            headers={"Referer": "https://example.test/"},
+        )
+        b = candidate(
+            playlist_url="https://two.test/list.m3u",
+            matching_entry_index=9,
+            stream_url="https://cdn.test/live/master.m3u8",
+            headers={"Referer": "https://example.test/"},
+        )
+        self.assertEqual(
+            quality_probe_identity(a),
+            quality_probe_identity(b),
+        )
+
+    def test_probe_candidates_reuses_one_probe_without_erasing_sources(self):
+        a = candidate(
+            playlist_url="https://one.test/list.m3u",
+            matching_entry_index=1,
+            stream_url="https://cdn.test/live/master.m3u8",
+            extra={"provider": "SONYLIV", "source_name": "one", "source_group": "SONYLIV_EVENTS"},
+        )
+        b = replace(
+            a,
+            playlist_url="https://two.test/list.m3u",
+            matching_entry_index=2,
+            extra={"provider": "SONYLIV", "source_name": "two", "source_group": "SONYLIV_EVENTS"},
+        )
+        probed = replace(
+            a,
+            quality_known=True,
+            quality_source="manifest",
+            video_width=1920,
+            video_height=1080,
+            video_resolution_source="manifest",
+            video_fps=50.0,
+            video_fps_source="manifest",
+            video_scan_type="progressive",
+            video_scan_type_source="event-policy",
+            video_bitrate_bps=4_963_000,
+            video_bitrate_source="manifest",
+            launchable=True,
+            probe_status="working",
+            extra={
+                **dict(a.extra),
+                "manifest_final_url": a.stream_url,
+                "manifest_expiry": None,
+                "probe_transport_launchable": True,
+            },
+        )
+        with patch(
+            "recorder_source.discovery.probe_candidate_hls",
+            return_value=probed,
+        ) as probe:
+            out = probe_candidates((a, b))
+
+        probe.assert_called_once()
+        self.assertEqual(out[0].extra["source_name"], "one")
+        self.assertEqual(out[1].extra["source_name"], "two")
+        self.assertEqual(out[0].video_fps_source, "manifest")
+        self.assertEqual(out[1].video_fps_source, "manifest")
+        self.assertEqual(out[0].video_bitrate_bps, out[1].video_bitrate_bps)
 
     def test_shared_hls_parser_returns_selected_variant_url(self):
         from recorder_source.quality import parse_hls_manifest_quality

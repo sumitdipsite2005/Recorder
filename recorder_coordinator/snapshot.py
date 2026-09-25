@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from recorder_source.identity import derive_feed_identity
 from recorder_source.models import SourceCandidate
 from recorder_source.policy import DEFAULT_SELECTION_POLICY, PROVIDER_SELECTION_POLICIES
+from recorder_source.quality import format_candidate_quality
 from recorder_source.selection import select_join_candidate, video_quality_rank
 
 from .models import (
@@ -142,20 +143,18 @@ def _quality_signature(candidate: Optional[SourceCandidate]) -> Tuple[object, ..
     )
 
 
-def quality_text(candidate: Optional[SourceCandidate]) -> str:
+def quality_text(
+    candidate: Optional[SourceCandidate],
+    *,
+    include_provenance: bool = True,
+) -> str:
     if candidate is None:
         return "no working candidate"
-    width, height = int(candidate.video_width or 0), int(candidate.video_height or 0)
-    fps = float(candidate.video_fps or 0.0)
-    bitrate = int(candidate.video_bitrate_bps or 0)
-    parts: List[str] = []
-    if width and height:
-        parts.append(f"{width}x{height}")
-    if fps:
-        parts.append(f"{fps:g}p")
-    if bitrate:
-        parts.append(f"{round(bitrate / 1000):d} Kbps")
-    return " | ".join(parts) if parts else "quality unknown"
+    return format_candidate_quality(
+        candidate,
+        motion_cap_fps=50.0,
+        include_provenance=include_provenance,
+    )
 
 
 def _best_candidate(

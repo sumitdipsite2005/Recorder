@@ -13,10 +13,160 @@ import os
 import re
 import subprocess
 import xml.etree.ElementTree as ET
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import urljoin
 
-from .selection import video_quality_rank
+from .models import SourceCandidate
+from .selection import (
+    comparable_motion_fps,
+    has_quality_evidence,
+    normalize_video_scan_type,
+    video_quality_rank,
+)
+
+
+QualityLike = Union[Mapping[str, object], SourceCandidate]
+
+
+def _quality_value(candidate: QualityLike, name: str, default: object = "") -> object:
+    if isinstance(candidate, SourceCandidate):
+        value = getattr(candidate, name, default)
+        if value not in ("", None):
+            return value
+        if isinstance(candidate.extra, Mapping):
+            return candidate.extra.get(name, value)
+        return value
+    return candidate.get(name, default)
+
+
+def quality_probe_identity(
+    candidate: QualityLike,
+    *,
+    effective_headers: Optional[Mapping[str, str]] = None,
+) -> Tuple[object, ...]:
+    """Return the request identity used to share one quality probe.
+
+    Source provenance and playlist-entry position are deliberately excluded.
+    They describe where an observation came from, not a different media probe.
+    """
+    stream_url = str(_quality_value(candidate, "stream_url", "") or "").strip()
+    if effective_headers is None:
+        raw_headers = _quality_value(candidate, "headers", {})
+        headers = dict(raw_headers) if isinstance(raw_headers, Mapping) else {}
+    else:
+        headers = dict(effective_headers)
+
+    normalized_headers = tuple(sorted(
+        (
+            str(name or "").strip().casefold(),
+            str(value),
+        )
+        for name, value in headers.items()
+        if str(name or "").strip() and value is not None
+    ))
+    raw_keys = _quality_value(candidate, "keys", ())
+    has_decryption_keys = bool(raw_keys or ())
+    return stream_url, normalized_headers, has_decryption_keys
+
+
+_QUALITY_SOURCE_LABELS = {
+    "manifest": "manifest",
+    "ffprobe": "FFprobe",
+    "stream": "FFprobe",
+    "format": "FFprobe",
+    "sps": "SPS",
+    "h264-picture": "picture",
+    "idet": "idet",
+    "sample": "FFmpeg sample",
+}
+
+
+def _quality_source_labels(*source_values: object) -> list[str]:
+    labels: list[str] = []
+    for source_value in source_values:
+        for raw_part in re.split(r"[+,]", str(source_value or "")):
+            raw_part = raw_part.strip()
+            if not raw_part:
+                continue
+            label = _QUALITY_SOURCE_LABELS.get(raw_part.casefold(), raw_part)
+            if label not in labels:
+                labels.append(label)
+    return labels
+
+
+def format_candidate_quality(
+    candidate: QualityLike,
+    *,
+    motion_cap_fps: float = 50.0,
+    include_provenance: bool = True,
+) -> str:
+    """Render Resolution | FPS/P-I | Bitrate using shared quality evidence."""
+    if not has_quality_evidence(candidate):
+        return "unknown"
+
+    fps = float(_quality_value(candidate, "video_fps", 0.0) or 0.0)
+    width = int(_quality_value(candidate, "video_width", 0) or 0)
+    height = int(_quality_value(candidate, "video_height", 0) or 0)
+    bitrate = int(_quality_value(candidate, "video_bitrate_bps", 0) or 0)
+    scan_type = normalize_video_scan_type(
+        _quality_value(candidate, "video_scan_type", "")
+    )
+
+    def with_sources(text: str, *source_values: object) -> str:
+        if not include_provenance:
+            return text
+        labels = _quality_source_labels(*source_values)
+        if not labels or labels == ["manifest"]:
+            return text
+        return f"{text} [{', '.join(labels)}]"
+
+    resolution_text = (
+        f"{width}x{height}"
+        if width > 0 and height > 0
+        else "resolution UNKNOWN"
+    )
+    resolution_text = with_sources(
+        resolution_text,
+        _quality_value(candidate, "video_resolution_source", ""),
+    )
+
+    if fps > 0:
+        display_fps = (
+            comparable_motion_fps(candidate, motion_cap_fps=float(motion_cap_fps))
+            if scan_type == "interlaced"
+            else fps
+        )
+        fps_text = f"{display_fps:.3f}".rstrip("0").rstrip(".")
+        if scan_type == "interlaced":
+            fps_text = f"{fps_text}i"
+        elif scan_type == "progressive":
+            fps_text = f"{fps_text}p"
+        else:
+            fps_text = f"{fps_text} fps (P/I UNKNOWN)"
+        fps_text = with_sources(
+            fps_text,
+            _quality_value(candidate, "video_fps_source", ""),
+            (
+                _quality_value(candidate, "video_scan_type_source", "")
+                if scan_type
+                else ""
+            ),
+        )
+    else:
+        fps_text = "fps UNKNOWN"
+
+    if bitrate > 0:
+        bitrate_text = f"{int(round(bitrate / 1000.0))} Kbps"
+        bitrate_source = str(
+            _quality_value(candidate, "video_bitrate_source", "") or ""
+        )
+        if bitrate_source == "sample":
+            bitrate_text = "~" + bitrate_text
+        bitrate_text = with_sources(bitrate_text, bitrate_source)
+    else:
+        bitrate_text = "bitrate UNKNOWN"
+
+    return " | ".join((resolution_text, fps_text, bitrate_text))
 
 
 def parse_frame_rate(value: object) -> float:
