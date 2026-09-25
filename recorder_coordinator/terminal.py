@@ -203,7 +203,7 @@ def _header_lines(
     if config_path is not None:
         lines.append(f"Config       : {Path(config_path).name}")
     if refresh_interval_sec is not None:
-        lines.append(f"Refresh      : every {refresh_interval_sec:g}s + manual r")
+        lines.append(f"Refresh      : every {refresh_interval_sec:g}s + manual F5")
     if snapshot.coordinator_window is not None:
         window = snapshot.coordinator_window
         lines.append("Coordinator")
@@ -316,7 +316,7 @@ def render_dashboard(
 
     if active_entries:
         lines.append("")
-        lines.append("ACTIVE RECORDINGS")
+        lines.append(_event_title("ACTIVE RECORDINGS", color))
         for identity_key, entry, state in sorted(
             active_entries,
             key=lambda item: (
@@ -332,8 +332,13 @@ def render_dashboard(
                 if isinstance(pid, int) and not isinstance(pid, bool)
                 else "-"
             )
+            state_flag = (
+                _marker(f"[{state}]", color)
+                if state == "ACTIVE"
+                else _important_text(f"[{state}]", color)
+            )
             lines.append(
-                f"  [{state}] {display_name} | {provider} | PID {pid_text}"
+                f"  {state_flag} {display_name} | {provider} | PID {pid_text}"
             )
 
     lines.append("")
@@ -619,7 +624,7 @@ def watch_status_text(
     return (
         f"Watching | Last scan {last_scan} | "
         f"Next scan {_format_countdown(next_refresh_monotonic - time.monotonic())} "
-        "| p=record | i=info | r=refresh | Ctrl+C=exit"
+        "| r=record | i=info | F5=refresh | Ctrl+C=exit"
     )
 
 
@@ -649,9 +654,9 @@ def render_coordinator_controls(sound_state: SoundSnoozeState) -> str:
         "================ COORDINATOR INFORMATION & CONTROLS ================",
         f"Sound state : {coordinator_sound_state_text(sound_state)}",
         "",
-        "  P  Record a MANUAL identity",
+        "  R  Record a MANUAL identity",
         "  S  Sound / notification snooze",
-        "  r  Refresh now",
+        "  F5 Refresh now",
         "  Ctrl+C  Exit",
         "====================================================================",
         "",
@@ -660,13 +665,13 @@ def render_coordinator_controls(sound_state: SoundSnoozeState) -> str:
 
 def render_manual_record_menu(
     snapshot: DashboardSnapshot,
-    identity_keys: Sequence[str],
+    identity_choices: Sequence[Tuple[int, str]],
 ) -> str:
     lines = [
         "",
         "================ RECORD MANUAL IDENTITY ================",
     ]
-    for number, identity_key in enumerate(identity_keys, start=1):
+    for number, identity_key in identity_choices:
         block = snapshot.blocks[(POLICY_MANUAL, identity_key)]
         candidate = block.best_candidate
         title = (
