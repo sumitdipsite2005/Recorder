@@ -993,7 +993,8 @@ def _manual_record_choices(
     snapshot: DashboardSnapshot,
     display_order: Mapping[str, Sequence[str]],
     registry_store: IdentityRegistryStore,
-) -> Tuple[str, ...]:
+) -> Tuple[Tuple[int, str], ...]:
+    """Return selectable identities with their stable dashboard row numbers."""
     registry = registry_store.read()
     entries = registry.get("entries")
     blocked = set(entries) if isinstance(entries, Mapping) else set()
@@ -1005,8 +1006,8 @@ def _manual_record_choices(
         if policy == POLICY_MANUAL and identity_key not in ordered
     )
     return tuple(
-        identity_key
-        for identity_key in ordered
+        (number, identity_key)
+        for number, identity_key in enumerate(ordered, start=1)
         if (
             identity_key not in blocked
             and (POLICY_MANUAL, identity_key) in snapshot.blocks
@@ -1014,6 +1015,44 @@ def _manual_record_choices(
             is not None
         )
     )
+
+
+def _registry_state_changes(
+    previous_entries: Mapping[str, Mapping[str, object]],
+    current_entries: Mapping[str, Mapping[str, object]],
+) -> Tuple[Tuple[str, str, str, str], ...]:
+    """Describe registry state transitions observed by the fast status poll."""
+    changes: List[Tuple[str, str, str, str]] = []
+    for identity_key in sorted(set(previous_entries) | set(current_entries)):
+        previous_entry = previous_entries.get(identity_key)
+        current_entry = current_entries.get(identity_key)
+        previous_state = (
+            str(previous_entry.get("state") or "").strip().upper()
+            if isinstance(previous_entry, Mapping)
+            else ""
+        )
+        current_state = (
+            str(current_entry.get("state") or "").strip().upper()
+            if isinstance(current_entry, Mapping)
+            else ""
+        )
+        if previous_state == current_state:
+            continue
+        reason_entry = current_entry if isinstance(current_entry, Mapping) else previous_entry
+        reason = (
+            str(reason_entry.get("reason") or "-")
+            if isinstance(reason_entry, Mapping)
+            else "-"
+        )
+        changes.append(
+            (
+                identity_key,
+                previous_state or "-",
+                current_state or "-",
+                reason,
+            )
+        )
+    return tuple(changes)
 
 
 def _manual_recovery_playlist_urls(
@@ -1100,7 +1139,10 @@ def _command_reader(
             key = msvcrt.getwch()
             if key in ("\x00", "\xe0"):
                 if msvcrt.kbhit():
-                    msvcrt.getwch()
+                    extended_key = msvcrt.getwch()
+                    if extended_key == "\x3f":  # F5
+                        number_buffer = ""
+                        command_queue.put("__F5__")
                 continue
             if key.isdigit():
                 number_buffer += key
@@ -1116,7 +1158,7 @@ def _command_reader(
                 continue
 
             number_buffer = ""
-            if key.casefold() in {"p", "r", "i", "s", "m", "f", "u"}:
+            if key.casefold() in {"r", "i", "s", "m", "f", "u"}:
                 command_queue.put(key.casefold())
             elif key == "\x1b":
                 command_queue.put("__ESC__")
@@ -1226,6 +1268,23 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 else:
                     registry_read_error_signature = ""
                     if fresh_registry_entries != registry_entries:
+                        for (
+                            identity_key,
+                            previous_state,
+                            current_state,
+                            reason,
+                        ) in _registry_state_changes(
+                            registry_entries,
+                            fresh_registry_entries,
+                        ):
+                            write_log(
+                                log_path,
+                                (
+                                    f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                                    f"REGISTRY STATE — {identity_key} — "
+                                    f"{previous_state} -> {current_state} — {reason}"
+                                ),
+                            )
                         registry_entries = fresh_registry_entries
                         if (
                             previous is not None
@@ -1514,13 +1573,17 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         continue
 
                     selected_number = int(number_text)
-                    if not 1 <= selected_number <= len(record_choices):
+                    choice_by_number = dict(record_choices)
+                    if selected_number not in choice_by_number:
+                        valid_numbers = ", ".join(
+                            str(number) for number, _ in record_choices
+                        )
                         set_live_status_line(
-                            f"Choose 1-{len(record_choices)} or Esc"
+                            f"Choose {valid_numbers} or Esc"
                         )
                         continue
 
-                    identity_key = record_choices[selected_number - 1]
+                    identity_key = choice_by_number[selected_number]
                     record_menu_open = False
                     record_choices = ()
                     clear_live_status_line()
@@ -1574,7 +1637,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     )
                 continue
 
-            if normalized in {"p", "record"}:
+            if normalized in {"r", "record"}:
                 if previous is None:
                     set_live_status_line(
                         "No completed discovery snapshot yet"
@@ -1613,7 +1676,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 )
                 continue
 
-            if normalized in {"r", "refresh"}:
+            if normalized in {"__f5__", "f5", "refresh"}:
                 force_refresh = True
                 continue
 
@@ -1635,7 +1698,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
 
             if normalized:
                 set_live_status_line(
-                    "Use p=record | i=info | s=sound | r=refresh | Ctrl+C=exit"
+                    "Use r=record | i=info | s=sound | F5=refresh | Ctrl+C=exit"
                 )
             elif next_refresh_monotonic > 0:
                 set_live_status_line(
