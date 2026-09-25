@@ -1240,7 +1240,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
     sound_state = SoundSnoozeState()
     sound_menu_open = False
     record_menu_open = False
-    record_choices: Tuple[str, ...] = ()
+    record_choices: Tuple[Tuple[int, str], ...] = ()
 
     try:
         while not stop_event.is_set():
