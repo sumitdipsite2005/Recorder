@@ -1336,7 +1336,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
             try:
                 command = command_queue.get(timeout=timeout)
             except queue.Empty:
-                if next_refresh_monotonic > 0:
+                if (
+                    next_refresh_monotonic > 0
+                    and not record_menu_open
+                    and not sound_menu_open
+                ):
                     set_live_status_line(
                         watch_status_text(last_scan_wall_time, next_refresh_monotonic)
                     )
@@ -1415,7 +1419,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     if command.startswith("__NUMBER_BUFFER__:"):
                         number_text = command.split(":", 1)[1]
                         set_live_status_line(
-                            f"Enter identity number: {number_text}"
+                            f"Identity number: {number_text}"
                         )
                         continue
                     if command.startswith("__NUMBER_SUBMIT__:"):
@@ -1424,13 +1428,13 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         number_text = normalized
                     else:
                         set_live_status_line(
-                            "Enter identity number and press Enter, or Esc to cancel"
+                            "Identity number: "
                         )
                         continue
 
                     if not number_text:
                         set_live_status_line(
-                            "Enter identity number and press Enter, or Esc to cancel"
+                            "Identity number: "
                         )
                         continue
 
@@ -1530,7 +1534,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 clear_live_status_line()
                 print(render_manual_record_menu(previous, record_choices))
                 set_live_status_line(
-                    "Enter identity number and press Enter, or Esc to cancel"
+                    "Identity number: "
                 )
                 continue
 
