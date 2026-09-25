@@ -19,12 +19,79 @@ def _apple_script_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _powershell_quote(value: object) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _detect_windows_shell() -> str:
+    """Detect the shell hosting the Coordinator process; fail safely to CMD."""
+    query_shell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    if query_shell is None:
+        return "cmd.exe"
+    try:
+        completed = subprocess.run(
+            [
+                query_shell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"(Get-Process -Id {os.getppid()}).ProcessName",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return "cmd.exe"
+
+    process_name = str(completed.stdout or "").strip().splitlines()
+    if not process_name:
+        return "cmd.exe"
+    normalized = process_name[-1].strip().casefold()
+    if normalized in {"powershell", "powershell.exe"}:
+        return "powershell.exe"
+    if normalized in {"pwsh", "pwsh.exe"}:
+        return "pwsh.exe"
+    if normalized in {"cmd", "cmd.exe"}:
+        return "cmd.exe"
+    return "cmd.exe"
+
+
 def _windows_tab_argv(
     worker_command: Sequence[str],
     *,
     title: str,
+    post_exit_cwd: Path,
+    windows_shell: Optional[str] = None,
 ) -> list[str]:
+    shell = str(windows_shell or _detect_windows_shell()).strip().casefold()
+    if shell in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        executable = "pwsh.exe" if shell.startswith("pwsh") else "powershell.exe"
+        invocation = "& " + " ".join(
+            _powershell_quote(argument)
+            for argument in worker_command
+        )
+        shell_command = (
+            f"{invocation}; "
+            f"Set-Location -LiteralPath {_powershell_quote(post_exit_cwd)}"
+        )
+        return [
+            "wt.exe",
+            "-w",
+            "0",
+            "new-tab",
+            "--title",
+            title,
+            "--suppressApplicationTitle",
+            executable,
+            "-NoExit",
+            "-Command",
+            shell_command,
+        ]
+
     command_line = subprocess.list2cmdline(list(worker_command))
+    post_exit = subprocess.list2cmdline([str(post_exit_cwd)])
     return [
         "wt.exe",
         "-w",
@@ -35,7 +102,7 @@ def _windows_tab_argv(
         "--suppressApplicationTitle",
         "cmd.exe",
         "/k",
-        command_line,
+        f"{command_line} & cd /d {post_exit}",
     ]
 
 
@@ -92,11 +159,18 @@ def build_terminal_tab_argv(
     *,
     title: str,
     cwd: Path,
+    post_exit_cwd: Optional[Path] = None,
     platform_name: Optional[str] = None,
+    windows_shell: Optional[str] = None,
 ) -> list[str]:
     platform_value = platform_name or sys.platform
     if platform_value.startswith("win"):
-        return _windows_tab_argv(worker_command, title=title)
+        return _windows_tab_argv(
+            worker_command,
+            title=title,
+            post_exit_cwd=Path(post_exit_cwd or cwd),
+            windows_shell=windows_shell,
+        )
     if platform_value == "darwin":
         return _macos_tab_argv(worker_command, title=title, cwd=cwd)
     raise TerminalHostError(
@@ -110,6 +184,7 @@ def launch_terminal_tab(
     *,
     title: str,
     cwd: Path,
+    post_exit_cwd: Optional[Path] = None,
     popen_factory: Optional[Callable[..., object]] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> object:
@@ -136,6 +211,7 @@ def launch_terminal_tab(
         worker_command,
         title=title,
         cwd=cwd,
+        post_exit_cwd=post_exit_cwd,
     )
     popen = popen_factory or subprocess.Popen
     return popen(
