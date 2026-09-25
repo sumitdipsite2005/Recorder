@@ -33,6 +33,7 @@ from recorder_runtime import sound as runtime_sound
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_runtime.sound import SoundSnoozeState
 
+from recorder_coordinator.registry import IdentityRegistryStore
 from recorder_coordinator.models import (
     ChangeEvent,
     CoordinatorWindow,
@@ -214,12 +215,21 @@ def _default_config_path() -> Path:
     return root / "recorder_dynamic_user_config.py"
 
 
-def _coordinator_log_path(config_path: Path, started: datetime) -> Path:
+def _coordinator_output_paths(config_path: Path):
     raw = runpy.run_path(str(config_path))
-    output_paths = build_recorder_output_paths(raw.get("RECORDING_OUTPUT_DIR"))
-    output_paths.coordinator_logs.mkdir(parents=True, exist_ok=True)
+    return build_recorder_output_paths(raw.get("RECORDING_OUTPUT_DIR"))
+
+
+def _coordinator_log_path(
+    config_path: Path,
+    started: datetime,
+    *,
+    output_paths=None,
+) -> Path:
+    paths = output_paths or _coordinator_output_paths(config_path)
+    paths.coordinator_logs.mkdir(parents=True, exist_ok=True)
     return (
-        output_paths.coordinator_logs
+        paths.coordinator_logs
         / f"IDENTITY_COORDINATOR_{started:%Y%m%d_%H%M%S}.log"
     )
 
@@ -1008,7 +1018,30 @@ def run(config_path: Path, *, once: bool = False) -> int:
     row_update_registry: Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]] = {}
     source_freshness_registry: Dict[str, Mapping[str, object]] = {}
     started = datetime.now()
-    log_path = _coordinator_log_path(config_path, started)
+    output_paths = _coordinator_output_paths(config_path)
+    log_path = _coordinator_log_path(
+        config_path,
+        started,
+        output_paths=output_paths,
+    )
+    registry_store = IdentityRegistryStore(output_paths)
+    registry_status = registry_store.prepare_session()
+    write_log(
+        log_path,
+        (
+            f"IDENTITY REGISTRY {registry_status.action} "
+            f"session={registry_status.session_id}"
+        ),
+    )
+    if registry_status.unresolved_identities:
+        unresolved = ", ".join(registry_status.unresolved_identities)
+        warning = (
+            "IDENTITY REGISTRY WARNING: unresolved ownership remains for "
+            f"{unresolved}; identity-based launch must remain blocked until "
+            "that registry state is resolved."
+        )
+        print(warning)
+        write_log(log_path, warning)
 
     command_queue: "queue.Queue[str]" = queue.Queue()
     stop_event = threading.Event()
