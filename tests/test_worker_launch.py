@@ -60,7 +60,7 @@ class WorkerLaunchTests(unittest.TestCase):
             store, request, config_path = self.make_store_and_request(td)
             captured = {}
 
-            def fake_terminal_launcher(command, *, title, cwd):
+            def fake_terminal_launcher(command, *, title, cwd, post_exit_cwd):
                 registry = store.read()
                 captured["state_at_launch"] = registry["entries"][
                     request.identity_key
@@ -68,6 +68,7 @@ class WorkerLaunchTests(unittest.TestCase):
                 captured["command"] = command
                 captured["title"] = title
                 captured["cwd"] = cwd
+                captured["post_exit_cwd"] = post_exit_cwd
                 store.transition(
                     identity_key=request.identity_key,
                     new_state=STATE_ACTIVE,
@@ -100,6 +101,10 @@ class WorkerLaunchTests(unittest.TestCase):
                     config_path.resolve(),
                 )
                 self.assertIn("Example Event", captured["title"])
+                self.assertEqual(
+                    captured["post_exit_cwd"],
+                    Path(td) / "Manual Recordings",
+                )
             finally:
                 request_path.unlink(missing_ok=True)
 
@@ -108,7 +113,7 @@ class WorkerLaunchTests(unittest.TestCase):
             store, request, config_path = self.make_store_and_request(td)
             captured_path = None
 
-            def failing_terminal_launcher(command, *, title, cwd):
+            def failing_terminal_launcher(command, *, title, cwd, post_exit_cwd):
                 nonlocal captured_path
                 captured_path = Path(
                     command[command.index("--request") + 1]
