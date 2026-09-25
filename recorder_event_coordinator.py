@@ -1001,6 +1001,43 @@ def _manual_record_choices(
     )
 
 
+def _manual_recovery_playlist_urls(
+    snapshot: DashboardSnapshot,
+    plan,
+    raw_config: Mapping[str, object],
+) -> Tuple[str, ...]:
+    """Freeze only the launch-winning targets' explicit provider source scope."""
+    winning_names = {intent.name for intent in plan.target_intents}
+    urls: List[str] = []
+    seen: Set[str] = set()
+
+    for view in snapshot.target_views:
+        target = view.target
+        if target.name not in winning_names:
+            continue
+        for group in target.source_groups:
+            context_group = _source_context_group_for_target(target, group)
+            provider = str(
+                GROUP_PROVIDER.get(context_group, context_group)
+            ).strip().upper()
+            if provider != plan.identity.provider:
+                continue
+            for spec in sources_for_group(
+                raw_config,
+                group,
+                context_group=context_group,
+            ):
+                if spec.url not in seen:
+                    seen.add(spec.url)
+                    urls.append(spec.url)
+
+    if not urls:
+        raise RuntimeError(
+            "Selected MANUAL identity has no frozen recovery playlist source scope"
+        )
+    return tuple(urls)
+
+
 def _launch_manual_identity(
     snapshot: DashboardSnapshot,
     identity_key: str,
@@ -1008,8 +1045,14 @@ def _launch_manual_identity(
     registry_session_id: str,
     registry_store: IdentityRegistryStore,
     config_path: Path,
+    raw_config: Mapping[str, object],
 ):
     plan = build_manual_launch_plan(snapshot, identity_key)
+    recovery_playlist_urls = _manual_recovery_playlist_urls(
+        snapshot,
+        plan,
+        raw_config,
+    )
     request = IdentityLaunchRequest(
         registry_session_id=registry_session_id,
         identity_key=plan.identity.serialized,
@@ -1017,6 +1060,7 @@ def _launch_manual_identity(
         selected_source_group=plan.selected_source_group,
         selected_candidate=plan.selected_candidate,
         target_intents=plan.target_intents,
+        recovery_playlist_urls=recovery_playlist_urls,
         recording_duration_min=plan.recording_duration_min,
         base_name=plan.base_name,
     )
@@ -1412,6 +1456,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             registry_session_id=registry_status.session_id,
                             registry_store=registry_store,
                             config_path=config_path,
+                            raw_config=state.raw_config or {},
                         )
                         message = (
                             f"Recording launched: {plan.base_name} "
