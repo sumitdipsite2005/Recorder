@@ -569,9 +569,17 @@ https://edge.drmlive.net/live.mpd
             headers = Headers()
             def __enter__(self): return self
             def __exit__(self, *a): return False
-            def read(self, n=-1): return body
+            def __init__(self): self._read_done = False
+            def read(self, n=-1):
+                if self._read_done:
+                    return b""
+                self._read_done = True
+                return body
             def geturl(self): return "https://final.test/master.m3u8"
-        with patch("recorder_source.discovery.urlopen", return_value=Response()):
+        with patch(
+            "recorder_source.discovery.urlopen",
+            side_effect=lambda *args, **kwargs: Response(),
+        ):
             out = probe_candidate_hls(candidate(stream_url="https://src.test/master.m3u8", extra={"provider":"SONYLIV"}))
         self.assertTrue(out.launchable)
         self.assertEqual((out.video_width, out.video_height, out.video_fps), (1920, 1080, 50.0))
@@ -637,10 +645,18 @@ https://edge.drmlive.net/live.mpd
             headers = Headers()
             def __enter__(self): return self
             def __exit__(self, *a): return False
-            def read(self, n=-1): return body
+            def __init__(self): self._read_done = False
+            def read(self, n=-1):
+                if self._read_done:
+                    return b""
+                self._read_done = True
+                return body
             def geturl(self): return "https://final.test/manifest.mpd"
         clear_key = "ba8896d605246871ac424878491d86a1:8600d4153034b3cbc852f13ea4b7482c"
-        with patch("recorder_source.discovery.urlopen", return_value=Response()):
+        with patch(
+            "recorder_source.discovery.urlopen",
+            side_effect=lambda *args, **kwargs: Response(),
+        ):
             out = probe_candidate_hls(candidate(
                 stream_url="https://src.test/manifest.mpd",
                 license_type="clearkey",
@@ -660,9 +676,17 @@ https://edge.drmlive.net/live.mpd
             headers = Headers()
             def __enter__(self): return self
             def __exit__(self, *a): return False
-            def read(self, n=-1): return body
+            def __init__(self): self._read_done = False
+            def read(self, n=-1):
+                if self._read_done:
+                    return b""
+                self._read_done = True
+                return body
             def geturl(self): return "https://final.test/manifest.mpd"
-        with patch("recorder_source.discovery.urlopen", return_value=Response()):
+        with patch(
+            "recorder_source.discovery.urlopen",
+            side_effect=lambda *args, **kwargs: Response(),
+        ):
             out = probe_candidate_hls(candidate(stream_url="https://src.test/manifest.mpd"))
         self.assertFalse(out.launchable)
         self.assertEqual(out.probe_status,"drm_key_missing")
@@ -676,9 +700,17 @@ https://edge.drmlive.net/live.mpd
             headers = Headers()
             def __enter__(self): return self
             def __exit__(self, *a): return False
-            def read(self, n=-1): return body
+            def __init__(self): self._read_done = False
+            def read(self, n=-1):
+                if self._read_done:
+                    return b""
+                self._read_done = True
+                return body
             def geturl(self): return "https://final.test/manifest.mpd"
-        with patch("recorder_source.discovery.urlopen", return_value=Response()):
+        with patch(
+            "recorder_source.discovery.urlopen",
+            side_effect=lambda *args, **kwargs: Response(),
+        ):
             out = probe_candidate_hls(candidate(stream_url="https://src.test/manifest.mpd"))
         self.assertTrue(out.launchable)
         self.assertEqual(out.stream_type, "DASH")
@@ -693,7 +725,12 @@ https://edge.drmlive.net/live.mpd
             headers = Headers()
             def __enter__(self): return self
             def __exit__(self, *a): return False
-            def read(self, n=-1): return body
+            def __init__(self): self._read_done = False
+            def read(self, n=-1):
+                if self._read_done:
+                    return b""
+                self._read_done = True
+                return body
             def geturl(self): return "https://final.test/master.m3u8"
 
         ffprobe = {
@@ -736,7 +773,12 @@ https://edge.drmlive.net/live.mpd
             headers = Headers()
             def __enter__(self): return self
             def __exit__(self, *a): return False
-            def read(self, n=-1): return body
+            def __init__(self): self._read_done = False
+            def read(self, n=-1):
+                if self._read_done:
+                    return b""
+                self._read_done = True
+                return body
             def geturl(self): return "https://final.test/master.m3u8"
 
         ffprobe = {

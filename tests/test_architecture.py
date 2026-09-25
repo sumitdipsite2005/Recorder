@@ -59,8 +59,8 @@ class ArchitectureGuardTests(unittest.TestCase):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
         self.assertIn("from recorder_source import transport as source_transport", recorder)
-        self.assertIn("source_transport.run_retryable_http_get(", recorder)
-        self.assertIn("source_transport.run_retryable_http_get(", discovery)
+        self.assertIn("source_transport.fetch_stream_manifest_text(", recorder)
+        self.assertIn("source_transport.fetch_stream_manifest_text(", discovery)
 
     def test_recorder_and_coordinator_share_dash_quality_parser(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
