@@ -12,7 +12,9 @@ import json
 import os
 import re
 import subprocess
+import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import urljoin
 
@@ -186,6 +188,29 @@ def parse_frame_rate(value: object) -> float:
         return 0.0
 
 
+def extract_auth_expiries(value: str) -> Tuple[int, ...]:
+    expiries = []
+    for match in re.finditer(
+        r'(?:^|[?&~=;])(?:exp|expires)=(\d+)',
+        str(value or ""),
+        flags=re.IGNORECASE,
+    ):
+        expiries.append(int(match.group(1)))
+    return tuple(expiries)
+
+
+def extract_auth_expiry(*values: object) -> Optional[int]:
+    expiries = []
+    for value in values:
+        expiries.extend(extract_auth_expiries(str(value or "")))
+    return min(expiries) if expiries else None
+
+
+def merge_auth_expiries(*values: Optional[float]) -> Optional[int]:
+    known = [int(value) for value in values if value is not None]
+    return min(known) if known else None
+
+
 def inspect_hls_manifest_drm(manifest_text: str) -> dict:
     """Identify HLS encryption that needs an external DRM/decryption key."""
     result = {
@@ -334,8 +359,12 @@ def parse_hls_manifest_quality(
 
         variant_url = urljoin(manifest_url, variant_uri) if variant_uri else ""
         variant_expiry = (
-            expiry_parser(variant_url)
-            if expiry_parser is not None and variant_url
+            (
+                expiry_parser(variant_url)
+                if expiry_parser is not None
+                else extract_auth_expiry(variant_url)
+            )
+            if variant_url
             else None
         )
 
@@ -355,6 +384,629 @@ def parse_hls_manifest_quality(
             "_hls_average_bandwidth_bps": average_bitrate,
             "_hls_codecs": str(codecs.group(1) if codecs else "").strip(),
         })
+
+    if not qualities:
+        return None
+
+    return max(
+        qualities,
+        key=lambda item: video_quality_rank(
+            item,
+            motion_cap_fps=float(motion_cap_fps),
+        ),
+    )
+
+
+def _dash_template_substitute(
+    template: str,
+    *,
+    representation_id: str,
+    bandwidth: int,
+    number: Optional[int] = None,
+    time_value: Optional[int] = None,
+) -> str:
+    """Resolve the standard DASH SegmentTemplate identifiers we need here."""
+    value = str(template or "")
+    if not value:
+        return ""
+
+    escaped_dollar = "\x00DASH_DOLLAR\x00"
+    value = value.replace("$", escaped_dollar)
+
+    values = {
+        "RepresentationID": str(representation_id or ""),
+        "Bandwidth": int(bandwidth or 0),
+        "Number": number,
+        "Time": time_value,
+    }
+
+    unresolved = False
+
+    def replace_token(match):
+        nonlocal unresolved
+        name = match.group(1)
+        width_text = match.group(3)
+        token_value = values.get(name)
+
+        if token_value is None or (name == "RepresentationID" and not token_value):
+            unresolved = True
+            return match.group(0)
+
+        if name == "RepresentationID":
+            return str(token_value)
+
+        numeric_value = int(token_value)
+        if width_text:
+            return f"{numeric_value:0{int(width_text)}d}"
+        return str(numeric_value)
+
+    value = re.sub(
+        r"\$(RepresentationID|Bandwidth|Number|Time)(%0(\d+)d)?\$",
+        replace_token,
+        value,
+    )
+    value = value.replace(escaped_dollar, "$")
+
+    if unresolved or re.search(r"\$[^$]+\$", value):
+        return ""
+
+    return value
+
+
+def _parse_dash_iso8601_datetime_timestamp(value: str) -> Optional[float]:
+    """Parse an MPD UTC timestamp without adding a third-party dependency."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return float(parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _parse_dash_iso8601_duration_seconds(value: str) -> float:
+    """Parse the ISO-8601 duration subset used by DASH MPD timing fields."""
+    text = str(value or "").strip().upper()
+    if not text:
+        return 0.0
+    match = re.fullmatch(
+        r"P(?:(?P<days>[0-9]+(?:\.[0-9]+)?)D)?"
+        r"(?:T(?:(?P<hours>[0-9]+(?:\.[0-9]+)?)H)?"
+        r"(?:(?P<minutes>[0-9]+(?:\.[0-9]+)?)M)?"
+        r"(?:(?P<seconds>[0-9]+(?:\.[0-9]+)?)S)?)?",
+        text,
+    )
+    if not match:
+        return 0.0
+    values = {
+        name: float(match.group(name) or 0.0)
+        for name in ("days", "hours", "minutes", "seconds")
+    }
+    return (
+        values["days"] * 86400.0
+        + values["hours"] * 3600.0
+        + values["minutes"] * 60.0
+        + values["seconds"]
+    )
+
+
+def parse_dash_manifest_quality(
+    manifest_text: str,
+    manifest_url: str = "",
+    *,
+    motion_cap_fps: float = 50.0,
+    now_ts: Optional[float] = None,
+) -> Optional[dict]:
+    """Parse DASH quality/addressing using the mature recorder rules."""
+    root = ET.fromstring(manifest_text)
+    qualities = []
+    current_ts = current_ts if now_ts is None else float(now_ts)
+
+    mpd_is_dynamic = str(root.attrib.get("type") or "").strip().casefold() == "dynamic"
+    mpd_availability_start_ts = _parse_dash_iso8601_datetime_timestamp(
+        root.attrib.get("availabilityStartTime") or ""
+    )
+    mpd_publish_ts = _parse_dash_iso8601_datetime_timestamp(
+        root.attrib.get("publishTime") or ""
+    )
+    mpd_suggested_delay_sec = _parse_dash_iso8601_duration_seconds(
+        root.attrib.get("suggestedPresentationDelay") or ""
+    )
+
+    def local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    def element_context_expiry(
+        element,
+        *,
+        excluded_child_names=(),
+    ) -> Optional[int]:
+        values = [str(value) for value in element.attrib.values()]
+
+        if element.text:
+            values.append(str(element.text))
+
+        excluded = {str(name) for name in excluded_child_names}
+
+        for child in element:
+            if local_name(child.tag) in excluded:
+                continue
+            values.append(ET.tostring(child, encoding="unicode"))
+
+        expiries = []
+        for value in values:
+            expiries.extend(extract_auth_expiries(value))
+        return min(expiries) if expiries else None
+
+    parent_map = {
+        child: parent
+        for parent in root.iter()
+        for child in parent
+    }
+
+    def element_chain(element):
+        chain = []
+        current = element
+        while current is not None:
+            chain.append(current)
+            current = parent_map.get(current)
+        return list(reversed(chain))
+
+    def first_child(element, name: str):
+        for child in element:
+            if local_name(child.tag) == name:
+                return child
+        return None
+
+    def resolve_base_urls(element) -> List[str]:
+        # DASH BaseURL is hierarchical and each level may expose alternatives.
+        # Preserve every valid path in document order instead of discarding all
+        # but the first BaseURL at each level.
+        base_urls = [str(manifest_url or "").strip()]
+
+        for node in element_chain(element):
+            node_base_texts = []
+
+            for child in node:
+                if local_name(child.tag) != "BaseURL":
+                    continue
+                base_text = str(child.text or "").strip()
+                if base_text and base_text not in node_base_texts:
+                    node_base_texts.append(base_text)
+
+            if not node_base_texts:
+                continue
+
+            resolved_urls = []
+            for current_base in base_urls:
+                for base_text in node_base_texts:
+                    resolved = urljoin(current_base, base_text)
+                    if resolved and resolved not in resolved_urls:
+                        resolved_urls.append(resolved)
+
+            if resolved_urls:
+                base_urls = resolved_urls
+
+        return base_urls
+
+    def inherited_segment_template(element):
+        attributes = {}
+        timeline = None
+        for node in element_chain(element):
+            template = first_child(node, "SegmentTemplate")
+            if template is None:
+                continue
+            attributes.update(template.attrib)
+            template_timeline = first_child(template, "SegmentTimeline")
+            if template_timeline is not None:
+                timeline = template_timeline
+        return attributes, timeline
+
+    def inherited_segment_list(element):
+        selected = None
+        for node in element_chain(element):
+            segment_list = first_child(node, "SegmentList")
+            if segment_list is not None:
+                selected = segment_list
+        return selected
+
+    def inherited_segment_base(element):
+        selected = None
+        for node in element_chain(element):
+            segment_base = first_child(node, "SegmentBase")
+            if segment_base is not None:
+                selected = segment_base
+        return selected
+
+    def period_start_seconds(element) -> float:
+        for node in reversed(element_chain(element)):
+            if local_name(node.tag) == "Period":
+                return _parse_dash_iso8601_duration_seconds(
+                    node.attrib.get("start") or ""
+                )
+        return 0.0
+
+    def live_presentation_time_units(
+        element,
+        *,
+        timescale: int,
+        presentation_time_offset: int,
+    ) -> Optional[int]:
+        if not mpd_is_dynamic or mpd_availability_start_ts is None:
+            return None
+        reference_ts = float(mpd_publish_ts or current_ts)
+        if mpd_suggested_delay_sec > 0:
+            reference_ts -= float(mpd_suggested_delay_sec)
+        elapsed_sec = (
+            reference_ts
+            - float(mpd_availability_start_ts)
+            - float(period_start_seconds(element))
+        )
+        if elapsed_sec <= 0:
+            return int(presentation_time_offset)
+        return int(
+            int(presentation_time_offset)
+            + (elapsed_sec * max(1, int(timescale)))
+        )
+
+    def recent_timeline_times(
+        timeline,
+        representation,
+        *,
+        timescale: int,
+        presentation_time_offset: int,
+        limit: int = 3,
+    ):
+        if timeline is None:
+            return []
+
+        entries = [
+            entry
+            for entry in timeline
+            if local_name(entry.tag) == "S"
+        ]
+        if not entries:
+            return []
+
+        recent = []
+        current_time = None
+        live_units = live_presentation_time_units(
+            representation,
+            timescale=timescale,
+            presentation_time_offset=presentation_time_offset,
+        )
+
+        for entry_index, entry in enumerate(entries):
+            duration = int(entry.attrib.get("d") or 0)
+            if duration <= 0:
+                continue
+            if entry.attrib.get("t") is not None:
+                current_time = int(entry.attrib.get("t") or 0)
+            elif current_time is None:
+                current_time = int(presentation_time_offset or 0)
+
+            repeat = int(entry.attrib.get("r") or 0)
+            if repeat >= 0:
+                count = repeat + 1
+            else:
+                next_time = None
+                for next_entry in entries[entry_index + 1:]:
+                    if next_entry.attrib.get("t") is not None:
+                        next_time = int(next_entry.attrib.get("t") or 0)
+                        break
+                if next_time is not None and next_time > current_time:
+                    count = max(1, (next_time - current_time + duration - 1) // duration)
+                elif live_units is not None and live_units > current_time:
+                    count = max(1, (live_units - current_time) // duration)
+                else:
+                    continue
+
+            keep = max(limit + 2, 5)
+            first_recent_index = max(0, int(count) - keep)
+            for repeat_index in range(first_recent_index, int(count)):
+                recent.append(int(current_time + (repeat_index * duration)))
+                if len(recent) > keep:
+                    recent = recent[-keep:]
+
+            current_time += int(count) * duration
+
+        if not recent:
+            return []
+
+        ordered = []
+        for index in (-2, -3, -1, -4, -5):
+            if abs(index) <= len(recent):
+                value = recent[index]
+                if value not in ordered:
+                    ordered.append(value)
+            if len(ordered) >= limit:
+                break
+        return ordered
+
+    def resolve_addressing(representation, representation_id: str, bandwidth: int):
+        def build_route(base_url: str) -> dict:
+            init_url = ""
+            init_range = ""
+            media_urls = []
+            media_ranges = []
+            media_self_contained = False
+
+            template_attrs, timeline = inherited_segment_template(representation)
+            if template_attrs:
+                initialization = _dash_template_substitute(
+                    template_attrs.get("initialization") or "",
+                    representation_id=representation_id,
+                    bandwidth=bandwidth,
+                )
+                if initialization:
+                    init_url = urljoin(base_url, initialization)
+
+                media_template = str(template_attrs.get("media") or "")
+                start_number = int(template_attrs.get("startNumber") or 1)
+                timescale = max(1, int(template_attrs.get("timescale") or 1))
+                presentation_time_offset = int(
+                    template_attrs.get("presentationTimeOffset") or 0
+                )
+                duration = int(template_attrs.get("duration") or 0)
+                if media_template:
+                    if "$Time" in media_template:
+                        time_values = recent_timeline_times(
+                            timeline,
+                            representation,
+                            timescale=timescale,
+                            presentation_time_offset=presentation_time_offset,
+                            limit=3,
+                        )
+                        if not time_values and duration > 0:
+                            live_units = live_presentation_time_units(
+                                representation,
+                                timescale=timescale,
+                                presentation_time_offset=presentation_time_offset,
+                            )
+                            if live_units is not None:
+                                live_index = max(
+                                    0,
+                                    int((live_units - presentation_time_offset) // duration),
+                                )
+                                for offset in (1, 2, 0):
+                                    index = max(0, live_index - offset)
+                                    value = presentation_time_offset + (index * duration)
+                                    if value not in time_values:
+                                        time_values.append(value)
+                            elif not mpd_is_dynamic:
+                                time_values = [
+                                    presentation_time_offset,
+                                    presentation_time_offset + duration,
+                                    presentation_time_offset + (duration * 2),
+                                ]
+                        for time_value in time_values:
+                            media = _dash_template_substitute(
+                                media_template,
+                                representation_id=representation_id,
+                                bandwidth=bandwidth,
+                                number=start_number,
+                                time_value=time_value,
+                            )
+                            if media:
+                                media_urls.append(urljoin(base_url, media))
+                    else:
+                        numbers = []
+                        if duration > 0:
+                            live_units = live_presentation_time_units(
+                                representation,
+                                timescale=timescale,
+                                presentation_time_offset=presentation_time_offset,
+                            )
+                            if live_units is not None:
+                                live_index = max(
+                                    0,
+                                    int((live_units - presentation_time_offset) // duration),
+                                )
+                                current_number = start_number + live_index
+                                for offset in (1, 2, 0):
+                                    value = max(start_number, current_number - offset)
+                                    if value not in numbers:
+                                        numbers.append(value)
+                        if not numbers and not mpd_is_dynamic:
+                            numbers = list(range(start_number, start_number + 3))
+
+                        for number in numbers:
+                            media = _dash_template_substitute(
+                                media_template,
+                                representation_id=representation_id,
+                                bandwidth=bandwidth,
+                                number=number,
+                                time_value=None,
+                            )
+                            if media:
+                                media_urls.append(urljoin(base_url, media))
+
+            if not init_url and not media_urls:
+                segment_list = inherited_segment_list(representation)
+                if segment_list is not None:
+                    initialization = first_child(segment_list, "Initialization")
+                    if initialization is not None:
+                        source_url = str(initialization.attrib.get("sourceURL") or "").strip()
+                        init_url = urljoin(base_url, source_url) if source_url else base_url
+                        init_range = str(initialization.attrib.get("range") or "").strip()
+
+                    segment_pairs = []
+                    for segment_url in segment_list:
+                        if local_name(segment_url.tag) != "SegmentURL":
+                            continue
+                        media = str(segment_url.attrib.get("media") or "").strip()
+                        if not media:
+                            continue
+                        segment_pairs.append((
+                            urljoin(base_url, media),
+                            str(segment_url.attrib.get("mediaRange") or "").strip(),
+                        ))
+
+                    if segment_pairs:
+                        if mpd_is_dynamic:
+                            recent_pairs = []
+                            for index in (-2, -3, -1):
+                                if abs(index) <= len(segment_pairs):
+                                    pair = segment_pairs[index]
+                                    if pair not in recent_pairs:
+                                        recent_pairs.append(pair)
+                            segment_pairs = recent_pairs
+                        else:
+                            segment_pairs = segment_pairs[:3]
+
+                    for media_url, media_range in segment_pairs[:3]:
+                        media_urls.append(media_url)
+                        media_ranges.append(media_range)
+
+            if not init_url and not media_urls:
+                segment_base = inherited_segment_base(representation)
+                if segment_base is not None and base_url:
+                    initialization = first_child(segment_base, "Initialization")
+                    if initialization is not None:
+                        source_url = str(initialization.attrib.get("sourceURL") or "").strip()
+                        init_url = urljoin(base_url, source_url) if source_url else base_url
+                        init_range = str(initialization.attrib.get("range") or "").strip()
+                    media_urls = [base_url]
+                    media_self_contained = True
+
+            if (
+                not init_url
+                and not media_urls
+                and base_url
+                and base_url != str(manifest_url or "").strip()
+            ):
+                media_urls = [base_url]
+                media_self_contained = True
+
+            return {
+                "base_url": base_url,
+                "initialization_url": init_url,
+                "initialization_range": init_range,
+                "media_urls": media_urls,
+                "media_ranges": media_ranges,
+                "media_self_contained": media_self_contained,
+            }
+
+        routes = [
+            build_route(base_url)
+            for base_url in resolve_base_urls(representation)
+            if str(base_url or "").strip()
+        ]
+
+        if not routes:
+            routes = [build_route(str(manifest_url or "").strip())]
+
+        primary = routes[0]
+
+        return {
+            "_dash_representation_id": representation_id,
+            "_dash_representation_bandwidth": int(bandwidth or 0),
+            "_dash_representation_base_url": primary["base_url"],
+            "_dash_representation_base_urls": [
+                route["base_url"]
+                for route in routes
+            ],
+            "_dash_initialization_url": primary["initialization_url"],
+            "_dash_initialization_range": primary["initialization_range"],
+            "_dash_media_urls": list(primary["media_urls"]),
+            "_dash_media_ranges": list(primary["media_ranges"]),
+            "_dash_media_self_contained": bool(
+                primary["media_self_contained"]
+            ),
+            "_dash_resource_routes": routes,
+        }
+
+    for adaptation in root.iter():
+        if local_name(adaptation.tag) != "AdaptationSet":
+            continue
+
+        adaptation_content_type = str(adaptation.attrib.get("contentType") or "").lower()
+        adaptation_mime_type = str(adaptation.attrib.get("mimeType") or "").lower()
+        adaptation_frame_rate = adaptation.attrib.get("frameRate")
+        adaptation_width = int(adaptation.attrib.get("width") or 0)
+        adaptation_height = int(adaptation.attrib.get("height") or 0)
+        adaptation_codecs = str(adaptation.attrib.get("codecs") or "").strip()
+        adaptation_scan_type = normalize_video_scan_type(
+            adaptation.attrib.get("scanType")
+        )
+
+        inherited_expiry = None
+        ancestor = parent_map.get(adaptation)
+        while ancestor is not None:
+            ancestor_expiry = element_context_expiry(
+                ancestor,
+                excluded_child_names=("Period", "AdaptationSet", "Representation"),
+            )
+            inherited_expiry = merge_auth_expiries(
+                inherited_expiry,
+                ancestor_expiry,
+            )
+            ancestor = parent_map.get(ancestor)
+
+        adaptation_expiry = element_context_expiry(
+            adaptation,
+            excluded_child_names=("Representation",),
+        )
+
+        for representation in adaptation:
+            if local_name(representation.tag) != "Representation":
+                continue
+
+            representation_mime_type = str(
+                representation.attrib.get("mimeType")
+                or adaptation_mime_type
+                or ""
+            ).lower()
+            width = int(representation.attrib.get("width") or adaptation_width or 0)
+            height = int(representation.attrib.get("height") or adaptation_height or 0)
+            fps = parse_frame_rate(
+                representation.attrib.get("frameRate") or adaptation_frame_rate
+            )
+            bitrate = int(representation.attrib.get("bandwidth") or 0)
+            representation_id = str(representation.attrib.get("id") or "").strip()
+            codecs = str(
+                representation.attrib.get("codecs")
+                or adaptation_codecs
+                or ""
+            ).strip()
+            video_scan_type = (
+                normalize_video_scan_type(representation.attrib.get("scanType"))
+                or adaptation_scan_type
+            )
+
+            is_video = (
+                adaptation_content_type == "video"
+                or "video" in adaptation_mime_type
+                or "video" in representation_mime_type
+                or (width > 0 and height > 0)
+                or fps > 0
+            )
+            if not is_video:
+                continue
+
+            representation_expiry = element_context_expiry(representation)
+            quality = {
+                "quality_known": bool(
+                    fps > 0 or (width > 0 and height > 0) or bitrate > 0
+                ),
+                "video_fps": fps,
+                "video_width": width,
+                "video_height": height,
+                "video_scan_type": video_scan_type,
+                "video_scan_type_source": "manifest" if video_scan_type else "",
+                "video_bitrate_bps": bitrate,
+                "manifest_expiry": merge_auth_expiries(
+                    inherited_expiry,
+                    adaptation_expiry,
+                    representation_expiry,
+                ),
+                "_dash_codecs": codecs,
+            }
+            quality.update(
+                resolve_addressing(representation, representation_id, bitrate)
+            )
+            qualities.append(quality)
 
     if not qualities:
         return None
