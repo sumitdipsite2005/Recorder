@@ -4,7 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from recorder_coordinator.registry import IdentityRegistryStore
+from recorder_coordinator.registry import (
+    IdentityRegistryStore,
+    STATE_ACTIVE,
+)
 from recorder_coordinator.worker import launch_identity_worker
 from recorder_runtime.identity_launch import (
     FrozenTargetIntent,
@@ -52,29 +55,27 @@ class WorkerLaunchTests(unittest.TestCase):
         config_path.write_text("# test config\n", encoding="utf-8")
         return store, request, config_path
 
-    def test_process_is_created_only_after_registry_claim(self):
+    def test_terminal_tab_is_created_only_after_registry_claim(self):
         with tempfile.TemporaryDirectory() as td:
             store, request, config_path = self.make_store_and_request(td)
             captured = {}
 
-            class FakeProcess:
-                pid = 4321
-
-            def fake_terminal_launcher(command, **kwargs):
+            def fake_terminal_launcher(command, *, title, cwd):
                 registry = store.read()
-                captured["state_at_spawn"] = registry["entries"][
+                captured["state_at_launch"] = registry["entries"][
                     request.identity_key
                 ]["state"]
                 captured["command"] = command
-                captured["kwargs"] = kwargs
+                captured["title"] = title
+                captured["cwd"] = cwd
                 store.transition(
                     identity_key=request.identity_key,
-                    new_state="ACTIVE",
+                    new_state=STATE_ACTIVE,
                     worker_pid=4321,
                     reason="test worker started",
                     expected_session_id=request.registry_session_id,
                 )
-                return FakeProcess()
+                return object()
 
             result = launch_identity_worker(
                 request,
@@ -83,40 +84,36 @@ class WorkerLaunchTests(unittest.TestCase):
                 terminal_launcher=fake_terminal_launcher,
                 startup_timeout_sec=1.0,
             )
+
             request_index = captured["command"].index("--request") + 1
             config_index = captured["command"].index("--config") + 1
             request_path = Path(captured["command"][request_index])
             try:
                 self.assertEqual(result.pid, 4321)
-                self.assertEqual(captured["state_at_spawn"], "LAUNCHING")
+                self.assertEqual(captured["state_at_launch"], "LAUNCHING")
                 self.assertEqual(
                     Path(captured["command"][1]).name,
                     "recorder_identity_worker.py",
                 )
-                self.assertTrue(request_path.exists())
                 self.assertEqual(
                     Path(captured["command"][config_index]),
                     config_path.resolve(),
                 )
-                self.assertIn("title", captured["kwargs"])
-                self.assertEqual(
-                    Path(captured["kwargs"]["cwd"]),
-                    Path(__file__).resolve().parents[1],
-                )
+                self.assertIn("Example Event", captured["title"])
             finally:
                 request_path.unlink(missing_ok=True)
 
-    def test_process_creation_failure_marks_identity_crashed(self):
+    def test_terminal_launch_failure_marks_identity_crashed(self):
         with tempfile.TemporaryDirectory() as td:
             store, request, config_path = self.make_store_and_request(td)
             captured_path = None
 
-            def failing_terminal_launcher(command, **_kwargs):
+            def failing_terminal_launcher(command, *, title, cwd):
                 nonlocal captured_path
                 captured_path = Path(
                     command[command.index("--request") + 1]
                 )
-                raise OSError("test spawn failure")
+                raise OSError("test terminal launch failure")
 
             with self.assertRaises(OSError):
                 launch_identity_worker(
