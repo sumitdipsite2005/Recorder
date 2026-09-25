@@ -7805,120 +7805,13 @@ def _parse_nm3u8dl_hls_manifest_quality(
 
 
 def _inspect_nm3u8dl_hls_manifest_drm(manifest_text: str) -> dict:
-    """Identify HLS encryption that needs an external DRM/decryption key."""
-    result = {
-        "drm_protected": False,
-        "drm_key_required": False,
-        "drm_detail": "",
-    }
-
-    for raw_line in str(manifest_text or "").splitlines():
-        line = raw_line.strip()
-
-        if not line.startswith(("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")):
-            continue
-
-        attributes = line.split(":", 1)[1]
-
-        method_match = re.search(
-            r'(?:^|,)\s*METHOD=([^,]+)',
-            attributes,
-            re.IGNORECASE,
-        )
-        method = (
-            method_match.group(1).strip().strip('\"')
-            if method_match
-            else ""
-        )
-
-        if not method or method.upper() == "NONE":
-            continue
-
-        result["drm_protected"] = True
-
-        keyformat_match = re.search(
-            r'(?:^|,)\s*KEYFORMAT=(?:"([^"]*)"|([^,]*))',
-            attributes,
-            re.IGNORECASE,
-        )
-        keyformat = (
-            (
-                keyformat_match.group(1)
-                or keyformat_match.group(2)
-                or ""
-            ).strip()
-            if keyformat_match
-            else "identity"
-        ) or "identity"
-
-        uri_match = re.search(
-            r'(?:^|,)\s*URI=(?:"([^"]*)"|([^,]*))',
-            attributes,
-            re.IGNORECASE,
-        )
-        key_uri = (
-            (
-                uri_match.group(1)
-                or uri_match.group(2)
-                or ""
-            ).strip()
-            if uri_match
-            else ""
-        )
-
-        # Only ordinary HLS AES-128 with an identity key URI is self-contained.
-        # SAMPLE-AES/cbcs still requires an external decryption key/path even
-        # when KEYFORMAT is omitted/defaults to identity and a URI is present.
-        if (
-            method.upper() == "AES-128"
-            and keyformat.casefold() == "identity"
-            and key_uri
-        ):
-            continue
-
-        result["drm_key_required"] = True
-        result["drm_detail"] = (
-            f"HLS {method} ({keyformat})"
-            if keyformat
-            else f"HLS {method}"
-        )
-        return result
-
-    return result
+    """Use the shared recorder/Coordinator HLS DRM interpretation."""
+    return source_quality.inspect_hls_manifest_drm(manifest_text)
 
 
 def _inspect_nm3u8dl_dash_manifest_drm(manifest_text: str) -> dict:
-    """Identify DASH ContentProtection that requires a decryption key."""
-    result = {
-        "drm_protected": False,
-        "drm_key_required": False,
-        "drm_detail": "",
-    }
-
-    try:
-        root = ET.fromstring(manifest_text)
-    except ET.ParseError:
-        return result
-
-    for element in root.iter():
-        if element.tag.rsplit("}", 1)[-1] != "ContentProtection":
-            continue
-
-        scheme = str(
-            element.attrib.get("schemeIdUri") or ""
-        ).strip()
-        value = str(
-            element.attrib.get("value") or ""
-        ).strip()
-
-        detail = value or scheme or "ContentProtection"
-
-        result["drm_protected"] = True
-        result["drm_key_required"] = True
-        result["drm_detail"] = f"DASH {detail}"
-        return result
-
-    return result
+    """Use the shared recorder/Coordinator DASH DRM interpretation."""
+    return source_quality.inspect_dash_manifest_drm(manifest_text)
 
 
 def _dash_template_substitute(

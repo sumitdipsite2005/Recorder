@@ -112,14 +112,36 @@ class TargetConfigTests(unittest.TestCase):
         self.assertEqual(v.status,"WAITING_COORDINATOR")
         self.assertIsNone(runtime.first_activation)
 
-    def test_sources_for_tv_group_uses_tv_bucket_and_common(self):
+    def test_sources_for_tv_group_does_not_implicitly_include_common(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{
             "COMMON":["https://common.test/list"],
             "TV":["https://tv.test/list"],
         }}
         specs=coord.sources_for_group(raw,"SONY_TV")
-        self.assertEqual([s.url for s in specs],["https://common.test/list","https://tv.test/list"])
+        self.assertEqual([s.url for s in specs],["https://tv.test/list"])
         self.assertTrue(all(s.provider=="SONYLIV" for s in specs))
+
+    def test_explicit_common_inherits_single_target_provider_context(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{
+            "COMMON":["https://common.test/list"],
+            "SONYLIV_EVENTS":["https://sony.test/list"],
+        }}
+        t=target(source_groups=("COMMON","SONYLIV_EVENTS"))
+        coord.validate_target_source_scopes(raw,(t,))
+        specs=coord.sources_for_group(raw,"COMMON",context_group="SONYLIV_EVENTS")
+        self.assertEqual([s.url for s in specs],["https://common.test/list"])
+        self.assertTrue(all(s.provider=="SONYLIV" for s in specs))
+        self.assertTrue(all(s.group=="SONYLIV_EVENTS" for s in specs))
+
+    def test_common_with_multiple_provider_groups_is_rejected_as_ambiguous(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{
+            "COMMON":["https://common.test/list"],
+            "SONYLIV_EVENTS":["https://sony.test/list"],
+            "FANCODE":["https://fancode.test/list"],
+        }}
+        t=target(source_groups=("COMMON","SONYLIV_EVENTS","FANCODE"))
+        with self.assertRaisesRegex(ValueError,"COMMON.*exactly one non-COMMON"):
+            coord.validate_target_source_scopes(raw,(t,))
 
     def test_playlist_user_agent_profile_is_resolved(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{
@@ -549,9 +571,9 @@ class TimingTests(unittest.TestCase):
 
 
 class AdditionalRegressionTests(unittest.TestCase):
-    def test_duplicate_playlist_urls_are_deduplicated_across_common_and_group(self):
+    def test_group_lookup_uses_only_the_named_bucket(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{
-            "COMMON":["https://same.test/list"],
+            "COMMON":["https://common.test/list"],
             "SONYLIV_EVENTS":["https://same.test/list","https://other.test/list"],
         }}
         specs=coord.sources_for_group(raw,"SONYLIV_EVENTS")

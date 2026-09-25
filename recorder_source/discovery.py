@@ -22,6 +22,8 @@ import xml.etree.ElementTree as ET
 
 from .matching import evaluate_match
 from .quality import (
+    inspect_dash_manifest_drm,
+    inspect_hls_manifest_drm,
     parse_hls_manifest_quality,
     probe_stream_quality_ffprobe,
     sample_stream_video_bitrate,
@@ -381,6 +383,16 @@ def _playback_fingerprint(final_url: str, headers: Mapping[str, str]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _candidate_decryption_key(candidate: SourceCandidate) -> str:
+    """Return a directly usable ClearKey value for FFprobe/FFmpeg when present."""
+    for raw_value in candidate.keys:
+        value = str(raw_value or "").strip()
+        match = re.fullmatch(r"[0-9a-fA-F]{32}:([0-9a-fA-F]{32})", value)
+        if match:
+            return match.group(1)
+    return ""
+
+
 def parse_playlist_text(
     playlist_text: str,
     *,
@@ -721,10 +733,9 @@ def probe_candidate_hls(
                 fps,
                 bitrate,
                 scan_type,
-                widevine,
+                _widevine_signal,
             ) = _parse_dash_quality(text)
-            if widevine:
-                unsupported_drm = "Widevine"
+            manifest_drm = inspect_dash_manifest_drm(text)
         else:
             hls_quality = _parse_hls_quality(text, final_url)
             if hls_quality:
@@ -739,11 +750,19 @@ def probe_candidate_hls(
                 width = height = bitrate = 0
                 fps = 0.0
                 scan_type = ""
-            if "com.widevine" in text.casefold() or "widevine" in text.casefold():
-                unsupported_drm = "Widevine"
+            manifest_drm = inspect_hls_manifest_drm(text)
+
         is_playlist = bool(is_hls or is_dash)
         expired_now = expiry is not None and expiry <= time.time()
-        launchable = bool(is_playlist and not unsupported_drm and not expired_now)
+        drm_key_required = bool(manifest_drm.get("drm_key_required"))
+        drm_key_missing = bool(drm_key_required and not candidate.keys)
+        launchable = bool(
+            is_playlist
+            and not unsupported_drm
+            and not drm_key_missing
+            and not expired_now
+        )
+        decryption_key = _candidate_decryption_key(candidate)
 
         quality_source = "manifest" if quality_known else ""
         video_fps_source = "manifest" if fps > 0 else ""
@@ -771,6 +790,7 @@ def probe_candidate_hls(
                         "video_fps": fps,
                     },
                     motion_cap_fps=50.0,
+                    decryption_key=decryption_key,
                 )
                 if ffprobe_quality:
                     ffprobe_fps = float(ffprobe_quality.get("video_fps") or 0.0)
@@ -823,6 +843,7 @@ def probe_candidate_hls(
                     headers,
                     sample_sec=4.0,
                     timeout_sec=12.0,
+                    decryption_key=decryption_key,
                 )
                 if sampled_bitrate > 0:
                     bitrate = sampled_bitrate
@@ -836,7 +857,13 @@ def probe_candidate_hls(
                 bitrate_sample_failure = f"{type(error).__name__}: {error}"
 
         probe_status = (
-            "expired" if expired_now else "working" if launchable else "unsupported"
+            "expired"
+            if expired_now
+            else "working"
+            if launchable
+            else "drm_key_missing"
+            if drm_key_missing
+            else "unsupported"
         )
         return replace(
             candidate,
@@ -857,8 +884,10 @@ def probe_candidate_hls(
             reason=(
                 "authorization expired"
                 if expired_now
-                else "unsupported DRM"
+                else f"unsupported DRM ({unsupported_drm})"
                 if unsupported_drm
+                else "DRM key missing"
+                if drm_key_missing
                 else "not an HLS/DASH playlist"
                 if not is_playlist
                 else ""
@@ -873,6 +902,10 @@ def probe_candidate_hls(
                 ),
                 "quality_source": quality_source,
                 "video_fps_source": video_fps_source,
+                "drm_protected": bool(manifest_drm.get("drm_protected")),
+                "drm_key_required": drm_key_required,
+                "drm_key_missing": drm_key_missing,
+                "drm_detail": str(manifest_drm.get("drm_detail") or ""),
                 "ffprobe_probe_failure": ffprobe_failure,
                 "video_bitrate_source": "sample" if bitrate_sample_failure == "" and bitrate > 0 and "sample" in quality_source else "",
                 "bitrate_sample_failure": bitrate_sample_failure,

@@ -14,7 +14,10 @@ from recorder_source.discovery import (
     parse_playlist_text,
     probe_candidate_hls,
 )
-from recorder_source.quality import parse_ffprobe_quality_output
+from recorder_source.quality import (
+    inspect_dash_manifest_drm,
+    parse_ffprobe_quality_output,
+)
 from recorder_source.matching import (
     build_match_groups,
     evaluate_match,
@@ -378,6 +381,51 @@ https://cdn.test/live.mpd
         self.assertEqual((out.video_width, out.video_height, out.video_fps), (1920, 1080, 50.0))
         self.assertEqual(out.final_stream_url, "https://final.test/master.m3u8")
         self.assertTrue(out.playback_fingerprint)
+
+    def test_shared_dash_drm_inspection_marks_content_protection_key_required(self):
+        manifest = '''<?xml version="1.0"?><MPD><Period><AdaptationSet><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" value="Widevine"/><Representation width="1920" height="1080" bandwidth="4500000" frameRate="25"/></AdaptationSet></Period></MPD>'''
+        drm = inspect_dash_manifest_drm(manifest)
+        self.assertTrue(drm["drm_protected"])
+        self.assertTrue(drm["drm_key_required"])
+
+    def test_probe_dash_clearkey_is_launchable_with_widevine_signaling(self):
+        body = b'''<?xml version="1.0"?><MPD><Period><AdaptationSet><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" value="Widevine"/><Representation width="1920" height="1080" bandwidth="8200000" frameRate="25"/></AdaptationSet></Period></MPD>'''
+        class Headers:
+            def get(self, name, default=None): return "application/dash+xml"
+        class Response:
+            headers = Headers()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1): return body
+            def geturl(self): return "https://final.test/manifest.mpd"
+        clear_key = "ba8896d605246871ac424878491d86a1:8600d4153034b3cbc852f13ea4b7482c"
+        with patch("recorder_source.discovery.urlopen", return_value=Response()):
+            out = probe_candidate_hls(candidate(
+                stream_url="https://src.test/manifest.mpd",
+                license_type="clearkey",
+                keys=(clear_key,),
+            ))
+        self.assertTrue(out.launchable)
+        self.assertEqual(out.probe_status,"working")
+        self.assertEqual(out.unsupported_drm,"")
+        self.assertTrue(out.extra["drm_key_required"])
+        self.assertFalse(out.extra["drm_key_missing"])
+
+    def test_probe_dash_drm_without_key_is_reported_as_key_missing(self):
+        body = b'''<?xml version="1.0"?><MPD><Period><AdaptationSet><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" value="Widevine"/><Representation width="1920" height="1080" bandwidth="8200000" frameRate="25"/></AdaptationSet></Period></MPD>'''
+        class Headers:
+            def get(self, name, default=None): return "application/dash+xml"
+        class Response:
+            headers = Headers()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1): return body
+            def geturl(self): return "https://final.test/manifest.mpd"
+        with patch("recorder_source.discovery.urlopen", return_value=Response()):
+            out = probe_candidate_hls(candidate(stream_url="https://src.test/manifest.mpd"))
+        self.assertFalse(out.launchable)
+        self.assertEqual(out.probe_status,"drm_key_missing")
+        self.assertTrue(out.extra["drm_key_missing"])
 
     def test_probe_dash_parses_quality(self):
         body = b'''<?xml version="1.0"?><MPD><Period><AdaptationSet><Representation width="1920" height="1080" bandwidth="4500000" frameRate="50"/></AdaptationSet></Period></MPD>'''

@@ -407,6 +407,30 @@ def _normalize_playlist_source(
     return str(source or "").strip(), "", {}, {}
 
 
+def _source_context_group_for_target(
+    target: IdentityTarget,
+    source_group: str,
+) -> str:
+    """Resolve provider/match semantics for one explicitly configured source bucket."""
+    group_name = str(source_group or "").strip().upper()
+    if group_name != "COMMON":
+        return group_name
+
+    provider_groups = tuple(
+        dict.fromkeys(
+            str(group).strip().upper()
+            for group in target.source_groups
+            if str(group).strip() and str(group).strip().upper() != "COMMON"
+        )
+    )
+    if len(provider_groups) != 1:
+        raise ValueError(
+            f"{target.name}: COMMON must be paired with exactly one non-COMMON "
+            "source group so provider/match behavior is unambiguous"
+        )
+    return provider_groups[0]
+
+
 def validate_target_source_scopes(
     raw: Mapping[str, object],
     targets: Sequence[IdentityTarget],
@@ -414,38 +438,51 @@ def validate_target_source_scopes(
     """Reject a reload before it can replace the last valid target set."""
     for target in targets:
         for group in target.source_groups:
-            sources_for_group(raw, group)
-            _match_definition_for_target(target, group)
+            context_group = _source_context_group_for_target(target, group)
+            sources_for_group(raw, group, context_group=context_group)
+            _match_definition_for_target(target, context_group)
 
 
-def sources_for_group(raw: Mapping[str, object], group: str) -> Tuple[PlaylistSourceSpec, ...]:
+def sources_for_group(
+    raw: Mapping[str, object],
+    group: str,
+    *,
+    context_group: Optional[str] = None,
+) -> Tuple[PlaylistSourceSpec, ...]:
+    """Return only the explicitly named source bucket.
+
+    COMMON is no longer silently injected. When COMMON is explicitly listed on
+    a target, context_group preserves that target's provider/match semantics
+    while the playlist URLs still come only from the COMMON bucket.
+    """
     group_name = str(group or "").strip().upper()
+    context_name = str(context_group or group_name).strip().upper()
     buckets = raw.get("NM3U8DL_PLAYLIST_GROUPS")
     if not isinstance(buckets, Mapping):
         raise ValueError("NM3U8DL_PLAYLIST_GROUPS is missing/invalid")
     bucket = GROUP_SOURCE_BUCKET.get(group_name, group_name)
-    provider = GROUP_PROVIDER.get(group_name, group_name or "UNKNOWN")
+    provider = GROUP_PROVIDER.get(context_name, context_name or "UNKNOWN")
+    values = buckets.get(bucket, ())
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"playlist source bucket {bucket!r} must be a list")
+
     result: List[PlaylistSourceSpec] = []
     seen: Set[str] = set()
-    for source_group in ("COMMON", bucket):
-        values = buckets.get(source_group, ())
-        if not isinstance(values, (list, tuple)):
-            raise ValueError(f"playlist source bucket {source_group!r} must be a list")
-        for item in values:
-            url, name, headers, stream_headers = _normalize_playlist_source(item)
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            result.append(
-                PlaylistSourceSpec(
-                    url=url,
-                    name=name or compact_source_name(url),
-                    group=group_name,
-                    provider=provider,
-                    request_headers=headers,
-                    stream_headers=stream_headers,
-                )
+    for item in values:
+        url, name, headers, stream_headers = _normalize_playlist_source(item)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        result.append(
+            PlaylistSourceSpec(
+                url=url,
+                name=name or compact_source_name(url),
+                group=context_name,
+                provider=provider,
+                request_headers=headers,
+                stream_headers=stream_headers,
             )
+        )
     if not result:
         raise ValueError(f"no playlist sources configured for group {group_name}")
     return tuple(result)
@@ -549,10 +586,17 @@ def acquire_active_targets(
 
     source_specs_by_key: Dict[Tuple[str, str, str], PlaylistSourceSpec] = {}
     target_group_sources: Dict[Tuple[str, str], Tuple[PlaylistSourceSpec, ...]] = {}
+    target_group_context: Dict[Tuple[str, str], str] = {}
     for view in active:
         for group in view.target.source_groups:
-            specs = sources_for_group(raw_config, group)
+            context_group = _source_context_group_for_target(view.target, group)
+            specs = sources_for_group(
+                raw_config,
+                group,
+                context_group=context_group,
+            )
             target_group_sources[(view.target.name, group)] = specs
+            target_group_context[(view.target.name, group)] = context_group
             for spec in specs:
                 source_specs_by_key[(spec.url, spec.provider, spec.group)] = spec
 
@@ -607,14 +651,20 @@ def acquire_active_targets(
     # First establish which identities genuinely qualify for each target.
     for view in active:
         target = view.target
+        matched_probe_keys: Set[Tuple[object, ...]] = set()
         for group in target.source_groups:
-            definition = _match_definition_for_target(target, group)
+            context_group = target_group_context[(target.name, group)]
+            definition = _match_definition_for_target(target, context_group)
             for spec in target_group_sources[(target.name, group)]:
                 key = (spec.url, spec.provider, spec.group)
                 for candidate in parsed_by_key.get(key, ()):
                     matched = _matching_candidate(candidate, definition)
                     if matched is None:
                         continue
+                    probe_key = _probe_key(matched)
+                    if probe_key in matched_probe_keys:
+                        continue
+                    matched_probe_keys.add(probe_key)
                     raw_candidates_by_target[target.name].append(matched)
                     matched_identity_keys[target.name].add(_identity_serialized(matched))
 
@@ -630,7 +680,8 @@ def acquire_active_targets(
             _probe_key(candidate) for candidate in raw_candidates_by_target[target.name]
         }
         for group in target.source_groups:
-            definition = _match_definition_for_target(target, group)
+            context_group = target_group_context[(target.name, group)]
+            definition = _match_definition_for_target(target, context_group)
             for spec in target_group_sources[(target.name, group)]:
                 key = (spec.url, spec.provider, spec.group)
                 for candidate in parsed_by_key.get(key, ()):
@@ -640,7 +691,11 @@ def acquire_active_targets(
                         continue
                     if _matching_candidate(candidate, definition) is not None:
                         continue
-                    context = _context_candidate_for_target(candidate, target, group)
+                    context = _context_candidate_for_target(
+                        candidate,
+                        target,
+                        context_group,
+                    )
                     if context is None:
                         continue
                     raw_candidates_by_target[target.name].append(context)
