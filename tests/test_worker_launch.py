@@ -48,11 +48,13 @@ class WorkerLaunchTests(unittest.TestCase):
             recording_duration_min=60,
             base_name="Example Event",
         )
-        return store, request
+        config_path = Path(td) / "config.py"
+        config_path.write_text("# test config\n", encoding="utf-8")
+        return store, request, config_path
 
     def test_process_is_created_only_after_registry_claim(self):
         with tempfile.TemporaryDirectory() as td:
-            store, request = self.make_store_and_request(td)
+            store, request, config_path = self.make_store_and_request(td)
             captured = {}
 
             class FakeProcess:
@@ -70,9 +72,12 @@ class WorkerLaunchTests(unittest.TestCase):
             result = launch_identity_worker(
                 request,
                 store,
+                config_path=config_path,
                 popen_factory=fake_popen,
             )
-            request_path = Path(captured["command"][-1])
+            request_index = captured["command"].index("--request") + 1
+            config_index = captured["command"].index("--config") + 1
+            request_path = Path(captured["command"][request_index])
             try:
                 self.assertEqual(result.pid, 4321)
                 self.assertEqual(captured["state_at_spawn"], "LAUNCHING")
@@ -81,6 +86,10 @@ class WorkerLaunchTests(unittest.TestCase):
                     "recorder_identity_worker.py",
                 )
                 self.assertTrue(request_path.exists())
+                self.assertEqual(
+                    Path(captured["command"][config_index]),
+                    config_path.resolve(),
+                )
                 if os.name == "nt":
                     self.assertIn("creationflags", captured["kwargs"])
                 else:
@@ -90,18 +99,21 @@ class WorkerLaunchTests(unittest.TestCase):
 
     def test_process_creation_failure_marks_identity_crashed(self):
         with tempfile.TemporaryDirectory() as td:
-            store, request = self.make_store_and_request(td)
+            store, request, config_path = self.make_store_and_request(td)
             captured_path = None
 
             def failing_popen(command, **_kwargs):
                 nonlocal captured_path
-                captured_path = Path(command[-1])
+                captured_path = Path(
+                    command[command.index("--request") + 1]
+                )
                 raise OSError("test spawn failure")
 
             with self.assertRaises(OSError):
                 launch_identity_worker(
                     request,
                     store,
+                    config_path=config_path,
                     popen_factory=failing_popen,
                 )
 
