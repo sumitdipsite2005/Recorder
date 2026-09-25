@@ -411,7 +411,7 @@ def _dash_template_substitute(
         return ""
 
     escaped_dollar = "\x00DASH_DOLLAR\x00"
-    value = value.replace("$", escaped_dollar)
+    value = value.replace(chr(36) * 2, escaped_dollar)
 
     values = {
         "RepresentationID": str(representation_id or ""),
@@ -501,7 +501,7 @@ def parse_dash_manifest_quality(
     """Parse DASH quality/addressing using the mature recorder rules."""
     root = ET.fromstring(manifest_text)
     qualities = []
-    current_ts = current_ts if now_ts is None else float(now_ts)
+    current_ts = time.time() if now_ts is None else float(now_ts)
 
     mpd_is_dynamic = str(root.attrib.get("type") or "").strip().casefold() == "dynamic"
     mpd_availability_start_ts = _parse_dash_iso8601_datetime_timestamp(
