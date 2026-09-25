@@ -1248,7 +1248,7 @@ def probe_candidate_hls(
                 ffprobe_quality = probe_stream_quality_ffprobe(
                     probe_stream_url,
                     headers,
-                    timeout_sec=min(20.0, max(1.0, float(timeout_sec))),
+                    timeout_sec=min(20.0, max(1.0, float(timeout_value))),
                     target_quality={
                         "video_width": width,
                         "video_height": height,
