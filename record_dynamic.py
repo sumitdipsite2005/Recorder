@@ -59,12 +59,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 
 from recorder_runtime import sound as runtime_sound
+from recorder_runtime.identity_launch import IdentityLaunchRequest
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_source import discovery as source_discovery
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
 from recorder_source import quality as source_quality
 from recorder_source import transport as source_transport
+from recorder_source.identity import derive_feed_identity
 from recorder_source.models import (
     SelectionDecision,
     SelectionPolicy,
@@ -527,6 +529,13 @@ class RecorderState:
     nm3u8dl_key_listener_stop_event: Optional[threading.Event] = None
     nm3u8dl_key_listener_thread: Optional[threading.Thread] = None
     
+    # Identity-worker launch context. The Coordinator supplies one already
+    # selected startup source; later source resolution remains constrained by
+    # the same canonical identity and frozen launch-time target intent.
+    identity_launch_request: Optional[IdentityLaunchRequest] = None
+    identity_initial_source: Optional[dict] = None
+    identity_feed_key: Optional[str] = None
+
     # Dynamic playlist renewal / access-block state
     nm3u8dl_running_source: Optional[dict] = None
     nm3u8dl_pending_source: Optional[dict] = None
@@ -6081,16 +6090,35 @@ def activate_nm3u8dl_playlist_if_present(
     return metadata
 
 def find_nm3u8dl_playlist_entries(
-    playlist_text: str
+    playlist_text: str,
+    *,
+    match_definitions: Optional[Iterable[object]] = None,
 ) -> List[dict]:
-    request = SourceAcquisitionRequest(
-        match=_get_nm3u8dl_match_definition(),
-        target_name=BASE_NAME,
-    )
-    result = source_discovery.discover_playlist_text(
-        playlist_text,
-        request,
-    )
+    definitions = tuple(match_definitions or (_get_nm3u8dl_match_definition(),))
+    matched_candidates = {}
+
+    for definition in definitions:
+        request = SourceAcquisitionRequest(
+            match=definition,
+            target_name=BASE_NAME,
+        )
+        result = source_discovery.discover_playlist_text(
+            playlist_text,
+            request,
+        )
+        for candidate in result.candidates:
+            key = (
+                candidate.extinf,
+                candidate.stream_url,
+                tuple(candidate.option_lines),
+            )
+            existing = matched_candidates.get(key)
+            if (
+                existing is None
+                or candidate.preferred_qualifier_score
+                > existing.preferred_qualifier_score
+            ):
+                matched_candidates[key] = candidate
 
     matches = [
         {
@@ -6102,7 +6130,7 @@ def find_nm3u8dl_playlist_entries(
             "stream_url": candidate.stream_url,
             "preferred_qualifier_score": candidate.preferred_qualifier_score,
         }
-        for candidate in result.candidates
+        for candidate in matched_candidates.values()
     ]
 
     if not matches:
@@ -12227,6 +12255,45 @@ def finalize_playlist_history(state: RecorderState) -> bool:
     return True
 
 
+def _identity_worker_match_definitions(
+    state: Optional[RecorderState],
+) -> Optional[tuple]:
+    request = getattr(state, "identity_launch_request", None)
+    if request is None:
+        return None
+
+    mode = get_nm3u8dl_playlist_match_mode()
+    return tuple(
+        source_matching.make_match_definition(
+            mode=mode,
+            primary=intent.primary,
+            required=intent.required,
+            rejected=intent.rejected,
+            preferred=intent.preferred,
+            match_all=intent.match_all,
+        )
+        for intent in request.target_intents
+    )
+
+
+def _identity_worker_candidate_matches(
+    state: Optional[RecorderState],
+    candidate: dict,
+) -> bool:
+    identity_key = str(
+        getattr(state, "identity_feed_key", None) or ""
+    ).strip()
+    request = getattr(state, "identity_launch_request", None)
+    if not identity_key or request is None:
+        return True
+
+    identity = derive_feed_identity(
+        SourceCandidate.from_mapping(candidate),
+        request.provider,
+    )
+    return identity.serialized == identity_key
+
+
 def resolve_nm3u8dl_playlist_source(
     *,
     include_candidate_pool: bool = False,
@@ -12485,7 +12552,8 @@ def resolve_nm3u8dl_playlist_source(
                 continue
 
             entries = find_nm3u8dl_playlist_entries(
-                playlist_text
+                playlist_text,
+                match_definitions=_identity_worker_match_definitions(state),
             )
 
             playlist_candidates = []
@@ -12824,6 +12892,13 @@ def resolve_nm3u8dl_playlist_source(
 
     if not candidate_scan_completed:
         raise RuntimeError("Playlist scan cancelled by stop request")
+
+    if state is not None and state.identity_feed_key:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if _identity_worker_candidate_matches(state, candidate)
+        ]
 
     selection_now = time.time()
 
@@ -13461,7 +13536,23 @@ def resolve_nm3u8dl_launch_source(
             set_terminal_activity_context(None)
             return None
 
-        if direct_retry_source is not None:
+        if state.identity_initial_source is not None:
+            set_terminal_activity_context(
+                new_terminal_activity("coordinator_selected_startup_source")
+            )
+            source = dict(state.identity_initial_source)
+            state.identity_initial_source = None
+            retained_source_label = "Coordinator-selected startup source"
+            log(
+                "Using Coordinator-selected startup source; "
+                "no new playlist scan."
+            )
+            log(
+                f"Coordinator source        : "
+                f"{source.get('playlist_url') or 'unknown'}"
+            )
+
+        elif direct_retry_source is not None:
             set_terminal_activity_context(
                 new_terminal_activity("stream_failover_direct_retry")
             )
@@ -18777,18 +18868,86 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
 def main(state: RecorderState, engine: RecorderEngine):
     orchestrate_recording(state, engine)
 
-# ==============================================================================
-# Entrypoint
-# ==============================================================================
+def _apply_identity_launch_request(
+    request: IdentityLaunchRequest,
+) -> dict:
+    global SCHEDULE_START
+    global RUN_DURATION_MIN
+    global BASE_NAME
+    global NM3U8DL_PLAYLIST_GROUP
+    global NM3U8DL_PLAYLIST_PRIMARY_PHRASES
+    global NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS
+    global NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS
+    global NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS
 
-if __name__ == "__main__":
+    candidate = request.selected_candidate
+    derived_identity = derive_feed_identity(candidate, request.provider)
+    if derived_identity.serialized != request.identity_key:
+        raise RuntimeError(
+            "Coordinator-selected startup source no longer matches "
+            "the assigned canonical identity"
+        )
+
+    group_name = request.selected_source_group.strip().upper()
+    if group_name not in NM3U8DL_PLAYLIST_GROUP_PROFILES:
+        raise RuntimeError(
+            f"Identity worker source group {group_name!r} has no recorder profile"
+        )
+
+    first_intent = request.target_intents[0]
+    SCHEDULE_START = None
+    RUN_DURATION_MIN = request.recording_duration_min
+    BASE_NAME = request.base_name
+    NM3U8DL_PLAYLIST_GROUP = group_name
+    # These globals keep existing summaries/compatibility wrappers meaningful.
+    # Actual identity-worker matching uses every frozen tied target intent above.
+    NM3U8DL_PLAYLIST_PRIMARY_PHRASES = first_intent.primary
+    NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = first_intent.required
+    NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = first_intent.rejected
+    NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = first_intent.preferred
+
+    source = candidate.to_mapping()
+    source.setdefault("source_results", [])
+    source.setdefault("source_errors", [])
+    source.setdefault("playlist_group", group_name)
+    source.setdefault(
+        "match_description",
+        "Coordinator-selected identity launch",
+    )
+    source.setdefault("playlist_source_count", 0)
+    source.setdefault("candidate_count", 1)
+    return source
+
+
+def run_recorder_process(
+    *,
+    identity_launch_request: Optional[IdentityLaunchRequest] = None,
+) -> None:
+    global FINAL_FILE
+    global CHUNKS_DIR
+    global LIST_FILE
+
+    initial_source = None
+    if identity_launch_request is not None:
+        initial_source = _apply_identity_launch_request(
+            identity_launch_request
+        )
+
     osSleep = None
     if os.name == "nt":
         osSleep = WindowsInhibitor()
         osSleep.inhibit()
     try:
         selected_engine = resolve_engine(DOWNLOAD_MODE)
-        state = RecorderState()
+        state = RecorderState(
+            identity_launch_request=identity_launch_request,
+            identity_initial_source=initial_source,
+            identity_feed_key=(
+                identity_launch_request.identity_key
+                if identity_launch_request is not None
+                else None
+            ),
+        )
         signal.signal(signal.SIGINT, make_signal_handler(state))
 
         run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -18808,4 +18967,12 @@ if __name__ == "__main__":
     finally:
         if osSleep:
             osSleep.uninhibit()
+
+
+# ==============================================================================
+# Entrypoint
+# ==============================================================================
+
+if __name__ == "__main__":
+    run_recorder_process()
 
