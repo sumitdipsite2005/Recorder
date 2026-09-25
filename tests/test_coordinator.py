@@ -399,6 +399,54 @@ class AcquisitionTests(unittest.TestCase):
             found,_=coord.acquire_active_targets(raw,(view(),))
         self.assertEqual(found["T"],())
 
+    def test_newer_shorter_metadata_does_not_reject_matching_identity(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
+            {"url":"https://old.test/list.m3u","name":"old"},
+            {"url":"https://new.test/list.m3u","name":"new"},
+        ]}}
+        matching=(
+            '#EXTM3U\n'
+            '#EXTINF:-1 tvg-name="Türkiye vs France - 26 Sep 2026 [ENG] - '
+            'UEFA Nations League 2026-27",Türkiye vs France - 26 Sep 2026 '
+            '[ENG] - UEFA Nations League 2026-27\n'
+            'https://a.test/hls/live/2120299/Footlive2509/ENG/master.m3u8\n'
+        )
+        shorter=(
+            '#EXTM3U\n'
+            '#EXTINF:-1 tvg-name="Türkiye vs France - 26 Sep 2026 [ENG]",'
+            'Türkiye vs France - 26 Sep 2026 [ENG]\n'
+            'https://b.test/hls/live/2120299/Footlive2509/ENG/master.m3u8\n'
+        )
+        def freshness(url,*args,**kwargs):
+            return {
+                "timestamp":1000.0 if "old.test" in url else 2000.0,
+                "source":"commit",
+                "content_hash":url,
+            }
+        with patch.object(
+            coord,"fetch_playlist_documents",
+            return_value=(
+                {"https://old.test/list.m3u":matching,"https://new.test/list.m3u":shorter},
+                (),
+                {},
+            ),
+        ), patch.object(
+            coord,"resolve_playlist_source_freshness",side_effect=freshness
+        ), patch.object(
+            coord,"probe_candidates",side_effect=lambda items: tuple(items)
+        ):
+            found,_=coord.acquire_active_targets(
+                raw,
+                (view(target(primary=("UEFA Nations League",))),),
+            )
+        self.assertEqual(len(found["T"]),2)
+        self.assertEqual(sum(not item.ignored for item in found["T"]),1)
+        context=next(item for item in found["T"] if item.ignored)
+        self.assertFalse(
+            context.extra["freshness_disqualifying_conflict"]
+        )
+        self.assertIn("less specific",context.reason)
+
     def test_newer_matching_metadata_keeps_identity_and_context_routes(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
             {"url":"https://old.test/list.m3u","name":"old"},

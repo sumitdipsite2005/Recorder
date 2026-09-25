@@ -577,10 +577,61 @@ def _matching_candidate(candidate: SourceCandidate, definition) -> Optional[Sour
     )
 
 
+def _normalized_primary_metadata(value: object) -> str:
+    text = str(value or "").casefold()
+    normalized = "".join(
+        character if character.isalnum() else " "
+        for character in text
+    )
+    return " ".join(normalized.split())
+
+
+def _primary_metadata_values(candidate: SourceCandidate) -> Tuple[str, ...]:
+    values: List[str] = []
+    for raw_value in (candidate.entry_title, candidate.tvg_name):
+        normalized = _normalized_primary_metadata(raw_value)
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return tuple(values)
+
+
+def _metadata_compatible_with_matching(
+    candidate: SourceCandidate,
+    matching_candidates: Sequence[SourceCandidate],
+) -> bool:
+    """Return True when same-feed metadata is compatible but less specific."""
+    current_values = _primary_metadata_values(candidate)
+    if not current_values:
+        return True
+
+    matching_values = tuple(
+        value
+        for matching_candidate in matching_candidates
+        for value in _primary_metadata_values(matching_candidate)
+    )
+    if not matching_values:
+        return True
+
+    for current in current_values:
+        for matching in matching_values:
+            if current == matching:
+                return True
+            shorter, longer = (
+                (current, matching)
+                if len(current) <= len(matching)
+                else (matching, current)
+            )
+            if len(shorter) >= 8 and shorter in longer:
+                return True
+    return False
+
+
 def _context_candidate_for_target(
     candidate: SourceCandidate,
     target: IdentityTarget,
     source_group: str,
+    *,
+    matching_candidates: Sequence[SourceCandidate] = (),
 ) -> Optional[SourceCandidate]:
     """Keep same-identity source disagreement visible without widening eligibility.
 
@@ -607,14 +658,27 @@ def _context_candidate_for_target(
     )
     if not evaluation.matches:
         return None
+    compatible_metadata = _metadata_compatible_with_matching(
+        candidate,
+        matching_candidates,
+    )
     return replace(
         candidate,
         preferred_qualifier_score=evaluation.preferred_qualifier_score,
         ignored=True,
         reason=(
-            "same feed identity context; this source's current primary metadata "
-            "does not match the target"
+            "same feed identity context; source metadata is compatible but "
+            "less specific than a matching observation"
+            if compatible_metadata
+            else (
+                "same feed identity context; this source's current primary "
+                "metadata conflicts with the target"
+            )
         ),
+        extra={
+            **dict(candidate.extra),
+            "freshness_disqualifying_conflict": not compatible_metadata,
+        },
     )
 
 
@@ -628,11 +692,11 @@ def _freshness_eligible_identity_keys(
 ) -> Set[str]:
     """Return identities that remain target-eligible after freshness review.
 
-    Matching rows are marked ignored=False; same-identity context rows whose
-    primary metadata does not match are ignored=True. Known freshest metadata
-    can disqualify an identity only when every observation at the newest
-    credible timestamp is non-matching. Unknown freshness or a tie containing
-    both matching and non-matching observations is conservative: keep.
+    Matching rows are marked ignored=False. Same-identity context rows are
+    freshness-disqualifying only when their primary metadata actually conflicts
+    with the matching observation. Shorter/incomplete metadata is not evidence
+    that the feed moved to another event. Unknown freshness and ties containing
+    matching evidence remain conservative: keep.
     """
     by_identity: Dict[str, List[SourceCandidate]] = {}
     for candidate in candidates:
@@ -642,6 +706,13 @@ def _freshness_eligible_identity_keys(
     for identity_key, identity_candidates in by_identity.items():
         known = []
         for candidate in identity_candidates:
+            if (
+                candidate.ignored
+                and candidate.extra.get(
+                    "freshness_disqualifying_conflict"
+                ) is False
+            ):
+                continue
             value = candidate.extra.get("source_freshness_ts")
             try:
                 timestamp = float(value)
@@ -821,6 +892,14 @@ def acquire_active_targets(
         target_identities = matched_identity_keys[target.name]
         if not target_identities:
             continue
+        matching_by_identity: Dict[str, List[SourceCandidate]] = {}
+        for matching_candidate in raw_candidates_by_target[target.name]:
+            if matching_candidate.ignored:
+                continue
+            matching_by_identity.setdefault(
+                _identity_serialized(matching_candidate),
+                [],
+            ).append(matching_candidate)
         existing_keys = {
             _observation_key(candidate) for candidate in raw_candidates_by_target[target.name]
         }
@@ -836,10 +915,15 @@ def acquire_active_targets(
                         continue
                     if _matching_candidate(candidate, definition) is not None:
                         continue
+                    identity_key = _identity_serialized(candidate)
                     context = _context_candidate_for_target(
                         candidate,
                         target,
                         context_group,
+                        matching_candidates=matching_by_identity.get(
+                            identity_key,
+                            (),
+                        ),
                     )
                     if context is None:
                         continue
