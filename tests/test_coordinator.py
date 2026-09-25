@@ -164,6 +164,12 @@ class ManualRecordLaunchTests(unittest.TestCase):
                     registry_session_id=status.session_id,
                     registry_store=store,
                     config_path=config_path,
+                    raw_config={
+                        "NM3U8DL_PLAYLIST_GROUPS": {
+                            "COMMON": ["https://common.test/list.m3u"],
+                            "SONYLIV_EVENTS": ["https://src1.test/list.m3u"],
+                        },
+                    },
                 )
 
             request = captured["request"]
@@ -180,6 +186,10 @@ class ManualRecordLaunchTests(unittest.TestCase):
             self.assertEqual(
                 request.registry_session_id,
                 status.session_id,
+            )
+            self.assertEqual(
+                request.recovery_playlist_urls,
+                ("https://src1.test/list.m3u",),
             )
             self.assertEqual(
                 captured["config_path"],
