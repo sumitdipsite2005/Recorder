@@ -91,5 +91,6 @@ class DashboardSnapshot:
     target_views: Tuple[TargetView, ...]
     coordinator_window: Optional[CoordinatorWindow]
     blocks: Dict[Tuple[str, str], IdentityBlock]
+    candidates_by_target: Dict[str, Tuple[SourceCandidate, ...]] = field(default_factory=dict)
     source_errors: Tuple[str, ...] = ()
     config_messages: Tuple[str, ...] = ()
