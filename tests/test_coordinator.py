@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import recorder_event_coordinator as coord
-from recorder_coordinator.snapshot import candidate_state
+from recorder_coordinator.snapshot import candidate_row_key, candidate_state
 from recorder_source.models import SourceCandidate
 
 
@@ -535,8 +535,8 @@ class SnapshotAndChangeTests(unittest.TestCase):
         )
         snap=snapshot([older,newer])
         block=next(iter(snap.blocks.values()))
-        block.row_last_updated[coord.candidate_row_key(older)]=datetime(2026,9,24,10,0,0)
-        block.row_last_updated[coord.candidate_row_key(newer)]=datetime(2026,9,24,10,5,0)
+        block.row_last_updated[candidate_row_key(older)]=datetime(2026,9,24,10,0,0)
+        block.row_last_updated[candidate_row_key(newer)]=datetime(2026,9,24,10,5,0)
         rendered=coord.render_dashboard(snap,())
         self.assertLess(rendered.index("[ON] Newer"),rendered.index("[ON] Older"))
 
