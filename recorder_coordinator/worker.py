@@ -73,6 +73,7 @@ def launch_identity_worker(
             command,
             title=f"Recorder — {request.base_name}",
             cwd=_worker_script_path().parent,
+            post_exit_cwd=registry_store.paths.root.parent.parent,
         )
 
         deadline = time.monotonic() + max(0.1, float(startup_timeout_sec))
