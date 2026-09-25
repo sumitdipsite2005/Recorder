@@ -25,6 +25,12 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertNotIn('os.system("cls"', text)
         self.assertNotIn("record_dynamic_event_worker", text)
 
+    def test_recorder_and_coordinator_share_sound_snooze_runtime_core(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        coordinator=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
+        self.assertIn("from recorder_runtime import sound as runtime_sound", recorder)
+        self.assertIn("from recorder_runtime import sound as runtime_sound", coordinator)
+
     def test_shared_source_package_does_not_depend_on_entrypoint_files(self):
         for path in (ROOT/"recorder_source").glob("*.py"):
             text=path.read_text(encoding="utf-8")

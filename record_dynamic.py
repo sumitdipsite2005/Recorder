@@ -58,6 +58,7 @@ from http.cookiejar import CookieJar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 
+from recorder_runtime import sound as runtime_sound
 from recorder_source import discovery as source_discovery
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
@@ -2035,8 +2036,7 @@ def append_raw_external_to_summarylog(summary_path: str) -> int:
 
 
 def _clear_sound_snooze(state: RecorderState):
-    state.sound_snooze_mode = None
-    state.sound_snooze_until_ts = None
+    runtime_sound.clear_sound_snooze(state)
     state.sound_snooze_run_attempt = None
 
 
@@ -2046,13 +2046,14 @@ def is_sound_snoozed(state: Optional[RecorderState], now_ts: Optional[float] = N
         return False
 
     mode = getattr(state, "sound_snooze_mode", None)
-    now = time.time() if now_ts is None else float(now_ts)
-
-    if mode == "timed":
-        until_ts = getattr(state, "sound_snooze_until_ts", None)
-        if until_ts is not None and now < float(until_ts):
+    timed_state = runtime_sound.timed_sound_snoozed(
+        state,
+        now_ts=now_ts,
+    )
+    if timed_state is not None:
+        if timed_state:
             return True
-        _clear_sound_snooze(state)
+        state.sound_snooze_run_attempt = None
         log("SOUND SNOOZE ENDED — 15-minute snooze expired; sound restored")
         return False
 
@@ -2994,16 +2995,16 @@ def cancel_console_interaction_if_active(state: RecorderState, message: str):
 
 def _set_sound_snooze(state: RecorderState, mode: Optional[str]):
     if mode == "timed":
-        state.sound_snooze_mode = "timed"
-        state.sound_snooze_until_ts = time.time() + (15 * 60.0)
+        runtime_sound.set_timed_sound_snooze(
+            state,
+            duration_sec=15 * 60.0,
+        )
         state.sound_snooze_run_attempt = None
     elif mode == "run":
-        state.sound_snooze_mode = "run"
-        state.sound_snooze_until_ts = None
+        runtime_sound.set_indefinite_sound_snooze(state, "run")
         state.sound_snooze_run_attempt = int(getattr(state, "run_attempt_index", 0) or 0)
     elif mode == "recording":
-        state.sound_snooze_mode = "recording"
-        state.sound_snooze_until_ts = None
+        runtime_sound.set_indefinite_sound_snooze(state, "recording")
         state.sound_snooze_run_attempt = None
     else:
         _clear_sound_snooze(state)

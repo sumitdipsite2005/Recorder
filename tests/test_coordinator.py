@@ -554,6 +554,23 @@ class SnapshotAndChangeTests(unittest.TestCase):
         rendered=coord.render_dashboard(snap,())
         self.assertLess(rendered.index("[ON] Newer"),rendered.index("[ON] Older"))
 
+    def test_sound_snooze_menu_has_coordinator_scopes_only(self):
+        state=coord.SoundSnoozeState()
+        rendered=coord.render_sound_snooze_menu(state)
+        self.assertIn("M  Snooze for 15 minutes",rendered)
+        self.assertIn("F  Snooze for full Coordinator run",rendered)
+        self.assertIn("U  Unsnooze / restore sounds",rendered)
+        self.assertNotIn("current RUN",rendered)
+
+    def test_coordinator_notification_is_suppressed_while_snoozed(self):
+        event=coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,"id"),("appeared",),beep=True)
+        state=coord.SoundSnoozeState()
+        coord.runtime_sound.set_indefinite_sound_snooze(state,"coordinator_run")
+        with patch("recorder_coordinator.terminal.winsound") as sound:
+            coord.beep((event,),state)
+        sound.PlaySound.assert_not_called()
+        sound.Beep.assert_not_called()
+
     def test_coordinator_notification_prefers_custom_wav(self):
         event=coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,"id"),("appeared",),beep=True)
         with patch("recorder_coordinator.terminal.winsound") as sound, patch(
@@ -589,6 +606,23 @@ class SnapshotAndChangeTests(unittest.TestCase):
         b_id=next(x for x in ids if "lane:2/B/ENG" in x)
         self.assertEqual(order2[coord.POLICY_MANUAL],[b_id,a_id])
 
+
+    def test_windows_command_reader_accepts_sound_without_enter(self):
+        q=queue.Queue()
+        stop=threading.Event()
+
+        class FakeMsvcrt:
+            @staticmethod
+            def kbhit():
+                return True
+            @staticmethod
+            def getwch():
+                stop.set()
+                return "s"
+
+        with patch.object(coord.os,"name","nt"), patch.object(coord,"msvcrt",FakeMsvcrt):
+            coord._command_reader(q,stop)
+        self.assertEqual(q.get_nowait(),"s")
 
     def test_windows_command_reader_accepts_r_without_enter(self):
         q=queue.Queue()

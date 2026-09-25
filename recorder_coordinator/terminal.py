@@ -13,6 +13,9 @@ try:
 except ImportError:  # pragma: no cover - non-Windows development/test hosts
     winsound = None
 
+from recorder_runtime import sound as runtime_sound
+from recorder_runtime.sound import SoundSnoozeState
+
 from .models import (
     ChangeEvent,
     DashboardSnapshot,
@@ -538,8 +541,58 @@ def watch_status_text(
     return (
         f"Watching | Last scan {last_scan} | "
         f"Next scan {_format_countdown(next_refresh_monotonic - time.monotonic())} "
-        "| r=refresh | Ctrl+C=exit"
+        "| i=info | s=sound | r=refresh | Ctrl+C=exit"
     )
+
+
+def coordinator_sound_state_text(
+    sound_state: SoundSnoozeState,
+    *,
+    now_ts: Optional[float] = None,
+) -> str:
+    if not runtime_sound.is_sound_snoozed(
+        sound_state,
+        now_ts=now_ts,
+        indefinite_modes=("coordinator_run",),
+    ):
+        return "ON"
+    if sound_state.sound_snooze_mode == "timed":
+        remaining = runtime_sound.sound_snooze_remaining_seconds(
+            sound_state,
+            now_ts=now_ts,
+        )
+        return f"SNOOZED — {_format_countdown(remaining)} remaining"
+    return "SNOOZED — full Coordinator run"
+
+
+def render_coordinator_controls(sound_state: SoundSnoozeState) -> str:
+    return "\n".join([
+        "",
+        "================ COORDINATOR INFORMATION & CONTROLS ================",
+        f"Sound state : {coordinator_sound_state_text(sound_state)}",
+        "",
+        "  I  Coordinator information & controls",
+        "  S  Sound / notification snooze",
+        "  r  Refresh now",
+        "  Ctrl+C  Exit",
+        "====================================================================",
+        "",
+    ])
+
+
+def render_sound_snooze_menu(sound_state: SoundSnoozeState) -> str:
+    return "\n".join([
+        "",
+        "================ SOUND / NOTIFICATION SNOOZE ================",
+        f"Current sound state : {coordinator_sound_state_text(sound_state)}",
+        "",
+        "  M  Snooze for 15 minutes",
+        "  F  Snooze for full Coordinator run",
+        "  U  Unsnooze / restore sounds",
+        "  Esc  Cancel",
+        "==============================================================",
+        "",
+    ])
 
 
 def write_log(path: Path, text: str) -> None:
@@ -555,7 +608,15 @@ def _coordinator_notification_sound_path() -> Path:
     return Path(__file__).resolve().parent.parent / COORDINATOR_NOTIFICATION_SOUND_FILENAME
 
 
-def beep(events: Sequence[ChangeEvent]) -> None:
+def beep(
+    events: Sequence[ChangeEvent],
+    sound_state: Optional[SoundSnoozeState] = None,
+) -> None:
+    if sound_state is not None and runtime_sound.is_sound_snoozed(
+        sound_state,
+        indefinite_modes=("coordinator_run",),
+    ):
+        return
     if winsound is None or not any(event.beep for event in events):
         return
     try:
