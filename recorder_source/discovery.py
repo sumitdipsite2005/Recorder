@@ -1287,6 +1287,8 @@ def probe_candidate_hls(
             if candidate.unsupported_drm
             else "drm_key_missing"
             if drm_key_missing
+            else "drm_check_failed"
+            if drm_inspection_failure
             else "working"
             if probe_transport_launchable
             else "unsupported"
@@ -1318,6 +1320,8 @@ def probe_candidate_hls(
                 if candidate.unsupported_drm
                 else "DRM key missing"
                 if drm_key_missing
+                else drm_inspection_failure
+                if drm_inspection_failure
                 else "not an HLS/DASH playlist"
                 if not is_playlist
                 else ""
