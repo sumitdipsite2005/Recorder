@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - Windows is the production terminal
     msvcrt = None
 
 from recorder_runtime import sound as runtime_sound
+from recorder_runtime.paths import build_recorder_output_paths
 from recorder_runtime.sound import SoundSnoozeState
 
 from recorder_coordinator.models import (
@@ -211,6 +212,16 @@ def _default_config_path() -> Path:
     else:
         raise RuntimeError("Use --config on this operating system")
     return root / "recorder_dynamic_user_config.py"
+
+
+def _coordinator_log_path(config_path: Path, started: datetime) -> Path:
+    raw = runpy.run_path(str(config_path))
+    output_paths = build_recorder_output_paths(raw.get("RECORDING_OUTPUT_DIR"))
+    output_paths.coordinator_logs.mkdir(parents=True, exist_ok=True)
+    return (
+        output_paths.coordinator_logs
+        / f"IDENTITY_COORDINATOR_{started:%Y%m%d_%H%M%S}.log"
+    )
 
 
 def _normalize_policy(value: object) -> str:
@@ -997,7 +1008,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
     row_update_registry: Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]] = {}
     source_freshness_registry: Dict[str, Mapping[str, object]] = {}
     started = datetime.now()
-    log_path = Path.cwd() / f"IDENTITY_COORDINATOR_{started:%Y%m%d_%H%M%S}.log"
+    log_path = _coordinator_log_path(config_path, started)
 
     command_queue: "queue.Queue[str]" = queue.Queue()
     stop_event = threading.Event()

@@ -59,6 +59,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 
 from recorder_runtime import sound as runtime_sound
+from recorder_runtime.paths import build_recorder_output_paths
 from recorder_source import discovery as source_discovery
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
@@ -114,6 +115,12 @@ NM3U8DL_PLAYLIST_GROUPS = _dynamic_user_config["NM3U8DL_PLAYLIST_GROUPS"]
 SCHEDULE_START = _dynamic_user_config["SCHEDULE_START"]
 RUN_DURATION_MIN = _dynamic_user_config["RUN_DURATION_MIN"]
 BASE_NAME = _dynamic_user_config["BASE_NAME"]
+OUTPUT_PATHS = build_recorder_output_paths(
+    _dynamic_user_config.get("RECORDING_OUTPUT_DIR")
+)
+RECORDING_OUTPUT_DIR = str(OUTPUT_PATHS.root)
+RECORDING_LOGS_DIR = str(OUTPUT_PATHS.recording_logs)
+PLAYLIST_HISTORY_DIR = str(OUTPUT_PATHS.playlist_history)
 
 
 
@@ -13157,8 +13164,7 @@ def record_playlist_history_scan(
 def _playlist_history_master_paths(state: RecorderState):
     start_ts = float(state.playlist_history_started_ts or state.start_time)
     month_key = datetime.fromtimestamp(start_ts).strftime("%Y-%m")
-    root_dir = os.path.abspath(os.path.dirname(FINAL_FILE) or os.curdir)
-    history_dir = os.path.join(root_dir, "playlist_history")
+    history_dir = PLAYLIST_HISTORY_DIR
     base = f"playlist_history_{state.playlist_history_machine}_{month_key}"
     return (
         history_dir,
@@ -19325,10 +19331,14 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
 
 def write_summary_log(state, dur, finalized=True):
     """
-    Write summary log next to FINAL_FILE.
+    Write the persistent recording log under recorder_logs/recording_logs.
     """
     try:
-        summary_path = os.path.splitext(FINAL_FILE)[0] + "_log.log"
+        os.makedirs(RECORDING_LOGS_DIR, exist_ok=True)
+        summary_path = os.path.join(
+            RECORDING_LOGS_DIR,
+            os.path.basename(os.path.splitext(FINAL_FILE)[0] + "_log.log"),
+        )
         total_runtime = 0.0
         if state.stats["process_start"] and state.stats["process_end"]:
             total_runtime = state.stats["process_end"] - state.stats["process_start"]
@@ -19931,7 +19941,11 @@ if __name__ == "__main__":
         signal.signal(signal.SIGINT, make_signal_handler(state))
 
         run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        FINAL_FILE = f"{BASE_NAME}_{run_ts}.mkv"
+        os.makedirs(RECORDING_OUTPUT_DIR, exist_ok=True)
+        FINAL_FILE = os.path.join(
+            RECORDING_OUTPUT_DIR,
+            f"{BASE_NAME}_{run_ts}.mkv",
+        )
 
         final_base = os.path.splitext(FINAL_FILE)[0]
         CHUNKS_DIR = f"{final_base}_chunks"

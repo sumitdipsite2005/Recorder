@@ -74,6 +74,29 @@ def snapshot(candidates, *, policy=coord.POLICY_MANUAL, target_name="T", now=Non
     return coord.build_snapshot((view(t, now=now),), {target_name: tuple(candidates)}, now=now or datetime(2026,9,24,10,0,0))
 
 
+class OutputPathTests(unittest.TestCase):
+    def test_coordinator_log_path_uses_configured_output_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Manual Recordings"
+            config_path = Path(td) / "config.py"
+            config_path.write_text(
+                "RECORDING_OUTPUT_DIR = " + repr(str(root)) + "\n",
+                encoding="utf-8",
+            )
+            started = datetime(2026, 9, 25, 0, 6, 7)
+
+            log_path = coord._coordinator_log_path(config_path, started)
+
+            self.assertEqual(
+                log_path,
+                root
+                / "recorder_logs"
+                / "coordinator_logs"
+                / "IDENTITY_COORDINATOR_20260925_000607.log",
+            )
+            self.assertTrue(log_path.parent.is_dir())
+
+
 class TargetConfigTests(unittest.TestCase):
     def test_parse_manual_target(self):
         items = coord.parse_targets({"IDENTITY_COORDINATOR_TARGETS":[{
