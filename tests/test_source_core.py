@@ -970,7 +970,7 @@ child.m3u8
         self.assertFalse(out.launchable)
         self.assertEqual(out.probe_status, "drm_check_failed")
         self.assertIn("HLS child DRM inspection failed", out.reason)
-        self.assertIn("HTTP 403", out.reason)
+        self.assertIn("HTTP Error 403", out.reason)
         self.assertEqual(out.unsupported_drm, "")
 
     def test_probe_fancode_http_403_uses_mature_access_classification(self):
