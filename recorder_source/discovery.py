@@ -1079,6 +1079,8 @@ def probe_candidate_hls(
             resource_expiry = None
 
         drm_inspection_failure = ""
+        hls_variant_probe_status = ""
+        hls_variant_probe_failure = ""
         if (
             is_hls
             and hls_quality
@@ -1119,31 +1121,49 @@ def probe_candidate_hls(
 
                 if child_text:
                     if "#EXTM3U" not in child_text:
-                        drm_inspection_failure = (
-                            "HLS child DRM inspection returned a non-HLS response"
+                        child_failure = source_transport.classify_hls_variant_probe_failure(
+                            non_hls_response=True,
+                        )
+                        hls_variant_probe_status = str(
+                            child_failure.get("status") or ""
+                        )
+                        hls_variant_probe_failure = str(
+                            child_failure.get("reason") or ""
                         )
                     else:
-                        child_drm = inspect_hls_manifest_drm(child_text)
-                        manifest_drm = {
-                            **dict(manifest_drm),
-                            "drm_protected": bool(
-                                manifest_drm.get("drm_protected")
-                                or child_drm.get("drm_protected")
-                            ),
-                            "drm_key_required": bool(
-                                manifest_drm.get("drm_key_required")
-                                or child_drm.get("drm_key_required")
-                            ),
-                            "drm_detail": str(
-                                child_drm.get("drm_detail")
-                                or manifest_drm.get("drm_detail")
-                                or ""
-                            ),
-                        }
+                        try:
+                            child_drm = inspect_hls_manifest_drm(child_text)
+                        except Exception as error:
+                            drm_inspection_failure = (
+                                "HLS DRM inspection failed — "
+                                f"{type(error).__name__}: {error}"
+                            )
+                        else:
+                            manifest_drm = {
+                                **dict(manifest_drm),
+                                "drm_protected": bool(
+                                    manifest_drm.get("drm_protected")
+                                    or child_drm.get("drm_protected")
+                                ),
+                                "drm_key_required": bool(
+                                    manifest_drm.get("drm_key_required")
+                                    or child_drm.get("drm_key_required")
+                                ),
+                                "drm_detail": str(
+                                    child_drm.get("drm_detail")
+                                    or manifest_drm.get("drm_detail")
+                                    or ""
+                                ),
+                            }
                 elif child_error is not None:
-                    drm_inspection_failure = (
-                        "HLS child DRM inspection failed — "
-                        f"{type(child_error).__name__}: {child_error}"
+                    child_failure = source_transport.classify_hls_variant_probe_failure(
+                        child_error,
+                    )
+                    hls_variant_probe_status = str(
+                        child_failure.get("status") or ""
+                    )
+                    hls_variant_probe_failure = str(
+                        child_failure.get("reason") or ""
                     )
 
         is_playlist = bool(is_hls or is_dash)
@@ -1155,6 +1175,7 @@ def probe_candidate_hls(
             and not drm_key_missing
             and not expired_now
             and not drm_inspection_failure
+            and not hls_variant_probe_failure
         )
         launchable = bool(
             probe_transport_launchable and not candidate.unsupported_drm
@@ -1289,6 +1310,8 @@ def probe_candidate_hls(
             if drm_key_missing
             else "drm_check_failed"
             if drm_inspection_failure
+            else hls_variant_probe_status
+            if hls_variant_probe_failure
             else "working"
             if probe_transport_launchable
             else "unsupported"
@@ -1322,6 +1345,8 @@ def probe_candidate_hls(
                 if drm_key_missing
                 else drm_inspection_failure
                 if drm_inspection_failure
+                else hls_variant_probe_failure
+                if hls_variant_probe_failure
                 else "not an HLS/DASH playlist"
                 if not is_playlist
                 else ""
@@ -1353,6 +1378,8 @@ def probe_candidate_hls(
                 "drm_key_missing": drm_key_missing,
                 "drm_detail": str(manifest_drm.get("drm_detail") or ""),
                 "drm_inspection_failure": drm_inspection_failure,
+                "hls_variant_probe_status": hls_variant_probe_status,
+                "hls_variant_probe_failure": hls_variant_probe_failure,
                 "ffprobe_probe_failure": ffprobe_failure,
                 "bitrate_sample_failure": bitrate_sample_failure,
                 "probe_transport_launchable": probe_transport_launchable,

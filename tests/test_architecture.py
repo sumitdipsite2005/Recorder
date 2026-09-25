@@ -62,6 +62,12 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("source_transport.fetch_stream_manifest_text(", recorder)
         self.assertIn("source_transport.fetch_stream_manifest_text(", discovery)
 
+    def test_recorder_and_coordinator_share_hls_variant_failure_classification(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        self.assertIn("source_transport.classify_hls_variant_probe_failure(", recorder)
+        self.assertIn("source_transport.classify_hls_variant_probe_failure(", discovery)
+
     def test_recorder_and_coordinator_share_dash_quality_parser(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")

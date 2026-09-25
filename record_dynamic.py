@@ -8743,6 +8743,8 @@ def _probe_nm3u8dl_candidate_quality(
         "drm_key_missing": False,
         "drm_detail": "",
         "drm_inspection_failure": "",
+        "hls_variant_probe_status": "",
+        "hls_variant_probe_failure": "",
         "access_blocked": False,
         "access_block_kind": "",
         "access_block_http_status": None,
@@ -8878,7 +8880,7 @@ def _probe_nm3u8dl_candidate_quality(
                                 else NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC
                             ),
                             context=(
-                                "HLS child DRM inspection | "
+                                "HLS variant check | "
                                 f"{child_timeout_route}"
                             ),
                         )
@@ -8886,34 +8888,52 @@ def _probe_nm3u8dl_candidate_quality(
 
                     if variant_text:
                         if not variant_text.lstrip().startswith("#EXTM3U"):
-                            quality["drm_inspection_failure"] = (
-                                "HLS child DRM inspection returned a "
-                                "non-HLS response"
+                            child_failure = (
+                                source_transport.classify_hls_variant_probe_failure(
+                                    non_hls_response=True,
+                                )
+                            )
+                            quality["hls_variant_probe_status"] = str(
+                                child_failure.get("status") or ""
+                            )
+                            quality["hls_variant_probe_failure"] = str(
+                                child_failure.get("reason") or ""
                             )
                         else:
-                            variant_drm = (
-                                _inspect_nm3u8dl_hls_manifest_drm(
-                                    variant_text
+                            try:
+                                variant_drm = (
+                                    _inspect_nm3u8dl_hls_manifest_drm(
+                                        variant_text
+                                    )
                                 )
-                            )
-
-                            quality["drm_protected"] = bool(
-                                quality.get("drm_protected")
-                                or variant_drm.get("drm_protected")
-                            )
-
-                            if variant_drm.get("drm_key_required"):
-                                quality["drm_key_required"] = True
-                                quality["drm_detail"] = str(
-                                    variant_drm.get("drm_detail")
-                                    or ""
+                            except Exception as error:
+                                quality["drm_inspection_failure"] = (
+                                    "HLS DRM inspection failed — "
+                                    + _describe_nm3u8dl_probe_exception(error)
                                 )
+                            else:
+                                quality["drm_protected"] = bool(
+                                    quality.get("drm_protected")
+                                    or variant_drm.get("drm_protected")
+                                )
+
+                                if variant_drm.get("drm_key_required"):
+                                    quality["drm_key_required"] = True
+                                    quality["drm_detail"] = str(
+                                        variant_drm.get("drm_detail")
+                                        or ""
+                                    )
                     elif child_error is not None:
-                        quality["drm_inspection_failure"] = (
-                            "HLS child DRM inspection failed — "
-                            + _describe_nm3u8dl_probe_exception(
-                                child_error
+                        child_failure = (
+                            source_transport.classify_hls_variant_probe_failure(
+                                child_error,
                             )
+                        )
+                        quality["hls_variant_probe_status"] = str(
+                            child_failure.get("status") or ""
+                        )
+                        quality["hls_variant_probe_failure"] = str(
+                            child_failure.get("reason") or ""
                         )
 
         elif re.search(
@@ -9374,6 +9394,7 @@ def _probe_nm3u8dl_candidate_quality(
     if (
         quality["drm_key_missing"]
         or quality.get("drm_inspection_failure")
+        or quality.get("hls_variant_probe_failure")
     ):
         quality["launchable"] = False
 
@@ -9665,6 +9686,8 @@ def _make_nm3u8dl_candidate_display_row(candidate: dict) -> dict:
         "drm_key_missing",
         "drm_detail",
         "drm_inspection_failure",
+        "hls_variant_probe_status",
+        "hls_variant_probe_failure",
         "access_blocked",
         "access_block_kind",
         "access_block_http_status",
@@ -9844,6 +9867,17 @@ def _nm3u8dl_candidate_display_classification(
     if str(candidate.get("drm_inspection_failure") or "").strip():
         return "DRM CHECK FAILED"
 
+    hls_variant_status = str(
+        candidate.get("hls_variant_probe_status") or ""
+    ).strip()
+    if hls_variant_status:
+        return {
+            "hls_variant_unavailable": "HLS VARIANT UNAVAILABLE",
+            "hls_variant_access_failed": "HLS VARIANT ACCESS FAILED",
+            "hls_variant_invalid": "HLS VARIANT INVALID",
+            "hls_variant_check_failed": "HLS VARIANT CHECK FAILED",
+        }.get(hls_variant_status, "HLS VARIANT CHECK FAILED")
+
     return ""
 
 
@@ -9952,6 +9986,20 @@ def _nm3u8dl_not_working_reason(candidate: dict) -> str:
 
     if drm_inspection_failure:
         return f"DRM CHECK FAILED — {drm_inspection_failure}"
+
+    hls_variant_failure = str(
+        candidate.get("hls_variant_probe_failure") or ""
+    ).strip()
+    if hls_variant_failure:
+        classification = _nm3u8dl_candidate_display_classification(
+            candidate,
+            status="NOT WORKING",
+        )
+        return (
+            f"{classification} — {hls_variant_failure}"
+            if classification
+            else hls_variant_failure
+        )
 
     header_reason = str(
         candidate.get("header_preparation_failure") or ""
@@ -11704,6 +11752,8 @@ def _playlist_history_candidate_json(
         "manifest_probe_failure": candidate.get("manifest_probe_failure") or "",
         "resource_probe_failure": candidate.get("resource_probe_failure") or "",
         "ffprobe_probe_failure": candidate.get("ffprobe_probe_failure") or "",
+        "hls_variant_probe_status": candidate.get("hls_variant_probe_status") or "",
+        "hls_variant_probe_failure": candidate.get("hls_variant_probe_failure") or "",
         "quality_probe_error": candidate.get("quality_probe_error") or "",
         "preferred_qualifier_score": int(
             candidate.get("preferred_qualifier_score") or 0

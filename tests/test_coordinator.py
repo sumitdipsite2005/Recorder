@@ -907,6 +907,19 @@ class AdditionalRegressionTests(unittest.TestCase):
         block=next(iter(snap.blocks.values()))
         self.assertEqual(block.target_names,["T1","T2"])
 
+    def test_hls_variant_unavailable_state_is_not_drm(self):
+        c=SourceCandidate(
+            stream_url="https://cdn.test/live/master.m3u8",
+            launchable=False,
+            probe_status="hls_variant_unavailable",
+            extra={
+                "provider":"SONYLIV",
+                "hls_variant_probe_status":"hls_variant_unavailable",
+                "hls_variant_probe_failure":"HTTP 404 Not Found — selected HLS variant/path unavailable",
+            },
+        )
+        self.assertEqual(candidate_state(c),"HLS_VARIANT_UNAVAILABLE")
+
     def test_hotstar_unknown_expiry_is_auth_unknown_not_working(self):
         c=SourceCandidate(
             stream_url="https://hotstar.test/live.m3u8",

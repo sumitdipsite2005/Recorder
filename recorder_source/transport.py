@@ -522,6 +522,81 @@ def fetch_hls_child_with_master_cookie_session(
         return response.read().decode("utf-8-sig", errors="replace")
 
 
+def classify_hls_variant_probe_failure(
+    error: Optional[BaseException] = None,
+    *,
+    non_hls_response: bool = False,
+) -> dict:
+    """Classify a selected HLS child/variant failure without inventing DRM.
+
+    The child is fetched partly so we can inspect encryption declarations, but a
+    transport/path failure is not itself DRM evidence. Keep that distinction
+    explicit for both the mature recorder and Coordinator.
+    """
+    if non_hls_response:
+        return {
+            "status": "hls_variant_invalid",
+            "classification": "HLS VARIANT INVALID",
+            "reason": "selected HLS variant returned a non-HLS response",
+            "http_status": None,
+        }
+
+    if isinstance(error, HTTPError):
+        status = int(getattr(error, "code", 0) or 0)
+        reason = str(getattr(error, "reason", "") or "").strip()
+        http_text = (
+            f"HTTP {status}" + (f" {reason}" if reason else "")
+            if status
+            else "HTTP request failed"
+        )
+        if status in (404, 410):
+            return {
+                "status": "hls_variant_unavailable",
+                "classification": "HLS VARIANT UNAVAILABLE",
+                "reason": f"{http_text} — selected HLS variant/path unavailable",
+                "http_status": status,
+            }
+        if status in (401, 403):
+            return {
+                "status": "hls_variant_access_failed",
+                "classification": "HLS VARIANT ACCESS FAILED",
+                "reason": f"{http_text} — selected HLS variant access failed",
+                "http_status": status,
+            }
+        return {
+            "status": "hls_variant_check_failed",
+            "classification": "HLS VARIANT CHECK FAILED",
+            "reason": f"{http_text} — selected HLS variant check failed",
+            "http_status": status or None,
+        }
+
+    if error is not None and is_timeout_exception(error):
+        return {
+            "status": "hls_variant_check_failed",
+            "classification": "HLS VARIANT CHECK FAILED",
+            "reason": "connection timed out while checking selected HLS variant",
+            "http_status": None,
+        }
+
+    detail = ""
+    if error is not None:
+        detail = str(error).strip()
+        if detail:
+            detail = f"{type(error).__name__}: {detail}"
+        else:
+            detail = type(error).__name__
+    return {
+        "status": "hls_variant_check_failed",
+        "classification": "HLS VARIANT CHECK FAILED",
+        "reason": (
+            f"{detail} — selected HLS variant check failed"
+            if detail
+            else "selected HLS variant check failed"
+        ),
+        "http_status": None,
+    }
+
+
 def classify_http_access_error(
     error: BaseException,
     *,

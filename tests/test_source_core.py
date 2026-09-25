@@ -938,7 +938,41 @@ https://edge.drmlive.net/live.mpd
         self.assertEqual(quality["video_fps"], 50.0)
         self.assertEqual(quality["_ffprobe_stream_index"], 1)
 
-    def test_probe_hls_child_drm_failure_is_not_mislabeled_unsupported(self):
+    def test_probe_hls_child_404_is_variant_unavailable_not_drm(self):
+        master = """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=4963000,RESOLUTION=1920x1080,FRAME-RATE=50
+child.m3u8
+"""
+        child_error = HTTPError(
+            "https://final.test/child.m3u8",
+            404,
+            "Not Found",
+            {},
+            None,
+        )
+        with patch(
+            "recorder_source.discovery.source_transport.fetch_stream_manifest_text",
+            side_effect=[
+                (master, "https://final.test/master.m3u8"),
+                child_error,
+            ],
+        ):
+            out = probe_candidate_hls(
+                candidate(
+                    stream_url="https://src.test/master.m3u8",
+                    extra={"provider": "SONYLIV", "source_group": "SONYLIV_EVENTS"},
+                )
+            )
+
+        self.assertFalse(out.launchable)
+        self.assertEqual(out.probe_status, "hls_variant_unavailable")
+        self.assertIn("HTTP 404 Not Found", out.reason)
+        self.assertIn("selected HLS variant/path unavailable", out.reason)
+        self.assertEqual(out.extra["drm_inspection_failure"], "")
+        self.assertEqual(out.extra["hls_variant_probe_status"], "hls_variant_unavailable")
+        self.assertEqual(out.unsupported_drm, "")
+
+    def test_probe_hls_child_403_is_access_failure_not_drm(self):
         master = """#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=4963000,RESOLUTION=1920x1080,FRAME-RATE=50
 child.m3u8
@@ -968,10 +1002,9 @@ child.m3u8
             )
 
         self.assertFalse(out.launchable)
-        self.assertEqual(out.probe_status, "drm_check_failed")
-        self.assertIn("HLS child DRM inspection failed", out.reason)
-        self.assertIn("HTTP Error 403", out.reason)
-        self.assertEqual(out.unsupported_drm, "")
+        self.assertEqual(out.probe_status, "hls_variant_access_failed")
+        self.assertIn("HTTP 403 Forbidden", out.reason)
+        self.assertEqual(out.extra["drm_inspection_failure"], "")
 
     def test_probe_fancode_http_403_uses_mature_access_classification(self):
         error = HTTPError("https://x", 403, "Forbidden", {}, None)
