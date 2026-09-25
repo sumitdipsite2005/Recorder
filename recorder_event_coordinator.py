@@ -1150,7 +1150,10 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     )
 
             now_monotonic = time.monotonic()
-            if force_refresh or now_monotonic >= next_refresh_monotonic:
+            if (
+                not record_menu_open
+                and (force_refresh or now_monotonic >= next_refresh_monotonic)
+            ):
                 try:
                     def show_initial_header(preview: DashboardSnapshot) -> None:
                         clear_live_status_line()
