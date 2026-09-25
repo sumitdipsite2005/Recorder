@@ -1,11 +1,12 @@
-"""Identity Coordinator — Inspect / Watch checkpoint.
+"""Identity Coordinator — Inspect / Watch / MANUAL launch orchestration.
 
-Checkpoint 2 deliberately stops before recording launch. It dynamically reads
-MANUAL/ALL target definitions, discovers qualifying playlist observations,
-canonicalizes provider feed identities, and presents meaningful changes.
+The Coordinator discovers qualifying identities, presents watch state, and for
+MANUAL policy launches an independently running mature-recorder worker only
+after the user explicitly chooses an identity.
 
-State/change intelligence and terminal presentation are kept in separate
-recorder_coordinator modules so this entry point remains orchestration-focused.
+State/change intelligence, launch planning, worker creation, registry ownership,
+and terminal presentation stay behind focused modules so this entry point
+remains orchestration-focused.
 """
 
 from __future__ import annotations
@@ -30,10 +31,13 @@ except ImportError:  # pragma: no cover - Windows is the production terminal
     msvcrt = None
 
 from recorder_runtime import sound as runtime_sound
+from recorder_runtime.identity_launch import IdentityLaunchRequest
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_runtime.sound import SoundSnoozeState
 
+from recorder_coordinator.launch import build_manual_launch_plan
 from recorder_coordinator.registry import IdentityRegistryStore
+from recorder_coordinator.worker import launch_identity_worker
 from recorder_coordinator.models import (
     ChangeEvent,
     CoordinatorWindow,
@@ -57,6 +61,7 @@ from recorder_coordinator.terminal import (
     render_coordinator_controls,
     render_dashboard,
     render_header,
+    render_manual_record_menu,
     render_sound_snooze_menu,
     set_live_status_line,
     update_display_order,
@@ -969,11 +974,61 @@ def next_watch_sleep_seconds(
     return min(delays)
 
 
+def _manual_record_choices(
+    snapshot: DashboardSnapshot,
+    display_order: Mapping[str, Sequence[str]],
+    registry_store: IdentityRegistryStore,
+) -> Tuple[str, ...]:
+    registry = registry_store.read()
+    entries = registry.get("entries")
+    blocked = set(entries) if isinstance(entries, Mapping) else set()
+
+    ordered = list(display_order.get(POLICY_MANUAL, ()))
+    ordered.extend(
+        identity_key
+        for policy, identity_key in snapshot.blocks
+        if policy == POLICY_MANUAL and identity_key not in ordered
+    )
+    return tuple(
+        identity_key
+        for identity_key in ordered
+        if (
+            identity_key not in blocked
+            and (POLICY_MANUAL, identity_key) in snapshot.blocks
+            and snapshot.blocks[(POLICY_MANUAL, identity_key)].best_candidate
+            is not None
+        )
+    )
+
+
+def _launch_manual_identity(
+    snapshot: DashboardSnapshot,
+    identity_key: str,
+    *,
+    registry_session_id: str,
+    registry_store: IdentityRegistryStore,
+):
+    plan = build_manual_launch_plan(snapshot, identity_key)
+    request = IdentityLaunchRequest(
+        registry_session_id=registry_session_id,
+        identity_key=plan.identity.serialized,
+        provider=plan.identity.provider,
+        selected_source_group=plan.selected_source_group,
+        selected_candidate=plan.selected_candidate,
+        target_intents=plan.target_intents,
+        recording_duration_min=plan.recording_duration_min,
+        base_name=plan.base_name,
+    )
+    result = launch_identity_worker(request, registry_store)
+    return plan, result
+
+
 def _command_reader(
     command_queue: "queue.Queue[str]",
     stop_event: threading.Event,
 ) -> None:
     if os.name == "nt" and msvcrt is not None:
+        number_buffer = ""
         while not stop_event.is_set():
             if not msvcrt.kbhit():
                 time.sleep(0.05)
@@ -983,7 +1038,21 @@ def _command_reader(
                 if msvcrt.kbhit():
                     msvcrt.getwch()
                 continue
-            if key.casefold() in {"r", "i", "s", "m", "f", "u"}:
+            if key.isdigit():
+                number_buffer += key
+                command_queue.put(f"__NUMBER_BUFFER__:{number_buffer}")
+                continue
+            if key == "\b":
+                number_buffer = number_buffer[:-1]
+                command_queue.put(f"__NUMBER_BUFFER__:{number_buffer}")
+                continue
+            if key in ("\r", "\n"):
+                command_queue.put(f"__NUMBER_SUBMIT__:{number_buffer}")
+                number_buffer = ""
+                continue
+
+            number_buffer = ""
+            if key.casefold() in {"p", "r", "i", "s", "m", "f", "u"}:
                 command_queue.put(key.casefold())
             elif key == "\x1b":
                 command_queue.put("__ESC__")
@@ -1058,6 +1127,8 @@ def run(config_path: Path, *, once: bool = False) -> int:
     dashboard_has_transient = False
     sound_state = SoundSnoozeState()
     sound_menu_open = False
+    record_menu_open = False
+    record_choices: Tuple[str, ...] = ()
 
     try:
         while not stop_event.is_set():
@@ -1281,6 +1352,134 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     )
                 continue
 
+            if record_menu_open:
+                if normalized in {"__esc__", "esc", "cancel"}:
+                    record_menu_open = False
+                    record_choices = ()
+                    clear_live_status_line()
+                    print("Record selection cancelled.")
+                else:
+                    number_text = ""
+                    if command.startswith("__NUMBER_BUFFER__:"):
+                        number_text = command.split(":", 1)[1]
+                        set_live_status_line(
+                            f"Enter identity number: {number_text}"
+                        )
+                        continue
+                    if command.startswith("__NUMBER_SUBMIT__:"):
+                        number_text = command.split(":", 1)[1]
+                    elif normalized.isdigit():
+                        number_text = normalized
+                    else:
+                        set_live_status_line(
+                            "Enter identity number and press Enter, or Esc to cancel"
+                        )
+                        continue
+
+                    if not number_text:
+                        set_live_status_line(
+                            "Enter identity number and press Enter, or Esc to cancel"
+                        )
+                        continue
+
+                    selected_number = int(number_text)
+                    if not 1 <= selected_number <= len(record_choices):
+                        set_live_status_line(
+                            f"Choose 1-{len(record_choices)} or Esc"
+                        )
+                        continue
+
+                    identity_key = record_choices[selected_number - 1]
+                    record_menu_open = False
+                    record_choices = ()
+                    clear_live_status_line()
+                    try:
+                        if previous is None:
+                            raise RuntimeError(
+                                "Coordinator has no completed discovery snapshot yet"
+                            )
+                        plan, launch_result = _launch_manual_identity(
+                            previous,
+                            identity_key,
+                            registry_session_id=registry_status.session_id,
+                            registry_store=registry_store,
+                        )
+                        message = (
+                            f"Recording launched: {plan.base_name} "
+                            f"(PID {launch_result.pid})"
+                        )
+                        print(message)
+                        write_log(
+                            log_path,
+                            (
+                                f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                                f"MANUAL LAUNCH — {plan.identity.serialized} — "
+                                f"{plan.base_name} — PID {launch_result.pid}"
+                            ),
+                        )
+                    except Exception as error:
+                        message = (
+                            "Record launch failed: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                        print(message)
+                        write_log(
+                            log_path,
+                            (
+                                f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                                f"MANUAL LAUNCH FAILED — {identity_key} — "
+                                f"{type(error).__name__}: {error}"
+                            ),
+                        )
+
+                    force_refresh = True
+                    continue
+
+                if next_refresh_monotonic > 0:
+                    set_live_status_line(
+                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                    )
+                continue
+
+            if normalized in {"p", "record"}:
+                if previous is None:
+                    set_live_status_line(
+                        "No completed discovery snapshot yet"
+                    )
+                    continue
+                try:
+                    record_choices = _manual_record_choices(
+                        previous,
+                        display_order,
+                        registry_store,
+                    )
+                except Exception as error:
+                    clear_live_status_line()
+                    print(
+                        "Could not read identity registry for Record: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    continue
+                if not record_choices:
+                    clear_live_status_line()
+                    print("No MANUAL identities are currently available to record.")
+                    if next_refresh_monotonic > 0:
+                        set_live_status_line(
+                            watch_status_text(
+                                last_scan_wall_time,
+                                next_refresh_monotonic,
+                            )
+                        )
+                    continue
+
+                record_menu_open = True
+                clear_live_status_line()
+                print(render_manual_record_menu(previous, record_choices))
+                set_live_status_line(
+                    "Enter identity number and press Enter, or Esc to cancel"
+                )
+                continue
+
             if normalized in {"r", "refresh"}:
                 force_refresh = True
                 continue
@@ -1303,7 +1502,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
 
             if normalized:
                 set_live_status_line(
-                    "Use i=info | s=sound | r=refresh | Ctrl+C=exit"
+                    "Use p=record | i=info | s=sound | r=refresh | Ctrl+C=exit"
                 )
             elif next_refresh_monotonic > 0:
                 set_live_status_line(
