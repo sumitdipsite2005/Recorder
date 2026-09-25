@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import runpy
 import sys
@@ -580,6 +581,48 @@ def _identity_serialized(candidate: SourceCandidate) -> str:
     return derive_feed_identity(candidate, provider).serialized
 
 
+def _freshness_eligible_identity_keys(
+    candidates: Sequence[SourceCandidate],
+) -> Set[str]:
+    """Return identities that remain target-eligible after freshness review.
+
+    Matching rows are marked ignored=False; same-identity context rows whose
+    primary metadata does not match are ignored=True. Known freshest metadata
+    can disqualify an identity only when every observation at the newest
+    credible timestamp is non-matching. Unknown freshness or a tie containing
+    both matching and non-matching observations is conservative: keep.
+    """
+    by_identity: Dict[str, List[SourceCandidate]] = {}
+    for candidate in candidates:
+        by_identity.setdefault(_identity_serialized(candidate), []).append(candidate)
+
+    eligible: Set[str] = set()
+    for identity_key, identity_candidates in by_identity.items():
+        known = []
+        for candidate in identity_candidates:
+            value = candidate.extra.get("source_freshness_ts")
+            try:
+                timestamp = float(value)
+            except (TypeError, ValueError):
+                continue
+            known.append((timestamp, candidate))
+
+        if not known:
+            eligible.add(identity_key)
+            continue
+
+        newest = max(timestamp for timestamp, _ in known)
+        freshest = [
+            candidate
+            for timestamp, candidate in known
+            if timestamp == newest
+        ]
+        if any(not candidate.ignored for candidate in freshest):
+            eligible.add(identity_key)
+
+    return eligible
+
+
 def acquire_active_targets(
     raw_config: Mapping[str, object],
     target_views: Sequence[TargetView],
@@ -628,25 +671,42 @@ def acquire_active_targets(
 
     freshness_by_url: Dict[str, Mapping[str, object]] = {}
     freshness_now = time.time()
-    for spec in source_specs:
+
+    def resolve_freshness(spec: PlaylistSourceSpec):
         text = documents.get(spec.url)
         if text is None:
-            continue
+            return spec.url, None
         previous_freshness = (
             source_freshness_registry.get(spec.url)
             if source_freshness_registry is not None
             else None
         )
-        freshness = resolve_playlist_source_freshness(
+        return (
             spec.url,
-            text,
-            fetch_diagnostics.get(spec.url),
-            previous=previous_freshness,
-            now_ts=freshness_now,
+            resolve_playlist_source_freshness(
+                spec.url,
+                text,
+                fetch_diagnostics.get(spec.url),
+                previous=previous_freshness,
+                now_ts=freshness_now,
+            ),
         )
-        freshness_by_url[spec.url] = freshness
-        if source_freshness_registry is not None:
-            source_freshness_registry[spec.url] = freshness
+
+    # GitHub commit lookups are independent network calls. Resolve source
+    # freshness concurrently so one slow repository does not serialize startup.
+    freshness_workers = min(6, max(1, len(source_specs)))
+    with ThreadPoolExecutor(
+        max_workers=freshness_workers,
+        thread_name_prefix="source_freshness",
+    ) as executor:
+        futures = [executor.submit(resolve_freshness, spec) for spec in source_specs]
+        for future in as_completed(futures):
+            source_url, freshness = future.result()
+            if freshness is None:
+                continue
+            freshness_by_url[source_url] = freshness
+            if source_freshness_registry is not None:
+                source_freshness_registry[source_url] = freshness
 
     parsed_by_key: Dict[Tuple[str, str, str], Tuple[SourceCandidate, ...]] = {}
     errors: List[str] = list(fetch_errors)
@@ -743,6 +803,17 @@ def acquire_active_targets(
                         continue
                     raw_candidates_by_target[target.name].append(context)
                     existing_keys.add(_observation_key(context))
+
+    # A stale matching row must not keep an identity eligible when newer
+    # credible metadata for that same identity has moved to another event.
+    # Ambiguous ties and identities with no usable freshness remain visible.
+    for target_name, candidates in raw_candidates_by_target.items():
+        eligible_identity_keys = _freshness_eligible_identity_keys(candidates)
+        raw_candidates_by_target[target_name] = [
+            candidate
+            for candidate in candidates
+            if _identity_serialized(candidate) in eligible_identity_keys
+        ]
 
     # Preserve each source observation separately here. The shared probing
     # boundary groups equivalent effective streams internally, probes once, and

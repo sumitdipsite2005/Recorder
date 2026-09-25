@@ -610,7 +610,9 @@ def _github_raw_file_parts(url: str) -> Optional[Tuple[str, str, str, str]]:
 def _github_file_commit_timestamp(
     playlist_url: str,
     *,
-    timeout_sec: float = 8.0,
+    timeout_sec: float = 5.0,
+    max_attempts: int = 3,
+    retry_base_sec: float = 0.35,
 ) -> Optional[float]:
     parts = _github_raw_file_parts(playlist_url)
     if parts is None:
@@ -627,10 +629,29 @@ def _github_file_commit_timestamp(
             "Accept": "application/vnd.github+json",
         },
     )
-    try:
-        with urlopen(request, timeout=float(timeout_sec)) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-    except Exception:
+    payload = None
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        try:
+            with urlopen(request, timeout=float(timeout_sec)) as response:
+                payload = json.loads(
+                    response.read().decode("utf-8", errors="replace")
+                )
+            break
+        except HTTPError as error:
+            # Retry only transient HTTP failures. Permanent/rate-limit responses
+            # should fall back immediately rather than making the scan hang.
+            if error.code not in (408, 425, 429, 500, 502, 503, 504):
+                return None
+        except (URLError, TimeoutError, OSError):
+            pass
+        except Exception:
+            return None
+
+        if attempt + 1 < attempts:
+            time.sleep(float(retry_base_sec) * (2 ** attempt))
+
+    if payload is None:
         return None
     if not isinstance(payload, list) or not payload:
         return None
@@ -667,7 +688,24 @@ def resolve_playlist_source_freshness(
     previous_hash = str((previous or {}).get("content_hash") or "")
     if previous_hash:
         if previous_hash == content_hash:
-            return dict(previous or {})
+            previous_result = dict(previous or {})
+            previous_source = str(previous_result.get("source") or "unknown")
+            # A transient GitHub failure on the first scan must not permanently
+            # freeze a weaker fallback. Retry unchanged GitHub documents until a
+            # commit timestamp is obtained. A witnessed in-run change remains the
+            # stronger evidence and does not need a GitHub replacement.
+            if (
+                _github_raw_file_parts(playlist_url) is not None
+                and previous_source not in ("commit", "observed")
+            ):
+                commit_ts = _github_file_commit_timestamp(playlist_url)
+                if commit_ts is not None:
+                    return {
+                        "timestamp": commit_ts,
+                        "source": "commit",
+                        "content_hash": content_hash,
+                    }
+            return previous_result
         return {
             "timestamp": float(time.time() if now_ts is None else now_ts),
             "source": "observed",

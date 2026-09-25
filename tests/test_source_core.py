@@ -9,6 +9,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from recorder_source.discovery import (
+    _github_file_commit_timestamp,
     adapt_json_playlist_text,
     discover_playlist_text,
     fetch_playlist_documents,
@@ -366,6 +367,48 @@ https://cdn.test/live.mpd
         )
         self.assertEqual(diag["https://good.test/list.m3u"]["etag"], '"abc"')
         self.assertFalse(diag["https://bad.test/list.m3u"]["ok"])
+
+    def test_github_commit_lookup_retries_transient_timeout(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps([{
+                    "commit":{
+                        "committer":{"date":"2026-09-25T03:17:48Z"}
+                    }
+                }]).encode("utf-8")
+        with patch(
+            "recorder_source.discovery.urlopen",
+            side_effect=[TimeoutError("slow"), Response()],
+        ) as opened, patch("recorder_source.discovery.time.sleep"):
+            value=_github_file_commit_timestamp(
+                "https://raw.githubusercontent.com/user/repo/main/list.m3u",
+                timeout_sec=0.01,
+                retry_base_sec=0,
+            )
+        self.assertIsNotNone(value)
+        self.assertEqual(opened.call_count,2)
+
+    def test_same_github_document_retries_weaker_fallback_until_commit_is_known(self):
+        previous={
+            "timestamp":1000.0,
+            "source":"generated",
+            "content_hash":__import__("hashlib").sha256(
+                b"#EXTM3U\n"
+            ).hexdigest(),
+        }
+        with patch(
+            "recorder_source.discovery._github_file_commit_timestamp",
+            return_value=2000.0,
+        ):
+            result=resolve_playlist_source_freshness(
+                "https://raw.githubusercontent.com/user/repo/main/list.m3u",
+                "#EXTM3U\n",
+                previous=previous,
+            )
+        self.assertEqual(result["source"],"commit")
+        self.assertEqual(result["timestamp"],2000.0)
 
     def test_playlist_freshness_prefers_github_commit_on_first_observation(self):
         with patch(

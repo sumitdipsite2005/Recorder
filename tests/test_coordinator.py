@@ -5,11 +5,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import queue
 import tempfile
+import wave
 import threading
 import unittest
 from unittest.mock import patch
 
 import recorder_event_coordinator as coord
+from recorder_coordinator import terminal as coordinator_terminal
 from recorder_coordinator.snapshot import candidate_row_key, candidate_state
 from recorder_source.models import SourceCandidate
 
@@ -198,6 +200,87 @@ class AcquisitionTests(unittest.TestCase):
             found,errors=coord.acquire_active_targets(self._raw(),(view(),))
         self.assertEqual(len(found["T"]),1)
         self.assertEqual(errors,("bad: OSError: boom",))
+
+    def test_newer_nonmatching_metadata_rejects_stale_matching_identity(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
+            {"url":"https://old.test/list.m3u","name":"old"},
+            {"url":"https://new.test/list.m3u","name":"new"},
+        ]}}
+        matching='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games",Asian Games\nhttps://a.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        moved='#EXTM3U\n#EXTINF:-1 tvg-name="Swimming",Swimming\nhttps://b.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        def freshness(url,*args,**kwargs):
+            return {
+                "timestamp":1000.0 if "old.test" in url else 2000.0,
+                "source":"commit",
+                "content_hash":url,
+            }
+        with patch.object(
+            coord,"fetch_playlist_documents",
+            return_value=(
+                {"https://old.test/list.m3u":matching,"https://new.test/list.m3u":moved},
+                (),
+                {},
+            ),
+        ), patch.object(
+            coord,"resolve_playlist_source_freshness",side_effect=freshness
+        ), patch.object(
+            coord,"probe_candidates",side_effect=lambda items: tuple(items)
+        ):
+            found,_=coord.acquire_active_targets(raw,(view(),))
+        self.assertEqual(found["T"],())
+
+    def test_newer_matching_metadata_keeps_identity_and_context_routes(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
+            {"url":"https://old.test/list.m3u","name":"old"},
+            {"url":"https://new.test/list.m3u","name":"new"},
+        ]}}
+        old='#EXTM3U\n#EXTINF:-1 tvg-name="Swimming",Swimming\nhttps://a.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        matching='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games",Asian Games\nhttps://b.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        def freshness(url,*args,**kwargs):
+            return {
+                "timestamp":1000.0 if "old.test" in url else 2000.0,
+                "source":"commit",
+                "content_hash":url,
+            }
+        with patch.object(
+            coord,"fetch_playlist_documents",
+            return_value=(
+                {"https://old.test/list.m3u":old,"https://new.test/list.m3u":matching},
+                (),
+                {},
+            ),
+        ), patch.object(
+            coord,"resolve_playlist_source_freshness",side_effect=freshness
+        ), patch.object(
+            coord,"probe_candidates",side_effect=lambda items: tuple(items)
+        ):
+            found,_=coord.acquire_active_targets(raw,(view(),))
+        self.assertEqual(len(found["T"]),2)
+        self.assertEqual(sum(not item.ignored for item in found["T"]),1)
+
+    def test_conflicting_equal_freshness_keeps_identity_conservatively(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
+            {"url":"https://one.test/list.m3u","name":"one"},
+            {"url":"https://two.test/list.m3u","name":"two"},
+        ]}}
+        matching='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games",Asian Games\nhttps://a.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        moved='#EXTM3U\n#EXTINF:-1 tvg-name="Swimming",Swimming\nhttps://b.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        with patch.object(
+            coord,"fetch_playlist_documents",
+            return_value=(
+                {"https://one.test/list.m3u":matching,"https://two.test/list.m3u":moved},
+                (),
+                {},
+            ),
+        ), patch.object(
+            coord,
+            "resolve_playlist_source_freshness",
+            return_value={"timestamp":2000.0,"source":"commit","content_hash":"x"},
+        ), patch.object(
+            coord,"probe_candidates",side_effect=lambda items: tuple(items)
+        ):
+            found,_=coord.acquire_active_targets(raw,(view(),))
+        self.assertEqual(len(found["T"]),2)
 
     def test_metadata_only_matching_entry_remains_visible_unusable(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[{"url":"https://good.test/list.m3u","name":"good"}]}}
@@ -567,9 +650,28 @@ class SnapshotAndChangeTests(unittest.TestCase):
         )
         rendered=coord.render_dashboard(snapshot([item]),())
         self.assertIn(
-            "Source Updated 2026-09-24 09:45:30 [commit]",
+            "Source Updated 09:45 [commit]",
             rendered,
         )
+
+    def test_timestamp_display_adds_date_only_for_another_day(self):
+        item=sony_candidate()
+        source_time=datetime(2026,9,23,23,55,30).timestamp()
+        item=replace(
+            item,
+            extra={
+                **dict(item.extra),
+                "source_freshness_ts":source_time,
+                "source_freshness_source":"commit",
+            },
+        )
+        snap=snapshot([item],now=datetime(2026,9,24,0,5,0))
+        block=next(iter(snap.blocks.values()))
+        block.row_last_updated[candidate_row_key(item)]=datetime(2026,9,23,23,58,45)
+        rendered=coord.render_dashboard(snap,())
+        self.assertIn("Last Updated 2026-09-23 23:58",rendered)
+        self.assertIn("Source Updated 2026-09-23 23:55 [commit]",rendered)
+        self.assertNotIn("23:55:30",rendered)
 
     def test_equal_last_updated_rows_use_source_freshness_as_tiebreaker(self):
         older=sony_candidate(
@@ -637,6 +739,19 @@ class SnapshotAndChangeTests(unittest.TestCase):
             coord.beep((event,),state)
         sound.PlaySound.assert_not_called()
         sound.Beep.assert_not_called()
+
+    def test_notification_pcm_volume_is_reduced_to_seventy_five_percent(self):
+        self.assertEqual(coordinator_terminal.COORDINATOR_NOTIFICATION_VOLUME,0.75)
+        frames=(
+            int(10000).to_bytes(2,"little",signed=True)
+            + int(-10000).to_bytes(2,"little",signed=True)
+        )
+        scaled=coordinator_terminal._scale_pcm_frames(frames,2,0.75)
+        values=[
+            int.from_bytes(scaled[i:i+2],"little",signed=True)
+            for i in range(0,len(scaled),2)
+        ]
+        self.assertEqual(values,[7500,-7500])
 
     def test_coordinator_notification_prefers_custom_wav(self):
         event=coord.ChangeEvent("NEW",(coord.POLICY_MANUAL,"id"),("appeared",),beep=True)

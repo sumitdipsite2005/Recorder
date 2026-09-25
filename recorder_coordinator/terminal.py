@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import tempfile
+import wave
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -86,6 +89,13 @@ def _secondary_text(text: str, use_color: bool) -> str:
 
 def _muted_text(text: str, use_color: bool) -> str:
     return _paint_rgb(text, _MUTED_RGB, use_color)
+
+
+def _compact_timestamp(value: datetime, reference: datetime) -> str:
+    """Show HH:MM today; include the date only when it differs from today."""
+    if value.date() == reference.date():
+        return value.strftime("%H:%M")
+    return value.strftime("%Y-%m-%d %H:%M")
 
 
 def _off_text(text: str, use_color: bool) -> str:
@@ -430,7 +440,7 @@ def render_dashboard(
                     group_name = candidate.group_title or "-"
                     last_updated = block.row_last_updated.get(candidate_row_key(candidate))
                     last_updated_text = (
-                        f"Last Updated {last_updated:%H:%M}"
+                        f"Last Updated {_compact_timestamp(last_updated, snapshot.created_at)}"
                         if last_updated is not None
                         else "Last Updated -"
                     )
@@ -442,7 +452,8 @@ def render_dashboard(
                         try:
                             freshness_time = datetime.fromtimestamp(float(freshness_ts))
                             freshness_text = (
-                                f"Source Updated {freshness_time:%Y-%m-%d %H:%M:%S} "
+                                "Source Updated "
+                                f"{_compact_timestamp(freshness_time, snapshot.created_at)} "
                                 f"[{freshness_source}]"
                             )
                         except (TypeError, ValueError, OSError, OverflowError):
@@ -617,11 +628,84 @@ def write_log(path: Path, text: str) -> None:
 
 
 COORDINATOR_NOTIFICATION_SOUND_FILENAME = "happy_notification.wav"
+COORDINATOR_NOTIFICATION_VOLUME = 0.75
 
 
 def _coordinator_notification_sound_path() -> Path:
     """Resolve the optional one-shot Coordinator sound beside the repo scripts."""
     return Path(__file__).resolve().parent.parent / COORDINATOR_NOTIFICATION_SOUND_FILENAME
+
+
+def _scale_pcm_frames(frames: bytes, sample_width: int, volume: float) -> bytes:
+    """Scale integer PCM samples without changing the user's system volume."""
+    factor = max(0.0, min(1.0, float(volume)))
+    if factor >= 0.999 or not frames:
+        return frames
+
+    if sample_width == 1:
+        output = bytearray(len(frames))
+        for index, sample in enumerate(frames):
+            scaled = int(round((sample - 128) * factor + 128))
+            output[index] = max(0, min(255, scaled))
+        return bytes(output)
+
+    if sample_width not in (2, 3, 4):
+        raise ValueError(f"unsupported PCM sample width: {sample_width}")
+
+    bits = sample_width * 8
+    minimum = -(1 << (bits - 1))
+    maximum = (1 << (bits - 1)) - 1
+    output = bytearray()
+    for offset in range(0, len(frames), sample_width):
+        chunk = frames[offset:offset + sample_width]
+        if len(chunk) != sample_width:
+            output.extend(chunk)
+            continue
+        sample = int.from_bytes(chunk, "little", signed=True)
+        scaled = int(round(sample * factor))
+        scaled = max(minimum, min(maximum, scaled))
+        output.extend(scaled.to_bytes(sample_width, "little", signed=True))
+    return bytes(output)
+
+
+def _attenuated_notification_sound_path(
+    source_path: Path,
+    volume: float = COORDINATOR_NOTIFICATION_VOLUME,
+) -> Path:
+    """Create one cached quieter PCM WAV while preserving async file playback."""
+    factor = max(0.0, min(1.0, float(volume)))
+    if factor >= 0.999:
+        return source_path
+
+    try:
+        stat = source_path.stat()
+        cache_key = hashlib.sha256(
+            (
+                f"{source_path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|"
+                f"{factor:.4f}"
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        output_path = Path(tempfile.gettempdir()) / (
+            f"recorder_coordinator_notification_{os.getpid()}_{cache_key}.wav"
+        )
+        if output_path.is_file():
+            return output_path
+
+        with wave.open(str(source_path), "rb") as source:
+            if source.getcomptype() != "NONE":
+                return source_path
+            params = source.getparams()
+            frames = source.readframes(source.getnframes())
+
+        scaled_frames = _scale_pcm_frames(frames, params.sampwidth, factor)
+        with wave.open(str(output_path), "wb") as output:
+            output.setparams(params)
+            output.writeframes(scaled_frames)
+        return output_path
+    except Exception:
+        # If the custom file is an unusual WAV encoding, preserve notification
+        # behavior rather than failing the alert entirely.
+        return source_path
 
 
 def beep(
@@ -638,8 +722,9 @@ def beep(
     try:
         sound_path = _coordinator_notification_sound_path()
         if sound_path.is_file():
+            playback_path = _attenuated_notification_sound_path(sound_path)
             winsound.PlaySound(
-                str(sound_path),
+                str(playback_path),
                 winsound.SND_FILENAME | winsound.SND_ASYNC,
             )
             return
