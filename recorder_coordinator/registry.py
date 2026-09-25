@@ -352,6 +352,7 @@ class IdentityRegistryStore:
         provider: str,
         display_name: str,
         reason: str = "",
+        expected_session_id: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         """Atomically claim an identity as LAUNCHING before worker creation."""
@@ -361,6 +362,13 @@ class IdentityRegistryStore:
 
         with _registry_lock(self.paths):
             registry = _read_unlocked(self.paths.current)
+            if (
+                expected_session_id is not None
+                and registry["session_id"] != expected_session_id
+            ):
+                raise RegistryError(
+                    "identity registry session changed before launch claim"
+                )
             entries = registry["entries"]
             assert isinstance(entries, dict)
             if identity_key in entries:
@@ -393,6 +401,7 @@ class IdentityRegistryStore:
         new_state: str,
         worker_pid: Optional[int] = None,
         reason: str = "",
+        expected_session_id: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, object]:
         """Atomically move one identity through settled orchestration states."""
@@ -410,6 +419,13 @@ class IdentityRegistryStore:
         stamp = _utc_text(now)
         with _registry_lock(self.paths):
             registry = _read_unlocked(self.paths.current)
+            if (
+                expected_session_id is not None
+                and registry["session_id"] != expected_session_id
+            ):
+                raise RegistryError(
+                    "identity registry session changed before state update"
+                )
             entries = registry["entries"]
             assert isinstance(entries, dict)
             entry = entries.get(identity_key)
