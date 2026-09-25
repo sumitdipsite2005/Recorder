@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path, PurePosixPath
 import unittest
 
@@ -54,13 +55,16 @@ class TerminalHostTests(unittest.TestCase):
 
         self.assertIn("powershell.exe", argv)
         self.assertIn("-NoExit", argv)
-        self.assertIn("-Command", argv)
+        self.assertIn("-EncodedCommand", argv)
+        self.assertNotIn("-Command", argv)
         self.assertNotIn("cmd.exe", argv)
-        self.assertIn("recorder_identity_worker.py", argv[-1])
+        decoded = base64.b64decode(argv[-1]).decode("utf-16-le")
+        self.assertIn("recorder_identity_worker.py", decoded)
         self.assertIn(
             "Set-Location -LiteralPath 'C:\\My PC Recordings\\Manual Recordings'",
-            argv[-1],
+            decoded,
         )
+        self.assertFalse(any("Set-Location" in argument for argument in argv[:-1]))
 
     def test_macos_worker_opens_new_terminal_tab_and_keeps_shell(self):
         worker = [

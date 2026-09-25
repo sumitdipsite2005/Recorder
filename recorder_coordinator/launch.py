@@ -62,13 +62,18 @@ def _combined_duration(targets: Tuple[IdentityTarget, ...]) -> Optional[float]:
 
 
 def _safe_base_name(candidate: SourceCandidate, fallback: str) -> str:
-    raw = (
+    event_name = (
         str(candidate.entry_title or "").strip()
         or str(candidate.tvg_name or "").strip()
-        or str(candidate.group_title or "").strip()
         or str(fallback or "").strip()
-        or "Recording"
     )
+    group_name = str(candidate.group_title or "").strip()
+
+    if group_name and event_name and group_name.casefold() != event_name.casefold():
+        raw = f"{group_name} - {event_name}"
+    else:
+        raw = event_name or group_name or "Recording"
+
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw)
     cleaned = cleaned.rstrip(" .")
     if not cleaned:

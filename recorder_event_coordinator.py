@@ -65,6 +65,7 @@ from recorder_coordinator.terminal import (
     render_sound_snooze_menu,
     set_live_status_line,
     update_display_order,
+    update_source_reference_registry,
     watch_status_text,
     write_log,
 )
@@ -1055,6 +1056,23 @@ def _registry_state_changes(
     return tuple(changes)
 
 
+def _write_registry_state_change(
+    log_path: Path,
+    identity_key: str,
+    previous_state: str,
+    current_state: str,
+    reason: str,
+) -> None:
+    write_log(
+        log_path,
+        (
+            f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+            f"REGISTRY STATE — {identity_key} — "
+            f"{previous_state} -> {current_state} — {reason}"
+        ),
+    )
+
+
 def _manual_recovery_playlist_urls(
     snapshot: DashboardSnapshot,
     plan,
@@ -1100,6 +1118,9 @@ def _launch_manual_identity(
     registry_store: IdentityRegistryStore,
     config_path: Path,
     raw_config: Mapping[str, object],
+    registry_transition_callback: Optional[
+        Callable[[str, str, Mapping[str, object]], None]
+    ] = None,
 ):
     plan = build_manual_launch_plan(snapshot, identity_key)
     recovery_playlist_urls = _manual_recovery_playlist_urls(
@@ -1122,6 +1143,7 @@ def _launch_manual_identity(
         request,
         registry_store,
         config_path=config_path,
+        registry_transition_callback=registry_transition_callback,
     )
     return plan, result
 
@@ -1138,11 +1160,10 @@ def _command_reader(
                 continue
             key = msvcrt.getwch()
             if key in ("\x00", "\xe0"):
-                if msvcrt.kbhit():
-                    extended_key = msvcrt.getwch()
-                    if extended_key == "\x3f":  # F5
-                        number_buffer = ""
-                        command_queue.put("__F5__")
+                extended_key = msvcrt.getwch()
+                if extended_key == "\x3f":  # F5
+                    number_buffer = ""
+                    command_queue.put("__F5__")
                 continue
             if key.isdigit():
                 number_buffer += key
@@ -1192,6 +1213,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
     display_order: Dict[str, List[str]] = {POLICY_ALL: [], POLICY_MANUAL: []}
     row_update_registry: Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]] = {}
     source_freshness_registry: Dict[str, Mapping[str, object]] = {}
+    source_reference_registry: Dict[str, int] = {}
     started = datetime.now()
     output_paths = _coordinator_output_paths(config_path)
     log_path = _coordinator_log_path(
@@ -1223,6 +1245,22 @@ def run(config_path: Path, *, once: bool = False) -> int:
         time.monotonic() + REGISTRY_REFRESH_INTERVAL_SEC
     )
     registry_read_error_signature = ""
+
+    def capture_launch_registry_transition(
+        identity_key: str,
+        previous_state: str,
+        entry: Mapping[str, object],
+    ) -> None:
+        current_state = str(entry.get("state") or "-").strip().upper() or "-"
+        reason = str(entry.get("reason") or "-")
+        _write_registry_state_change(
+            log_path,
+            identity_key,
+            previous_state,
+            current_state,
+            reason,
+        )
+        registry_entries[identity_key] = dict(entry)
 
     command_queue: "queue.Queue[str]" = queue.Queue()
     stop_event = threading.Event()
@@ -1277,13 +1315,12 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             registry_entries,
                             fresh_registry_entries,
                         ):
-                            write_log(
+                            _write_registry_state_change(
                                 log_path,
-                                (
-                                    f"{datetime.now():%Y-%m-%d %H:%M:%S} "
-                                    f"REGISTRY STATE — {identity_key} — "
-                                    f"{previous_state} -> {current_state} — {reason}"
-                                ),
+                                identity_key,
+                                previous_state,
+                                current_state,
+                                reason,
                             )
                         registry_entries = fresh_registry_entries
                         if (
@@ -1301,6 +1338,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                                 refresh_interval_sec=state.refresh_interval_sec,
                                 use_color=True,
                                 registry_entries=registry_entries,
+                                source_references=source_reference_registry,
                             )
                             clear_dashboard_terminal()
                             print(terminal_text)
@@ -1398,6 +1436,10 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 clear_transient_only = (not meaningful) and dashboard_has_transient
 
                 display_order = update_display_order(display_order, snapshot)
+                source_reference_registry = update_source_reference_registry(
+                    source_reference_registry,
+                    snapshot,
+                )
                 if meaningful or clear_transient_only:
                     clear_live_status_line()
                     terminal_events = events if meaningful else ()
@@ -1409,6 +1451,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         refresh_interval_sec=state.refresh_interval_sec,
                         use_color=True,
                         registry_entries=registry_entries,
+                        source_references=source_reference_registry,
                     )
                     clear_dashboard_terminal()
                     print(terminal_text)
@@ -1422,6 +1465,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             refresh_interval_sec=state.refresh_interval_sec,
                             use_color=False,
                             registry_entries=registry_entries,
+                            source_references=source_reference_registry,
                         )
                         write_log(log_path, log_text)
                         for event in events:
@@ -1599,6 +1643,9 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             registry_store=registry_store,
                             config_path=config_path,
                             raw_config=state.raw_config or {},
+                            registry_transition_callback=(
+                                capture_launch_registry_transition
+                            ),
                         )
                         message = (
                             f"Recording launched: {plan.base_name} "

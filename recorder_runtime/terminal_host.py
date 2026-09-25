@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import shlex
 import shutil
@@ -76,6 +77,9 @@ def _windows_tab_argv(
             f"{invocation}; "
             f"Set-Location -LiteralPath {_powershell_quote(post_exit_cwd)}"
         )
+        encoded_command = base64.b64encode(
+            shell_command.encode("utf-16-le")
+        ).decode("ascii")
         return [
             "wt.exe",
             "-w",
@@ -86,8 +90,8 @@ def _windows_tab_argv(
             "--suppressApplicationTitle",
             executable,
             "-NoExit",
-            "-Command",
-            shell_command,
+            "-EncodedCommand",
+            encoded_command,
         ]
 
     command_line = subprocess.list2cmdline(list(worker_command))

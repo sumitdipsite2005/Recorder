@@ -59,6 +59,7 @@ class WorkerLaunchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store, request, config_path = self.make_store_and_request(td)
             captured = {}
+            transitions = []
 
             def fake_terminal_launcher(command, *, title, cwd, post_exit_cwd):
                 registry = store.read()
@@ -84,6 +85,16 @@ class WorkerLaunchTests(unittest.TestCase):
                 config_path=config_path,
                 terminal_launcher=fake_terminal_launcher,
                 startup_timeout_sec=1.0,
+                registry_transition_callback=(
+                    lambda identity_key, previous_state, entry: transitions.append(
+                        (
+                            identity_key,
+                            previous_state,
+                            entry["state"],
+                            entry.get("reason"),
+                        )
+                    )
+                ),
             )
 
             request_index = captured["command"].index("--request") + 1
@@ -92,6 +103,15 @@ class WorkerLaunchTests(unittest.TestCase):
             try:
                 self.assertEqual(result.pid, 4321)
                 self.assertEqual(captured["state_at_launch"], "LAUNCHING")
+                self.assertEqual(
+                    transitions,
+                    [(
+                        request.identity_key,
+                        "-",
+                        "LAUNCHING",
+                        "identity worker launch requested",
+                    )],
+                )
                 self.assertEqual(
                     Path(captured["command"][1]).name,
                     "recorder_identity_worker.py",

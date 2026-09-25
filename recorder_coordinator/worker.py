@@ -6,7 +6,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 from recorder_runtime.identity_launch import (
     IdentityLaunchRequest,
@@ -40,12 +40,15 @@ def launch_identity_worker(
     config_path: Path,
     terminal_launcher: Optional[Callable[..., object]] = None,
     startup_timeout_sec: float = 15.0,
+    registry_transition_callback: Optional[
+        Callable[[str, str, Mapping[str, object]], None]
+    ] = None,
 ) -> WorkerLaunchResult:
     """Claim one identity and create its independent recorder process."""
     request_path = write_launch_request_temp(request)
     claimed = False
     try:
-        registry_store.claim(
+        claim_entry = registry_store.claim(
             identity_key=request.identity_key,
             provider=request.provider,
             display_name=request.base_name,
@@ -53,6 +56,16 @@ def launch_identity_worker(
             expected_session_id=request.registry_session_id,
         )
         claimed = True
+        if registry_transition_callback is not None:
+            try:
+                registry_transition_callback(
+                    request.identity_key,
+                    "-",
+                    claim_entry,
+                )
+            except Exception:
+                # Observability must not prevent the recorder worker from starting.
+                pass
 
         resolved_config = Path(config_path).resolve()
         if not resolved_config.is_file():
@@ -115,7 +128,7 @@ def launch_identity_worker(
                 registry = registry_store.read()
                 entry = registry["entries"].get(request.identity_key)
                 if isinstance(entry, dict) and entry.get("state") == "LAUNCHING":
-                    registry_store.transition(
+                    crashed_entry = registry_store.transition(
                         identity_key=request.identity_key,
                         new_state=STATE_CRASHED,
                         reason=(
@@ -124,6 +137,15 @@ def launch_identity_worker(
                         ),
                         expected_session_id=request.registry_session_id,
                     )
+                    if registry_transition_callback is not None:
+                        try:
+                            registry_transition_callback(
+                                request.identity_key,
+                                "LAUNCHING",
+                                crashed_entry,
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 # Preserve the original launch failure. Any unresolved ownership
                 # will be surfaced by the registry's fail-safe startup checks.

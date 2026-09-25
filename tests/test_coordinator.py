@@ -185,10 +185,19 @@ class ManualRecordLaunchTests(unittest.TestCase):
             status = store.prepare_session()
             captured = {}
 
-            def fake_launch(request, registry_store, *, config_path):
+            def fake_launch(
+                request,
+                registry_store,
+                *,
+                config_path,
+                registry_transition_callback=None,
+            ):
                 captured["request"] = request
                 captured["store"] = registry_store
                 captured["config_path"] = config_path
+                captured["registry_transition_callback"] = (
+                    registry_transition_callback
+                )
                 return type("Result", (), {"pid": 4321})()
 
             with patch.object(coord, "launch_identity_worker", fake_launch):
@@ -227,6 +236,8 @@ class ManualRecordLaunchTests(unittest.TestCase):
                 request.recovery_playlist_urls,
                 ("https://src1.test/list.m3u",),
             )
+            self.assertEqual(request.base_name, "Sports - Asian Games")
+            self.assertEqual(plan.base_name, "Sports - Asian Games")
             self.assertEqual(
                 captured["config_path"],
                 config_path,
@@ -564,6 +575,9 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("[ON] Asian Games",rendered)
         self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps",rendered)
         self.assertIn("Identity: lane:2120305/AG_Strea2309/ENG",rendered)
+        self.assertIn("src1 [S1]", rendered)
+        self.assertIn("SOURCE REFERENCES", rendered)
+        self.assertIn("[S1] https://src1.test/list.m3u", rendered)
 
     def test_dashboard_overlays_registry_state_and_active_recordings(self):
         snap=snapshot([sony_candidate()])
@@ -611,9 +625,64 @@ class SnapshotAndChangeTests(unittest.TestCase):
             colored,
         )
         self.assertIn(
-            "\033[38;2;255;135;3m[ACTIVE]\033[0m",
+            "\033[38;2;255;215;0m[ACTIVE]\033[0m",
             colored,
         )
+        self.assertIn(
+            "\033[38;2;255;215;0mACTIVE\033[0m",
+            colored,
+        )
+
+    def test_dashboard_uses_shared_color_mapping_for_waiting_state(self):
+        snap=snapshot([sony_candidate()])
+        identity_key=next(
+            identity
+            for policy,identity in snap.blocks
+            if policy==coord.POLICY_MANUAL
+        )
+        colored=coord.render_dashboard(
+            snap,
+            (),
+            use_color=True,
+            registry_entries={
+                identity_key:{
+                    "identity":identity_key,
+                    "provider":"SONYLIV",
+                    "display_name":"ENG _ Asian Games",
+                    "state":"WAITING_FOR_SOURCE",
+                    "worker_pid":4321,
+                }
+            },
+        )
+        self.assertIn(
+            "\033[38;2;255;135;3m[WAITING_FOR_SOURCE]\033[0m",
+            colored,
+        )
+        self.assertIn(
+            "\033[38;2;255;135;3mWAITING_FOR_SOURCE\033[0m",
+            colored,
+        )
+
+    def test_source_reference_numbers_remain_stable_across_refreshes(self):
+        first=snapshot([sony_candidate(
+            playlist="https://src1.test/list.m3u",
+            source_name="src1",
+        )])
+        refs=coordinator_terminal.update_source_reference_registry({},first)
+        second=snapshot([
+            sony_candidate(
+                playlist="https://src2.test/list.m3u",
+                source_name="src2",
+                lane="2120306/AG_Strea2309/ENG",
+            ),
+            sony_candidate(
+                playlist="https://src1.test/list.m3u",
+                source_name="src1",
+            ),
+        ])
+        refs=coordinator_terminal.update_source_reference_registry(refs,second)
+        self.assertEqual(refs["https://src1.test/list.m3u"],1)
+        self.assertEqual(refs["https://src2.test/list.m3u"],2)
 
     def test_dashboard_terminal_registry_state_suppresses_available_label(self):
         snap=snapshot([sony_candidate()])
@@ -1064,11 +1133,13 @@ class SnapshotAndChangeTests(unittest.TestCase):
         q=queue.Queue()
         stop=threading.Event()
         keys=iter(["\x00","\x3f"])
+        kbhit_calls=[]
 
         class FakeMsvcrt:
             @staticmethod
             def kbhit():
-                return True
+                kbhit_calls.append(True)
+                return len(kbhit_calls)==1
             @staticmethod
             def getwch():
                 value=next(keys)
@@ -1079,6 +1150,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         with patch.object(coord.os,"name","nt"), patch.object(coord,"msvcrt",FakeMsvcrt):
             coord._command_reader(q,stop)
         self.assertEqual(q.get_nowait(),"__F5__")
+        self.assertEqual(len(kbhit_calls),1)
 
 
 class RegistryStateChangeTests(unittest.TestCase):

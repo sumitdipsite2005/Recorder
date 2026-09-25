@@ -55,6 +55,16 @@ _IDENTITY_RGB = (145, 153, 160)
 _ERROR_RGB = (224, 82, 82)
 _IMPORTANT_RGB = (220, 220, 220)
 
+_RUNTIME_STATE_RGB = {
+    "AVAILABLE": _IMPORTANT_RGB,
+    "LAUNCHING": _EVENT_RGB,
+    "ACTIVE": _CHANGE_DETAIL_RGB,
+    "WAITING_FOR_SOURCE": _MARKER_RGB,
+    "ENDED": _MUTED_RGB,
+    "MANUALLY_STOPPED": _MUTED_RGB,
+    "CRASHED": _ERROR_RGB,
+}
+
 
 def _paint_rgb(text: str, rgb: Tuple[int, int, int], use_color: bool) -> str:
     if not use_color:
@@ -104,6 +114,18 @@ def _compact_timestamp(value: datetime, reference: datetime) -> str:
 
 def _off_text(text: str, use_color: bool) -> str:
     return _paint_rgb(text, _ERROR_RGB, use_color)
+
+
+def _runtime_state_text(
+    state: str,
+    use_color: bool,
+    *,
+    bracketed: bool = False,
+) -> str:
+    normalized = str(state or "").strip().upper()
+    text = f"[{normalized}]" if bracketed else normalized
+    rgb = _RUNTIME_STATE_RGB.get(normalized, _ERROR_RGB)
+    return _paint_rgb(text, rgb, use_color)
 
 
 def _phrase_group_text(value: object) -> str:
@@ -285,6 +307,36 @@ def _provider_summary(snapshot: DashboardSnapshot) -> str:
     return f"{label}={','.join(providers)}"
 
 
+def _dashboard_source_ids(snapshot: DashboardSnapshot) -> Tuple[str, ...]:
+    source_ids: List[str] = []
+    seen = set()
+    for block in snapshot.blocks.values():
+        for source in block.observations.values():
+            source_id = str(source.source_id or "").strip()
+            if source_id and source_id not in seen:
+                seen.add(source_id)
+                source_ids.append(source_id)
+    return tuple(source_ids)
+
+
+def update_source_reference_registry(
+    previous: Mapping[str, int],
+    snapshot: DashboardSnapshot,
+) -> Dict[str, int]:
+    """Keep source reference numbers stable for the life of a Coordinator run."""
+    result = {
+        str(source_id): int(number)
+        for source_id, number in previous.items()
+        if str(source_id).strip() and int(number) > 0
+    }
+    next_number = max(result.values(), default=0) + 1
+    for source_id in _dashboard_source_ids(snapshot):
+        if source_id not in result:
+            result[source_id] = next_number
+            next_number += 1
+    return result
+
+
 def render_dashboard(
     snapshot: DashboardSnapshot,
     events: Sequence[ChangeEvent],
@@ -294,9 +346,16 @@ def render_dashboard(
     refresh_interval_sec: Optional[float] = None,
     use_color: Optional[bool] = None,
     registry_entries: Optional[Mapping[str, Mapping[str, object]]] = None,
+    source_references: Optional[Mapping[str, int]] = None,
 ) -> str:
     color = _terminal_is_interactive() if use_color is None else bool(use_color)
     identity_events, source_events, quality_events = _event_maps(events)
+    effective_source_references = (
+        dict(source_references)
+        if source_references is not None
+        else update_source_reference_registry({}, snapshot)
+    )
+    current_source_ids = _dashboard_source_ids(snapshot)
 
     lines: List[str] = _header_lines(
         snapshot,
@@ -332,11 +391,7 @@ def render_dashboard(
                 if isinstance(pid, int) and not isinstance(pid, bool)
                 else "-"
             )
-            state_flag = (
-                _marker(f"[{state}]", color)
-                if state == "ACTIVE"
-                else _important_text(f"[{state}]", color)
-            )
+            state_flag = _runtime_state_text(state, color, bracketed=True)
             lines.append(
                 f"  {state_flag} {display_name} | {provider} | PID {pid_text}"
             )
@@ -386,17 +441,7 @@ def render_dashboard(
                 else ""
             )
             visible_state = registry_state or block.overall_state
-            if visible_state in {
-                "AVAILABLE",
-                "LAUNCHING",
-                "ACTIVE",
-                "WAITING_FOR_SOURCE",
-            }:
-                state_label = _important_text(visible_state, color)
-            elif visible_state in {"ENDED", "MANUALLY_STOPPED"}:
-                state_label = _muted_text(visible_state, color)
-            else:
-                state_label = _off_text(visible_state, color)
+            state_label = _runtime_state_text(visible_state, color)
             lines.append(
                 f"{identity_marker}[{index}] {state_label} {block.identity.provider} "
                 f"| Identity: {_identity_text(identity_value, color)} "
@@ -520,13 +565,21 @@ def render_dashboard(
                         if state_text == "WORKING"
                         else " | " + _off_text(state_text, color)
                     )
+                    source_reference = effective_source_references.get(
+                        str(source.source_id)
+                    )
+                    source_reference_text = (
+                        " " + _important_text(f"[S{source_reference}]", color)
+                        if source_reference is not None
+                        else ""
+                    )
                     lines.append(
                         "        "
                         f"{marker_prefix}{on_off} "
                         f"{_event_title(event_name, color)} | "
                         f"{_secondary_text(tvg_name, color)} | "
                         f"{_group_text(group_name, color)} | "
-                        f"{_muted_text(source.source_name, color)} | "
+                        f"{_muted_text(source.source_name, color)}{source_reference_text} | "
                         f"{_secondary_text(last_updated_text, color)} | "
                         f"{_secondary_text(freshness_text, color)}"
                         f"{trailing_state}"
@@ -538,6 +591,17 @@ def render_dashboard(
 
             if index != len(policy_blocks):
                 lines.append("")
+
+    visible_source_references = [
+        (effective_source_references[source_id], source_id)
+        for source_id in current_source_ids
+        if source_id in effective_source_references
+    ]
+    if visible_source_references:
+        lines.append("")
+        lines.append(_important_text("SOURCE REFERENCES", color))
+        for number, source_id in sorted(visible_source_references):
+            lines.append(_important_text(f"  [S{number}] {source_id}", color))
 
     if snapshot.source_errors:
         lines.append("")
