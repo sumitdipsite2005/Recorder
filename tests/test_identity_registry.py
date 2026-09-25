@@ -9,6 +9,7 @@ from recorder_coordinator.registry import (
     IdentityLaunchBlocked,
     IdentityRegistryStore,
     InvalidRegistryTransition,
+    RegistryError,
     STATE_ACTIVE,
     STATE_CRASHED,
     STATE_LAUNCHING,
@@ -166,6 +167,27 @@ class IdentityRegistryTests(unittest.TestCase):
             registry = store.read()
             entry = registry["entries"]["sony|lane-a|english"]
             self.assertEqual(entry["state"], STATE_LAUNCHING)
+
+    def test_session_guard_rejects_stale_worker_update(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self.make_store(td)
+            status = store.prepare_session(now=FIXED_TIME)
+            store.claim(
+                identity_key="sony|lane-a|english",
+                provider="SONY",
+                display_name="Lane A",
+                expected_session_id=status.session_id,
+                now=FIXED_TIME,
+            )
+
+            with self.assertRaises(RegistryError):
+                store.transition(
+                    identity_key="sony|lane-a|english",
+                    new_state=STATE_ACTIVE,
+                    worker_pid=12345,
+                    expected_session_id="stale-session",
+                    now=FIXED_TIME,
+                )
 
     def test_state_machine_rejects_invalid_terminal_transition(self):
         with tempfile.TemporaryDirectory() as td:
