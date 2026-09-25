@@ -55,6 +55,20 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("source_quality.parse_hls_manifest_quality(",recorder)
         self.assertIn("parse_hls_manifest_quality(",discovery)
 
+    def test_recorder_and_coordinator_share_probe_transport_policy(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        self.assertIn("from recorder_source import transport as source_transport", recorder)
+        self.assertIn("source_transport.run_retryable_http_get(", recorder)
+        self.assertIn("source_transport.run_retryable_http_get(", discovery)
+
+    def test_recorder_and_coordinator_share_dash_quality_parser(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        self.assertIn("source_quality.parse_dash_manifest_quality(", recorder)
+        self.assertIn("parse_dash_manifest_quality(", discovery)
+        self.assertNotIn("def _parse_dash_quality(", discovery)
+
     def test_quality_probe_identity_and_formatter_are_shared(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
