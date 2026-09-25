@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -72,21 +73,15 @@ def build_terminal_tab_argv(
     cwd: Path,
     platform_name: Optional[str] = None,
 ) -> list[str]:
-    platform_value = platform_name or os.name
-    if platform_value == "nt":
+    platform_value = platform_name or sys.platform
+    if platform_value.startswith("win"):
         return _windows_tab_argv(worker_command, title=title)
-    if platform_value == "posix" and sys_platform_is_macos():
+    if platform_value == "darwin":
         return _macos_tab_argv(worker_command, title=title, cwd=cwd)
     raise TerminalHostError(
         "Identity-worker terminal tabs are currently supported on "
         "Windows Terminal and macOS Terminal."
     )
-
-
-def sys_platform_is_macos() -> bool:
-    import sys
-
-    return sys.platform == "darwin"
 
 
 def launch_terminal_tab(
@@ -99,13 +94,13 @@ def launch_terminal_tab(
 ) -> object:
     environment = dict(os.environ if environ is None else environ)
 
-    if os.name == "nt":
+    if sys.platform.startswith("win"):
         if shutil.which("wt.exe", path=environment.get("PATH")) is None:
             raise TerminalHostError(
                 "Windows Terminal (wt.exe) is required to host identity "
                 "workers as tabs instead of separate console windows."
             )
-    elif sys_platform_is_macos():
+    elif sys.platform == "darwin":
         if shutil.which("osascript", path=environment.get("PATH")) is None:
             raise TerminalHostError(
                 "macOS osascript is unavailable; cannot open a Terminal tab."
