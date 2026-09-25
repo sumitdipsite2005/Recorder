@@ -235,6 +235,48 @@ https://example.test/rejected.m3u8
         )
         self.assertIs(selected, preferred_lower_quality)
 
+    def test_mature_nonselection_reason_matches_shared_selection_service(self):
+        from recorder_source.models import SourceCandidate
+        from recorder_source.selection import selection_nonselection_reason
+
+        now = 1_000_000.0
+        RECORDER.NM3U8DL_PLAYLIST_GROUP = "SONYLIV_EVENTS"
+        selected = make_candidate(
+            "selected-1080p50",
+            fps=50,
+            expiry=now + 30 * 60,
+        )
+        selected.update({
+            "launchable": True,
+            "playlist_url": "https://selected.test/list.m3u",
+            "matching_entry_index": 1,
+        })
+        lower = make_candidate(
+            "lower-1080p25",
+            fps=25,
+            expiry=now + 30 * 60,
+        )
+        lower.update({
+            "launchable": True,
+            "playlist_url": "https://lower.test/list.m3u",
+            "matching_entry_index": 1,
+        })
+
+        mature_reason = RECORDER._nm3u8dl_nonselection_reason(
+            lower,
+            selected,
+            now_ts=now,
+        )
+        shared_reason = selection_nonselection_reason(
+            SourceCandidate.from_mapping(lower),
+            SourceCandidate.from_mapping(selected),
+            RECORDER._get_nm3u8dl_selection_policy(),
+            now_ts=now,
+        )
+
+        self.assertEqual(mature_reason, shared_reason)
+        self.assertEqual(mature_reason, "not selected: lower quality")
+
     def test_mature_quality_ordering_is_preserved(self):
         p1080_25 = make_candidate("1080p25", fps=25)
         p1080_50 = make_candidate("1080p50", fps=50)

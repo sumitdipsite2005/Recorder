@@ -6,6 +6,8 @@ live here. Recorder-only execution behavior remains in record_dynamic.py.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from .models import MATCH_MODE_EVENT_PHRASE, MATCH_MODE_EXACT_CHANNEL, SelectionPolicy
 
 
@@ -119,3 +121,47 @@ PROVIDER_SELECTION_POLICIES = {
         allow_unknown_expiry=True,
     ),
 }
+
+
+def selection_policy_for_provider(
+    provider: object,
+    *,
+    mandatory_min_remaining_sec: Optional[int] = None,
+    upgrade_min_remaining_sec: Optional[int] = None,
+    allow_unknown_expiry: Optional[bool] = None,
+    prefer_unknown_expiry_on_equal_quality: Optional[bool] = None,
+    motion_cap_fps: Optional[float] = None,
+) -> SelectionPolicy:
+    """Resolve one provider selection policy with explicit runtime overrides."""
+    provider_name = str(provider or "").strip().upper()
+    base = PROVIDER_SELECTION_POLICIES.get(
+        provider_name,
+        DEFAULT_SELECTION_POLICY,
+    )
+    return SelectionPolicy(
+        mandatory_min_remaining_sec=(
+            int(mandatory_min_remaining_sec)
+            if mandatory_min_remaining_sec is not None
+            else int(base.mandatory_min_remaining_sec)
+        ),
+        upgrade_min_remaining_sec=(
+            int(upgrade_min_remaining_sec)
+            if upgrade_min_remaining_sec is not None
+            else int(base.upgrade_min_remaining_sec)
+        ),
+        allow_unknown_expiry=(
+            bool(allow_unknown_expiry)
+            if allow_unknown_expiry is not None
+            else bool(base.allow_unknown_expiry)
+        ),
+        prefer_unknown_expiry_on_equal_quality=(
+            bool(prefer_unknown_expiry_on_equal_quality)
+            if prefer_unknown_expiry_on_equal_quality is not None
+            else bool(base.prefer_unknown_expiry_on_equal_quality)
+        ),
+        motion_cap_fps=(
+            float(motion_cap_fps)
+            if motion_cap_fps is not None
+            else float(base.motion_cap_fps)
+        ),
+    )

@@ -1007,6 +1007,31 @@ class SnapshotAndChangeTests(unittest.TestCase):
         rendered=coord.render_dashboard(snap,())
         self.assertLess(rendered.index("[ON] Newer"),rendered.index("[ON] Older"))
 
+    def test_dashboard_marks_selected_source_and_explains_working_loser(self):
+        selected=sony_candidate(
+            playlist="https://selected.test/list",
+            source_name="selected-source",
+            title="Selected Event",
+            fps=50.0,
+        )
+        lower=sony_candidate(
+            playlist="https://lower.test/list",
+            source_name="lower-source",
+            title="Lower Event",
+            fps=25.0,
+        )
+        rendered=coord.render_dashboard(snapshot([lower,selected]),())
+        selected_line=next(
+            line for line in rendered.splitlines()
+            if "selected-source" in line
+        )
+        lower_line=next(
+            line for line in rendered.splitlines()
+            if "lower-source" in line
+        )
+        self.assertIn("[SELECTED]",selected_line)
+        self.assertIn("not selected: lower quality",lower_line)
+
     def test_dashboard_shows_source_freshness_time_and_evidence(self):
         item=sony_candidate()
         source_time=datetime(2026,9,24,9,45,30).timestamp()

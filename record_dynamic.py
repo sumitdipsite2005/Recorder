@@ -80,7 +80,7 @@ from recorder_source.policy import (
     PLAYLIST_GROUP_SOURCE_BUCKETS as SHARED_PLAYLIST_GROUP_SOURCE_BUCKETS,
     PLAYLIST_USER_AGENTS as SHARED_PLAYLIST_USER_AGENTS,
     PROVIDER_ADDED_HEADERS as SHARED_PROVIDER_ADDED_HEADERS,
-    PROVIDER_SELECTION_POLICIES as SHARED_PROVIDER_SELECTION_POLICIES,
+    selection_policy_for_provider as shared_selection_policy_for_provider,
 )
 
 # User configuration is shared through OneDrive across all recorder machines.
@@ -190,7 +190,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "HOTSTAR": {
         "safe_overtime_min": 60,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["HOTSTAR"].allow_unknown_expiry,
+        "allow_unknown_expiry": shared_selection_policy_for_provider("HOTSTAR").allow_unknown_expiry,
         "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["HOTSTAR"]),
         "key_mode": "SHAKA",
         "extra_args": "",
@@ -203,7 +203,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "JIO": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["JIO"].allow_unknown_expiry,
+        "allow_unknown_expiry": shared_selection_policy_for_provider("JIO").allow_unknown_expiry,
         "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["JIO"]),
         "key_mode": "MP4DECRYPT",
         "extra_args": "--thread-count 1 --live-keep-segments",
@@ -219,7 +219,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "KHEL": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["KHEL"].allow_unknown_expiry,
+        "allow_unknown_expiry": shared_selection_policy_for_provider("KHEL").allow_unknown_expiry,
         "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["KHEL"]),
         "key_mode": "SHAKA",
         "extra_args": "",
@@ -228,7 +228,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "SONYLIV": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["SONYLIV"].allow_unknown_expiry,
+        "allow_unknown_expiry": shared_selection_policy_for_provider("SONYLIV").allow_unknown_expiry,
         "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["SONYLIV"]),
         "key_mode": "NONE",
         "extra_args": "",
@@ -241,8 +241,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "FANCODE": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["FANCODE"].allow_unknown_expiry,
-        "prefer_unknown_expiry_on_equal_quality": SHARED_PROVIDER_SELECTION_POLICIES["FANCODE"].prefer_unknown_expiry_on_equal_quality,
+        "allow_unknown_expiry": shared_selection_policy_for_provider("FANCODE").allow_unknown_expiry,
+        "prefer_unknown_expiry_on_equal_quality": shared_selection_policy_for_provider("FANCODE").prefer_unknown_expiry_on_equal_quality,
         "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["FANCODE"]),
         "key_mode": "SHAKA",
         "extra_args": "",
@@ -7409,6 +7409,8 @@ def _get_nm3u8dl_selection_policy(
     allow_unknown_expiry: Optional[bool] = None,
 ) -> SelectionPolicy:
     profile = get_nm3u8dl_playlist_profile()
+    group_name = NM3U8DL_PLAYLIST_GROUP.strip().upper()
+    provider = NM3U8DL_PLAYLIST_GROUP_PROFILES.get(group_name, "")
     if upgrade_min_remaining_min is None:
         upgrade_min_remaining_min = NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN
     if allow_unknown_expiry is None:
@@ -7416,7 +7418,8 @@ def _get_nm3u8dl_selection_policy(
             profile.get("allow_unknown_expiry", False)
         )
 
-    return SelectionPolicy(
+    return shared_selection_policy_for_provider(
+        provider,
         mandatory_min_remaining_sec=int(
             NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN * 60
         ),
@@ -9835,14 +9838,7 @@ def _nm3u8dl_candidate_identity(candidate: dict) -> str:
 def _nm3u8dl_same_candidate(left: Optional[dict], right: Optional[dict]) -> bool:
     if not left or not right:
         return False
-
-    return (
-        str(left.get("playlist_url") or "")
-        == str(right.get("playlist_url") or "")
-        and int(left.get("matching_entry_index") or 0)
-        == int(right.get("matching_entry_index") or 0)
-        and int(left.get("matching_entry_index") or 0) > 0
-    )
+    return source_selection.same_selection_candidate(left, right)
 
 
 def _nm3u8dl_candidate_status(
@@ -9931,84 +9927,12 @@ def _nm3u8dl_nonselection_reason(
     *,
     now_ts: float,
 ) -> str:
-    if not selected_candidate or not candidate.get("launchable", False):
-        return ""
-
-    if _nm3u8dl_same_candidate(candidate, selected_candidate):
-        return ""
-
-    min_remaining_sec = int(
-        NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN * 60
+    return source_selection.selection_nonselection_reason(
+        candidate,
+        selected_candidate,
+        _get_nm3u8dl_selection_policy(),
+        now_ts=now_ts,
     )
-
-    def stable_for_join(item: dict) -> bool:
-        expiry = item.get("expiry")
-        return (
-            expiry is None
-            or float(expiry) - float(now_ts) >= min_remaining_sec
-        )
-
-    if stable_for_join(selected_candidate) and not stable_for_join(candidate):
-        return (
-            "not selected: less than "
-            f"{int(NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN)} min remaining"
-        )
-
-    candidate_preferred = int(
-        candidate.get("preferred_qualifier_score") or 0
-    )
-    selected_preferred = int(
-        selected_candidate.get("preferred_qualifier_score") or 0
-    )
-
-    if candidate_preferred < selected_preferred:
-        return "not selected: less preferred match"
-
-    candidate_video_rank = _nm3u8dl_video_quality_rank(candidate)
-    selected_video_rank = _nm3u8dl_video_quality_rank(selected_candidate)
-
-    if candidate_video_rank < selected_video_rank:
-        if (
-            candidate_video_rank[:-1] == selected_video_rank[:-1]
-            and candidate_video_rank[-1] <= 0
-            and selected_video_rank[-1] > 0
-        ):
-            return "not selected: bitrate unknown"
-        return "not selected: lower quality"
-
-    candidate_expiry = candidate.get("expiry")
-    selected_expiry = selected_candidate.get("expiry")
-
-    if candidate_video_rank == selected_video_rank:
-        prefer_unknown_expiry = bool(
-            get_nm3u8dl_playlist_profile().get(
-                "prefer_unknown_expiry_on_equal_quality",
-                False,
-            )
-        )
-
-        if (
-            candidate_expiry is not None
-            and selected_expiry is not None
-            and float(candidate_expiry) < float(selected_expiry)
-        ):
-            return "not selected: expires sooner"
-
-        if candidate_expiry is None and selected_expiry is not None:
-            if not prefer_unknown_expiry:
-                return "not selected: expiry unknown"
-
-        if candidate_expiry is not None and selected_expiry is None:
-            if prefer_unknown_expiry:
-                return (
-                    "not selected: equal quality; "
-                    "unknown-expiry source preferred"
-                )
-
-        return "not selected: equivalent alternative"
-
-    return "not selected: another candidate ranked higher"
-
 
 def _nm3u8dl_not_working_reason(candidate: dict) -> str:
     unsupported_drm = str(

@@ -44,11 +44,13 @@ from recorder_source.models import (
     SourceCandidate,
 )
 from recorder_source import transport as source_transport
+from recorder_source.policy import selection_policy_for_provider
 from recorder_source.selection import (
     candidate_quality_rank,
     comparable_motion_fps,
     select_join_candidate,
     select_quality_upgrade,
+    selection_nonselection_reason,
     video_quality_rank,
 )
 
@@ -228,6 +230,61 @@ class SelectionTests(unittest.TestCase):
     def test_interlaced_25_is_comparable_to_50_motion(self):
         interlaced = candidate(video_fps=25, video_scan_type="interlaced")
         self.assertEqual(comparable_motion_fps(interlaced, motion_cap_fps=50), 50)
+
+    def test_provider_policy_resolver_uses_shared_provider_defaults(self):
+        sony = selection_policy_for_provider("SONYLIV")
+        hotstar = selection_policy_for_provider("HOTSTAR")
+        self.assertTrue(sony.allow_unknown_expiry)
+        self.assertFalse(hotstar.allow_unknown_expiry)
+        self.assertEqual(sony.mandatory_min_remaining_sec, 900)
+
+    def test_shared_nonselection_reason_reports_lower_quality(self):
+        selected = candidate(
+            "selected",
+            playlist_url="https://selected.test/list.m3u",
+            matching_entry_index=1,
+            video_fps=50,
+            expiry=self.now + 3600,
+        )
+        lower = candidate(
+            "lower",
+            playlist_url="https://lower.test/list.m3u",
+            matching_entry_index=1,
+            video_fps=25,
+            expiry=self.now + 3600,
+        )
+        self.assertEqual(
+            selection_nonselection_reason(
+                lower,
+                selected,
+                self.policy,
+                now_ts=self.now,
+            ),
+            "not selected: lower quality",
+        )
+
+    def test_shared_nonselection_reason_reports_equivalent_alternative(self):
+        selected = candidate(
+            "selected",
+            playlist_url="https://selected.test/list.m3u",
+            matching_entry_index=1,
+            expiry=self.now + 3600,
+        )
+        equivalent = candidate(
+            "equivalent",
+            playlist_url="https://equivalent.test/list.m3u",
+            matching_entry_index=1,
+            expiry=self.now + 3600,
+        )
+        self.assertEqual(
+            selection_nonselection_reason(
+                equivalent,
+                selected,
+                self.policy,
+                now_ts=self.now,
+            ),
+            "not selected: equivalent alternative",
+        )
 
     def test_upgrade_requires_minimum_lifetime(self):
         running = candidate("running", video_fps=25, expiry=self.now + 3600)

@@ -125,6 +125,23 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("NM3U8DL_PLAYLIST_GROUP_MATCH_MODES = dict(SHARED_PLAYLIST_GROUP_MATCH_MODES)",text)
         self.assertIn("NM3U8DL_PLAYLIST_GROUP_LIFECYCLES = dict(SHARED_PLAYLIST_GROUP_LIFECYCLES)",text)
         self.assertIn("NM3U8DL_PLAYLIST_USER_AGENTS = dict(SHARED_PLAYLIST_USER_AGENTS)",text)
+        self.assertIn("shared_selection_policy_for_provider(",text)
+        self.assertNotIn("SHARED_PROVIDER_SELECTION_POLICIES",text)
+
+    def test_selection_reasoning_has_one_shared_owner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        terminal=(ROOT/"recorder_coordinator"/"terminal.py").read_text(encoding="utf-8")
+        selection=(ROOT/"recorder_source"/"selection.py").read_text(encoding="utf-8")
+        launch=(ROOT/"recorder_coordinator"/"launch.py").read_text(encoding="utf-8")
+        snapshot=(ROOT/"recorder_coordinator"/"snapshot.py").read_text(encoding="utf-8")
+
+        self.assertIn("def selection_nonselection_reason(",selection)
+        self.assertIn("source_selection.selection_nonselection_reason(",recorder)
+        self.assertIn("selection_nonselection_reason(",terminal)
+        self.assertNotIn('return "not selected: lower quality"',recorder)
+
+        self.assertIn("selection_policy_for_provider(",launch)
+        self.assertIn("selection_policy_for_provider(",snapshot)
 
 
 if __name__ == "__main__":

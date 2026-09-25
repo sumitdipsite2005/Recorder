@@ -10,10 +10,7 @@ from typing import List, Optional, Tuple
 from recorder_runtime.identity_launch import FrozenTargetIntent
 from recorder_source.identity import CanonicalFeedIdentity, derive_feed_identity
 from recorder_source.models import SourceCandidate
-from recorder_source.policy import (
-    DEFAULT_SELECTION_POLICY,
-    PROVIDER_SELECTION_POLICIES,
-)
+from recorder_source.policy import selection_policy_for_provider
 from recorder_source.selection import candidate_quality_rank, select_join_candidate
 
 from .models import DashboardSnapshot, IdentityTarget, POLICY_MANUAL
@@ -128,10 +125,7 @@ def build_manual_launch_plan(
             f"MANUAL identity has no active target/candidate context: {identity_key}"
         )
 
-    policy = PROVIDER_SELECTION_POLICIES.get(
-        block.identity.provider,
-        DEFAULT_SELECTION_POLICY,
-    )
+    policy = selection_policy_for_provider(block.identity.provider)
     decision = select_join_candidate(
         [candidate for _, candidate in contexts],
         policy,

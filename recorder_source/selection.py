@@ -133,6 +133,116 @@ def candidate_quality_rank(
     )
 
 
+def same_selection_candidate(
+    left: Union[Mapping[str, object], SourceCandidate],
+    right: Union[Mapping[str, object], SourceCandidate],
+) -> bool:
+    """Return whether two rows identify the same playlist candidate."""
+    left_candidate = _as_candidate(left)
+    right_candidate = _as_candidate(right)
+    left_index = int(left_candidate.matching_entry_index or 0)
+    right_index = int(right_candidate.matching_entry_index or 0)
+
+    if left_index > 0 and right_index > 0:
+        return (
+            str(left_candidate.playlist_url or "")
+            == str(right_candidate.playlist_url or "")
+            and left_index == right_index
+        )
+
+    return (
+        str(left_candidate.stream_url or "")
+        == str(right_candidate.stream_url or "")
+        and str(left_candidate.final_stream_url or "")
+        == str(right_candidate.final_stream_url or "")
+        and tuple(sorted(left_candidate.headers.items()))
+        == tuple(sorted(right_candidate.headers.items()))
+        and tuple(left_candidate.keys) == tuple(right_candidate.keys)
+    )
+
+
+def selection_nonselection_reason(
+    candidate: Union[Mapping[str, object], SourceCandidate],
+    selected_candidate: Optional[
+        Union[Mapping[str, object], SourceCandidate]
+    ],
+    policy: SelectionPolicy,
+    *,
+    now_ts: Optional[float] = None,
+) -> str:
+    """Explain why one working candidate lost to the selected candidate."""
+    current = _as_candidate(candidate)
+    if selected_candidate is None or not current.launchable:
+        return ""
+
+    selected = _as_candidate(selected_candidate)
+    if same_selection_candidate(current, selected):
+        return ""
+
+    now = time.time() if now_ts is None else float(now_ts)
+    min_remaining_sec = int(policy.mandatory_min_remaining_sec)
+
+    def stable_for_join(item: SourceCandidate) -> bool:
+        expiry = item.expiry
+        return (
+            expiry is None
+            or float(expiry) - now >= min_remaining_sec
+        )
+
+    if stable_for_join(selected) and not stable_for_join(current):
+        minutes = int(min_remaining_sec / 60)
+        return f"not selected: less than {minutes} min remaining"
+
+    if int(current.preferred_qualifier_score or 0) < int(
+        selected.preferred_qualifier_score or 0
+    ):
+        return "not selected: less preferred match"
+
+    current_video_rank = video_quality_rank(
+        current,
+        motion_cap_fps=policy.motion_cap_fps,
+    )
+    selected_video_rank = video_quality_rank(
+        selected,
+        motion_cap_fps=policy.motion_cap_fps,
+    )
+
+    if current_video_rank < selected_video_rank:
+        if (
+            current_video_rank[:-1] == selected_video_rank[:-1]
+            and current_video_rank[-1] <= 0
+            and selected_video_rank[-1] > 0
+        ):
+            return "not selected: bitrate unknown"
+        return "not selected: lower quality"
+
+    current_expiry = current.expiry
+    selected_expiry = selected.expiry
+
+    if current_video_rank == selected_video_rank:
+        if (
+            current_expiry is not None
+            and selected_expiry is not None
+            and float(current_expiry) < float(selected_expiry)
+        ):
+            return "not selected: expires sooner"
+
+        if current_expiry is None and selected_expiry is not None:
+            if not policy.prefer_unknown_expiry_on_equal_quality:
+                return "not selected: expiry unknown"
+
+        if current_expiry is not None and selected_expiry is None:
+            if policy.prefer_unknown_expiry_on_equal_quality:
+                return (
+                    "not selected: equal quality; "
+                    "unknown-expiry source preferred"
+                )
+
+        return "not selected: equivalent alternative"
+
+    return "not selected: another candidate ranked higher"
+
+
 def select_join_candidate(
     candidates: Sequence[SourceCandidate],
     policy: SelectionPolicy,

@@ -6,14 +6,13 @@ rendering and terminal side effects live in recorder_coordinator.terminal.
 
 from __future__ import annotations
 
-import time
 from datetime import datetime
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from recorder_source.identity import derive_feed_identity
 from recorder_source.models import SourceCandidate
-from recorder_source.policy import DEFAULT_SELECTION_POLICY, PROVIDER_SELECTION_POLICIES
+from recorder_source.policy import selection_policy_for_provider
 from recorder_source.quality import format_candidate_quality
 from recorder_source.selection import select_join_candidate, video_quality_rank
 
@@ -24,9 +23,6 @@ from .models import (
     SourceObservation,
     TargetView,
 )
-
-
-PROVIDER_SELECTION_POLICY = PROVIDER_SELECTION_POLICIES
 
 
 def compact_source_name(url: str) -> str:
@@ -110,7 +106,7 @@ def _candidate_observation_key(candidate: SourceCandidate) -> Tuple[object, ...]
 
 def candidate_state(candidate: SourceCandidate) -> str:
     provider = str(candidate.extra.get("provider") or "UNKNOWN").upper()
-    policy = PROVIDER_SELECTION_POLICY.get(provider, DEFAULT_SELECTION_POLICY)
+    policy = selection_policy_for_provider(provider)
     if (
         candidate.launchable
         and candidate.expiry is None
@@ -160,6 +156,8 @@ def quality_text(
 def _best_candidate(
     candidates: Sequence[SourceCandidate],
     provider: str,
+    *,
+    now_ts: Optional[float] = None,
 ) -> Optional[SourceCandidate]:
     working = [
         candidate
@@ -168,8 +166,8 @@ def _best_candidate(
     ]
     if not working:
         return None
-    policy = PROVIDER_SELECTION_POLICY.get(provider, DEFAULT_SELECTION_POLICY)
-    decision = select_join_candidate(working, policy, now_ts=time.time())
+    policy = selection_policy_for_provider(provider)
+    decision = select_join_candidate(working, policy, now_ts=now_ts)
     return decision.selected
 
 
@@ -177,6 +175,8 @@ def _build_source_observation(
     source_id: str,
     candidates: Sequence[SourceCandidate],
     provider: str,
+    *,
+    now_ts: Optional[float] = None,
 ) -> SourceObservation:
     event_names = tuple(
         dict.fromkeys(
@@ -199,7 +199,7 @@ def _build_source_observation(
             if str(item.group_title or "").strip()
         )
     )
-    best = _best_candidate(candidates, provider)
+    best = _best_candidate(candidates, provider, now_ts=now_ts)
     candidate_states = tuple(sorted(candidate_state(item) for item in candidates))
     states = set(candidate_states)
     state = "WORKING" if "WORKING" in states else sorted(states)[0] if states else "UNUSABLE"
@@ -269,8 +269,14 @@ def build_snapshot(
         by_source: Dict[str, List[SourceCandidate]] = {}
         for candidate in block.candidates:
             by_source.setdefault(_candidate_source_id(candidate), []).append(candidate)
+        snapshot_ts = current_time.timestamp()
         block.observations = {
-            source_id: _build_source_observation(source_id, candidates, block.identity.provider)
+            source_id: _build_source_observation(
+                source_id,
+                candidates,
+                block.identity.provider,
+                now_ts=snapshot_ts,
+            )
             for source_id, candidates in by_source.items()
         }
         for candidate in block.candidates:
@@ -281,7 +287,11 @@ def build_snapshot(
             if previous_entry is None or previous_entry[0] != signature:
                 row_update_registry[global_key] = (signature, current_time)
             block.row_last_updated[row_key] = row_update_registry[global_key][1]
-        block.best_candidate = _best_candidate(block.candidates, block.identity.provider)
+        block.best_candidate = _best_candidate(
+            block.candidates,
+            block.identity.provider,
+            now_ts=current_time.timestamp(),
+        )
         block.overall_state = "AVAILABLE" if block.best_candidate is not None else "UNUSABLE"
 
     return DashboardSnapshot(
@@ -414,7 +424,7 @@ def diff_snapshots(
             and old.best_candidate is not None
             and new.best_candidate is not None
         ):
-            policy = PROVIDER_SELECTION_POLICY.get(new.identity.provider, DEFAULT_SELECTION_POLICY)
+            policy = selection_policy_for_provider(new.identity.provider)
             old_rank = video_quality_rank(
                 old.best_candidate, motion_cap_fps=policy.motion_cap_fps
             )

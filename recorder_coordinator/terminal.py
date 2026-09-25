@@ -18,6 +18,11 @@ except ImportError:  # pragma: no cover - non-Windows development/test hosts
 
 from recorder_runtime import sound as runtime_sound
 from recorder_runtime.sound import SoundSnoozeState
+from recorder_source.policy import selection_policy_for_provider
+from recorder_source.selection import (
+    same_selection_candidate,
+    selection_nonselection_reason,
+)
 
 from .models import (
     ChangeEvent,
@@ -539,6 +544,18 @@ def render_dashboard(
 
                     state_text = candidate_state(candidate)
                     on_off = "[ON]" if state_text == "WORKING" else _off_text("[OFF]", color)
+                    selection_marker = ""
+                    selection_reason = ""
+                    if state_text == "WORKING" and block.best_candidate is not None:
+                        if same_selection_candidate(candidate, block.best_candidate):
+                            selection_marker = " " + _marker("[SELECTED]", color)
+                        else:
+                            selection_reason = selection_nonselection_reason(
+                                candidate,
+                                block.best_candidate,
+                                selection_policy_for_provider(block.identity.provider),
+                                now_ts=snapshot.created_at.timestamp(),
+                            )
                     event_name = candidate.entry_title or candidate.tvg_name or "-"
                     tvg_name = candidate.tvg_name or "-"
                     group_name = candidate.group_title or "-"
@@ -569,6 +586,11 @@ def render_dashboard(
                         if state_text == "WORKING"
                         else " | " + _off_text(state_text, color)
                     )
+                    trailing_selection = (
+                        " | " + _secondary_text(selection_reason, color)
+                        if selection_reason
+                        else ""
+                    )
                     source_reference = effective_source_references.get(
                         str(source.source_id)
                     )
@@ -579,7 +601,7 @@ def render_dashboard(
                     )
                     lines.append(
                         "        "
-                        f"{marker_prefix}{on_off} "
+                        f"{marker_prefix}{on_off}{selection_marker} "
                         f"{_event_title(event_name, color)} | "
                         f"{_secondary_text(tvg_name, color)} | "
                         f"{_group_text(group_name, color)} | "
@@ -587,6 +609,7 @@ def render_dashboard(
                         f"{_secondary_text(last_updated_text, color)} | "
                         f"{_secondary_text(freshness_text, color)}"
                         f"{trailing_state}"
+                        f"{trailing_selection}"
                     )
                     for detail in details_to_show:
                         lines.append(
