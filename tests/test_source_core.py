@@ -22,8 +22,10 @@ from recorder_source.discovery import (
     resolve_playlist_source_freshness,
 )
 from recorder_source.quality import (
+    extract_auth_expiry,
     format_candidate_quality,
     inspect_dash_manifest_drm,
+    parse_dash_manifest_quality,
     parse_ffprobe_quality_output,
     quality_probe_identity,
 )
@@ -575,6 +577,51 @@ https://edge.drmlive.net/live.mpd
         self.assertEqual((out.video_width, out.video_height, out.video_fps), (1920, 1080, 50.0))
         self.assertEqual(out.final_stream_url, "https://final.test/master.m3u8")
         self.assertTrue(out.playback_fingerprint)
+
+    def test_shared_auth_expiry_uses_mature_syntax(self):
+        self.assertEqual(
+            extract_auth_expiry(
+                "https://cdn.test/live.m3u8?exp=2000",
+                "Cookie=foo;expires=1500",
+            ),
+            1500,
+        )
+        self.assertIsNone(
+            extract_auth_expiry("https://cdn.test/live.m3u8?expiry=1234")
+        )
+
+    def test_shared_dash_parser_preserves_mature_representation_addressing(self):
+        manifest = """<?xml version="1.0"?>
+<MPD type="static">
+  <Period>
+    <AdaptationSet contentType="video">
+      <Representation id="v25" width="1920" height="1080" bandwidth="5000000" frameRate="25">
+        <BaseURL>video/</BaseURL>
+        <SegmentTemplate initialization="init-$RepresentationID$.mp4" media="seg-$Number%03d$.m4s" startNumber="7" duration="2" timescale="1"/>
+      </Representation>
+      <Representation id="v50" width="1920" height="1080" bandwidth="4500000" frameRate="50" scanType="progressive">
+        <BaseURL>video50/</BaseURL>
+        <SegmentTemplate initialization="init-$RepresentationID$.mp4" media="seg-$Number%03d$.m4s" startNumber="11" duration="2" timescale="1"/>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"""
+        quality = parse_dash_manifest_quality(
+            manifest,
+            "https://cdn.test/live/manifest.mpd",
+            motion_cap_fps=50.0,
+            now_ts=1000.0,
+        )
+        self.assertEqual(quality["video_fps"], 50.0)
+        self.assertEqual(quality["_dash_representation_id"], "v50")
+        self.assertEqual(
+            quality["_dash_initialization_url"],
+            "https://cdn.test/live/video50/init-v50.mp4",
+        )
+        self.assertEqual(
+            quality["_dash_media_urls"][0],
+            "https://cdn.test/live/video50/seg-011.m4s",
+        )
 
     def test_shared_dash_drm_inspection_marks_content_protection_key_required(self):
         manifest = '''<?xml version="1.0"?><MPD><Period><AdaptationSet><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" value="Widevine"/><Representation width="1920" height="1080" bandwidth="4500000" frameRate="25"/></AdaptationSet></Period></MPD>'''
