@@ -19,7 +19,9 @@ class TerminalHostTests(unittest.TestCase):
             worker,
             title="Recorder — Example",
             cwd=Path(r"C:\Recorder"),
+            post_exit_cwd=Path(r"C:\My PC Recordings\Manual Recordings"),
             platform_name="win32",
+            windows_shell="cmd.exe",
         )
 
         self.assertEqual(argv[:4], ["wt.exe", "-w", "0", "new-tab"])
@@ -28,6 +30,37 @@ class TerminalHostTests(unittest.TestCase):
         self.assertIn("/k", argv)
         self.assertNotIn("CREATE_NEW_CONSOLE", " ".join(argv))
         self.assertIn("recorder_identity_worker.py", argv[-1])
+        self.assertIn(
+            r'cd /d "C:\My PC Recordings\Manual Recordings"',
+            argv[-1],
+        )
+
+    def test_windows_worker_matches_powershell_coordinator_shell(self):
+        worker = [
+            r"C:\Python\python.exe",
+            r"C:\Recorder\recorder_identity_worker.py",
+            "--request",
+            r"C:\Temp\request.json",
+        ]
+
+        argv = build_terminal_tab_argv(
+            worker,
+            title="Recorder — Example",
+            cwd=Path(r"C:\Recorder"),
+            post_exit_cwd=Path(r"C:\My PC Recordings\Manual Recordings"),
+            platform_name="win32",
+            windows_shell="powershell.exe",
+        )
+
+        self.assertIn("powershell.exe", argv)
+        self.assertIn("-NoExit", argv)
+        self.assertIn("-Command", argv)
+        self.assertNotIn("cmd.exe", argv)
+        self.assertIn("recorder_identity_worker.py", argv[-1])
+        self.assertIn(
+            "Set-Location -LiteralPath 'C:\\My PC Recordings\\Manual Recordings'",
+            argv[-1],
+        )
 
     def test_macos_worker_opens_new_terminal_tab_and_keeps_shell(self):
         worker = [
