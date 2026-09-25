@@ -149,17 +149,21 @@ class ManualRecordLaunchTests(unittest.TestCase):
             status = store.prepare_session()
             captured = {}
 
-            def fake_launch(request, registry_store):
+            def fake_launch(request, registry_store, *, config_path):
                 captured["request"] = request
                 captured["store"] = registry_store
+                captured["config_path"] = config_path
                 return type("Result", (), {"pid": 4321})()
 
             with patch.object(coord, "launch_identity_worker", fake_launch):
+                config_path = Path(td) / "config.py"
+                config_path.write_text("# test config\n", encoding="utf-8")
                 plan, result = coord._launch_manual_identity(
                     snap,
                     identity_key,
                     registry_session_id=status.session_id,
                     registry_store=store,
+                    config_path=config_path,
                 )
 
             request = captured["request"]
@@ -176,6 +180,10 @@ class ManualRecordLaunchTests(unittest.TestCase):
             self.assertEqual(
                 request.registry_session_id,
                 status.session_id,
+            )
+            self.assertEqual(
+                captured["config_path"],
+                config_path,
             )
 
 
