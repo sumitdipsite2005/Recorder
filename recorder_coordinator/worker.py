@@ -33,6 +33,7 @@ def launch_identity_worker(
     request: IdentityLaunchRequest,
     registry_store: IdentityRegistryStore,
     *,
+    config_path: Path,
     popen_factory: Optional[Callable[..., object]] = None,
 ) -> WorkerLaunchResult:
     """Claim one identity and create its independent recorder process."""
@@ -50,11 +51,19 @@ def launch_identity_worker(
         )
         claimed = True
 
+        resolved_config = Path(config_path).resolve()
+        if not resolved_config.is_file():
+            raise RuntimeError(
+                f"Recorder config not found: {resolved_config}"
+            )
+
         command = [
             sys.executable,
             str(_worker_script_path()),
             "--request",
             str(request_path),
+            "--config",
+            str(resolved_config),
         ]
         kwargs = {
             "cwd": str(_worker_script_path().parent),
