@@ -45,6 +45,7 @@ class WorkerLaunchTests(unittest.TestCase):
                     primary=("example",),
                 ),
             ),
+            recovery_playlist_urls=("https://example.test/list.m3u",),
             recording_duration_min=60,
             base_name="Example Event",
         )
