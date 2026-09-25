@@ -16,6 +16,8 @@ from recorder_coordinator.registry import (
     IdentityRegistryStore,
     STATE_ACTIVE,
     STATE_CRASHED,
+    STATE_ENDED,
+    STATE_MANUALLY_STOPPED,
 )
 from recorder_runtime.identity_launch import read_launch_request
 
@@ -62,20 +64,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     try:
-        record_dynamic.run_recorder_process(
+        outcome = record_dynamic.run_recorder_process(
             identity_launch_request=request,
         )
-    except Exception as error:
-        registry_store.transition(
-            identity_key=request.identity_key,
-            new_state=STATE_CRASHED,
-            worker_pid=os.getpid(),
-            reason=f"worker failed: {type(error).__name__}: {error}",
-            expected_session_id=request.registry_session_id,
-        )
-        raise
 
-    return 0
+        if outcome.status == "manual_stopped":
+            registry_store.transition(
+                identity_key=request.identity_key,
+                new_state=STATE_MANUALLY_STOPPED,
+                worker_pid=os.getpid(),
+                reason=outcome.reason,
+                expected_session_id=request.registry_session_id,
+            )
+            return 0
+
+        if outcome.status == "ended":
+            registry_store.transition(
+                identity_key=request.identity_key,
+                new_state=STATE_ENDED,
+                worker_pid=os.getpid(),
+                reason=outcome.reason,
+                expected_session_id=request.registry_session_id,
+            )
+            return 0
+
+        raise RuntimeError(
+            "mature recorder returned a non-terminal-success outcome: "
+            f"{outcome.status}: {outcome.reason}"
+        )
+
+    except BaseException as error:
+        try:
+            registry = registry_store.read()
+            entry = registry["entries"].get(request.identity_key)
+            if (
+                isinstance(entry, dict)
+                and entry.get("state") == STATE_ACTIVE
+            ):
+                registry_store.transition(
+                    identity_key=request.identity_key,
+                    new_state=STATE_CRASHED,
+                    worker_pid=os.getpid(),
+                    reason=f"worker failed: {type(error).__name__}: {error}",
+                    expected_session_id=request.registry_session_id,
+                )
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
