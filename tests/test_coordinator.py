@@ -117,7 +117,7 @@ class ManualRecordLaunchTests(unittest.TestCase):
 
             self.assertEqual(
                 coord._manual_record_choices(snap, display_order, store),
-                (identity_key,),
+                ((1, identity_key),),
             )
             store.claim(
                 identity_key=identity_key,
@@ -134,6 +134,42 @@ class ManualRecordLaunchTests(unittest.TestCase):
                 (coord.POLICY_MANUAL, identity_key),
                 snap.blocks,
             )
+
+    def test_manual_record_choices_preserve_dashboard_numbers_when_first_is_blocked(self):
+        first = sony_candidate(lane="1/A/ENG", title="First Event")
+        second = sony_candidate(lane="2/B/ENG", title="Second Event")
+        snap = snapshot([first, second])
+        identities = [
+            identity
+            for policy, identity in snap.blocks
+            if policy == coord.POLICY_MANUAL
+        ]
+        display_order = {
+            coord.POLICY_ALL: [],
+            coord.POLICY_MANUAL: identities,
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = coord.build_recorder_output_paths(Path(td) / "Recordings")
+            store = coord.IdentityRegistryStore(paths)
+            status = store.prepare_session()
+            store.claim(
+                identity_key=identities[0],
+                provider="SONYLIV",
+                display_name="First Event",
+                expected_session_id=status.session_id,
+            )
+
+            choices = coord._manual_record_choices(
+                snap,
+                display_order,
+                store,
+            )
+
+        self.assertEqual(choices, ((2, identities[1]),))
+        rendered = coord.render_manual_record_menu(snap, choices)
+        self.assertIn("  2. Second Event", rendered)
+        self.assertNotIn("  1. First Event", rendered)
 
     def test_manual_launch_handoff_contains_selected_exact_source_and_identity(self):
         snap = snapshot([sony_candidate()])
@@ -556,6 +592,29 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("ACTIVE RECORDINGS",rendered)
         self.assertIn("[ACTIVE] ENG _ Asian Games | SONYLIV | PID 4321",rendered)
 
+        colored=coord.render_dashboard(
+            snap,
+            (),
+            use_color=True,
+            registry_entries={
+                identity_key:{
+                    "identity":identity_key,
+                    "provider":"SONYLIV",
+                    "display_name":"ENG _ Asian Games",
+                    "state":"ACTIVE",
+                    "worker_pid":4321,
+                }
+            },
+        )
+        self.assertIn(
+            "\033[38;2;41;159;214mACTIVE RECORDINGS\033[0m",
+            colored,
+        )
+        self.assertIn(
+            "\033[38;2;255;135;3m[ACTIVE]\033[0m",
+            colored,
+        )
+
     def test_dashboard_terminal_registry_state_suppresses_available_label(self):
         snap=snapshot([sony_candidate()])
         identity_key=next(
@@ -893,11 +952,13 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertNotIn("I  Coordinator information & controls",rendered)
         self.assertIn("S  Sound / notification snooze",rendered)
 
-    def test_watch_footer_advertises_info_not_nested_sound_control(self):
+    def test_watch_footer_advertises_record_and_f5_refresh(self):
         rendered=coord.watch_status_text(0.0,coord.time.monotonic()+60)
+        self.assertIn("r=record",rendered)
         self.assertIn("i=info",rendered)
         self.assertNotIn("s=sound",rendered)
-        self.assertIn("r=refresh",rendered)
+        self.assertIn("F5=refresh",rendered)
+        self.assertNotIn("p=record",rendered)
 
     def test_sound_snooze_menu_has_coordinator_scopes_only(self):
         state=coord.SoundSnoozeState()
@@ -998,6 +1059,49 @@ class SnapshotAndChangeTests(unittest.TestCase):
         with patch.object(coord.os,"name","nt"), patch.object(coord,"msvcrt",FakeMsvcrt):
             coord._command_reader(q,stop)
         self.assertEqual(q.get_nowait(),"r")
+
+    def test_windows_command_reader_maps_f5_to_refresh_command(self):
+        q=queue.Queue()
+        stop=threading.Event()
+        keys=iter(["\x00","\x3f"])
+
+        class FakeMsvcrt:
+            @staticmethod
+            def kbhit():
+                return True
+            @staticmethod
+            def getwch():
+                value=next(keys)
+                if value=="\x3f":
+                    stop.set()
+                return value
+
+        with patch.object(coord.os,"name","nt"), patch.object(coord,"msvcrt",FakeMsvcrt):
+            coord._command_reader(q,stop)
+        self.assertEqual(q.get_nowait(),"__F5__")
+
+
+class RegistryStateChangeTests(unittest.TestCase):
+    def test_registry_state_changes_report_only_state_transitions(self):
+        old={
+            "id-a":{"state":"ACTIVE","reason":"started"},
+            "id-b":{"state":"ACTIVE","reason":"started"},
+        }
+        new={
+            "id-a":{"state":"WAITING_FOR_SOURCE","reason":"source unavailable"},
+            "id-b":{"state":"ACTIVE","reason":"metadata changed"},
+            "id-c":{"state":"LAUNCHING","reason":"launch requested"},
+        }
+
+        changes=coord._registry_state_changes(old,new)
+
+        self.assertEqual(
+            changes,
+            (
+                ("id-a","ACTIVE","WAITING_FOR_SOURCE","source unavailable"),
+                ("id-c","-","LAUNCHING","launch requested"),
+            ),
+        )
 
 
 class TimingTests(unittest.TestCase):
