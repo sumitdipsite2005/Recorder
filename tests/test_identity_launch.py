@@ -45,6 +45,7 @@ class IdentityLaunchRequestTests(unittest.TestCase):
             selected_source_group="SONYLIV_EVENTS",
             selected_candidate=candidate,
             target_intents=(target,),
+            recovery_playlist_urls=("https://example.test/list.m3u",),
             recording_duration_min=120.0,
             base_name="Example Event",
         )
@@ -73,6 +74,10 @@ class IdentityLaunchRequestTests(unittest.TestCase):
             loaded.target_intents[0].primary,
             request.target_intents[0].primary,
         )
+        self.assertEqual(
+            loaded.recovery_playlist_urls,
+            ("https://example.test/list.m3u",),
+        )
         self.assertEqual(loaded.recording_duration_min, 120.0)
 
     def test_temp_handoff_can_be_consumed_and_deleted(self):
@@ -99,6 +104,7 @@ class IdentityLaunchRequestTests(unittest.TestCase):
                     launchable=False,
                 ),
                 target_intents=request.target_intents,
+                recovery_playlist_urls=request.recovery_playlist_urls,
                 recording_duration_min=request.recording_duration_min,
                 base_name=request.base_name,
             )
