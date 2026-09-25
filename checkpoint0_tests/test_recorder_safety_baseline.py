@@ -19,6 +19,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from recorder_source import discovery as shared_discovery
+from recorder_source import quality as shared_quality
 
 
 HERE = Path(__file__).resolve().parent
@@ -382,6 +383,30 @@ https://example.test/rejected.m3u8
             RECORDER.normalize_nm3u8dl_playlist_license_key(payload),
             list(shared_discovery.normalize_playlist_license_key(payload)),
         )
+
+    def test_mature_and_shared_dash_parser_are_identical(self):
+        manifest = """<?xml version="1.0"?>
+<MPD type="static">
+  <Period>
+    <AdaptationSet contentType="video">
+      <Representation id="v25" width="1280" height="720" bandwidth="2500000" frameRate="25"/>
+      <Representation id="v50" width="1920" height="1080" bandwidth="4500000" frameRate="50" scanType="progressive">
+        <BaseURL>video/</BaseURL>
+        <SegmentTemplate initialization="init-$RepresentationID$.mp4" media="seg-$Number$.m4s" startNumber="3" duration="2" timescale="1"/>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"""
+        mature = RECORDER._parse_nm3u8dl_dash_manifest_quality(
+            manifest,
+            "https://cdn.test/live/manifest.mpd",
+        )
+        shared = shared_quality.parse_dash_manifest_quality(
+            manifest,
+            "https://cdn.test/live/manifest.mpd",
+            motion_cap_fps=RECORDER.NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+        )
+        self.assertEqual(mature, shared)
 
     def test_mature_access_classification_uses_shared_rule(self):
         RECORDER.NM3U8DL_PLAYLIST_GROUP = "FANCODE"
