@@ -28,6 +28,14 @@ class RecorderOutputPathTests(unittest.TestCase):
                 paths.coordinator_logs,
                 root / "recorder_logs" / "coordinator_logs",
             )
+            self.assertEqual(
+                paths.identity_registry,
+                root / "recorder_logs" / "identity_registry",
+            )
+            self.assertEqual(
+                paths.identity_registry_archive,
+                root / "recorder_logs" / "identity_registry" / "archive",
+            )
 
     def test_missing_output_root_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "RECORDING_OUTPUT_DIR is required"):
