@@ -98,6 +98,7 @@ class IdentityLaunchRequest:
     selected_source_group: str
     selected_candidate: SourceCandidate
     target_intents: Tuple[FrozenTargetIntent, ...]
+    recovery_playlist_urls: Tuple[str, ...]
     recording_duration_min: Optional[float]
     base_name: str
     version: int = LAUNCH_REQUEST_VERSION
@@ -117,6 +118,10 @@ class IdentityLaunchRequest:
             raise ValueError("selected_source_group is required")
         if not self.target_intents:
             raise ValueError("at least one frozen target intent is required")
+        if not self.recovery_playlist_urls:
+            raise ValueError("at least one frozen recovery playlist URL is required")
+        if any(not str(url).strip() for url in self.recovery_playlist_urls):
+            raise ValueError("recovery playlist URLs must be non-empty")
         if not self.base_name.strip():
             raise ValueError("base_name is required")
         if not self.selected_candidate.stream_url.strip():
@@ -154,6 +159,11 @@ class IdentityLaunchRequest:
                 for item in target_values
                 if isinstance(item, Mapping)
             ),
+            recovery_playlist_urls=tuple(
+                str(item).strip()
+                for item in (value.get("recovery_playlist_urls") or ())
+                if str(item).strip()
+            ),
             recording_duration_min=(
                 float(value["recording_duration_min"])
                 if value.get("recording_duration_min") is not None
@@ -174,6 +184,7 @@ class IdentityLaunchRequest:
                 target.to_mapping()
                 for target in self.target_intents
             ],
+            "recovery_playlist_urls": list(self.recovery_playlist_urls),
             "recording_duration_min": self.recording_duration_min,
             "base_name": self.base_name,
         }
