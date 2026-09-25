@@ -96,9 +96,14 @@ elif os.name == "nt":
 else:
     raise RuntimeError("Unsupported operating system for recorder config location.")
 
-DYNAMIC_CONFIG_PATH = os.path.join(
-    RECORDER_CONFIG_DIR,
-    "recorder_dynamic_user_config.py",
+DYNAMIC_CONFIG_PATH = os.path.abspath(
+    os.path.expanduser(
+        os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        or os.path.join(
+            RECORDER_CONFIG_DIR,
+            "recorder_dynamic_user_config.py",
+        )
+    )
 )
 
 if not os.path.isfile(DYNAMIC_CONFIG_PATH):
