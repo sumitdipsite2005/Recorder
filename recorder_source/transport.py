@@ -365,7 +365,7 @@ def _single_byte_range(byte_range: str = "") -> str:
     return f"{match.group(1)}-{match.group(1)}" if match else "0-0"
 
 
-def _resource_request_headers(
+def build_resource_request_headers(
     headers: Mapping[str, str],
     *,
     default_user_agent: str,
@@ -403,7 +403,7 @@ def resolve_http_resource_final_url(
             stop_requested=stop_requested,
         )
 
-    ranged = _resource_request_headers(
+    ranged = build_resource_request_headers(
         headers,
         default_user_agent=default_user_agent,
         byte_range=_single_byte_range(byte_range),
@@ -414,7 +414,7 @@ def resolve_http_resource_final_url(
         if int(getattr(error, "code", 0) or 0) != 416:
             raise
 
-    normal = _resource_request_headers(
+    normal = build_resource_request_headers(
         headers,
         default_user_agent=default_user_agent,
     )
