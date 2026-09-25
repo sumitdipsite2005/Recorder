@@ -74,8 +74,9 @@ def _windows_tab_argv(
             for argument in worker_command
         )
         shell_command = (
-            f"{invocation}; "
+            f"try {{ {invocation} }} finally {{ "
             f"Set-Location -LiteralPath {_powershell_quote(post_exit_cwd)}"
+            " }"
         )
         encoded_command = base64.b64encode(
             shell_command.encode("utf-16-le")

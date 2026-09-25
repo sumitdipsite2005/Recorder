@@ -60,8 +60,10 @@ class TerminalHostTests(unittest.TestCase):
         self.assertNotIn("cmd.exe", argv)
         decoded = base64.b64decode(argv[-1]).decode("utf-16-le")
         self.assertIn("recorder_identity_worker.py", decoded)
+        self.assertIn("try { & ", decoded)
         self.assertIn(
-            "Set-Location -LiteralPath 'C:\\My PC Recordings\\Manual Recordings'",
+            "} finally { Set-Location -LiteralPath "
+            "'C:\\My PC Recordings\\Manual Recordings' }",
             decoded,
         )
         self.assertFalse(any("Set-Location" in argument for argument in argv[:-1]))
