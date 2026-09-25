@@ -8,6 +8,7 @@ of this module.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -31,7 +32,12 @@ from .quality import (
     quality_probe_identity,
     sample_stream_video_bitrate,
 )
-from .policy import PLAYLIST_GROUP_LIFECYCLES
+from .policy import (
+    PLAYLIST_GROUP_LIFECYCLES,
+    PLAYLIST_USER_AGENTS,
+    PROVIDER_ADDED_HEADERS,
+)
+from . import transport as source_transport
 from .selection import normalize_video_scan_type
 from .models import (
     PlaylistSourceSpec,
@@ -41,29 +47,6 @@ from .models import (
 )
 
 
-
-PROVIDER_PROBE_HEADERS = {
-    "SONYLIV": {
-        "Accept": "*/*",
-        "Origin": "https://www.sonyliv.com",
-        "Referer": "https://www.sonyliv.com/",
-        "Sec-GPC": "1",
-    },
-    "FANCODE": {
-        "Accept": "*/*",
-        "Origin": "https://www.fancode.com",
-        "Referer": "https://www.fancode.com/",
-        "Sec-GPC": "1",
-    },
-    "HOTSTAR": {
-        "Accept": "*/*",
-        "Sec-GPC": "1",
-    },
-    "KHEL": {
-        "Accept": "*/*",
-        "Sec-GPC": "1",
-    },
-}
 
 JSON_RECORD_LIST_ALIASES = ("channels", "streams", "items", "entries", "data")
 JSON_FIELD_ALIASES = {
@@ -84,11 +67,38 @@ JSON_HEADER_FIELD_ALIASES = {
 }
 JSON_HEADER_OBJECT_ALIASES = ("headers", "http_headers", "request_headers")
 
-DEFAULT_HTTP_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-)
 
+def build_effective_probe_headers(
+    provider: str,
+    candidate_headers: Optional[Mapping[str, object]] = None,
+    *,
+    base_headers: Optional[Mapping[str, object]] = None,
+    default_user_agent: Optional[str] = None,
+) -> Dict[str, str]:
+    """Build effective stream-request headers with mature precedence."""
+    provider_name = str(provider or "UNKNOWN").strip().upper()
+    headers: Dict[str, str] = {}
+    defaults = (
+        dict(base_headers)
+        if base_headers is not None
+        else dict(PROVIDER_ADDED_HEADERS.get(provider_name, {}))
+    )
+    _apply_headers(headers, defaults)
+    _apply_headers(headers, candidate_headers or {})
+    has_user_agent = any(
+        str(name).casefold() == "user-agent" and str(value).strip()
+        for name, value in headers.items()
+    )
+    if not has_user_agent:
+        fallback = str(
+            default_user_agent
+            if default_user_agent is not None
+            else PLAYLIST_USER_AGENTS.get("DEFAULT", "")
+        ).strip()
+        if not fallback:
+            raise RuntimeError("Missing DEFAULT user-agent profile")
+        headers["User-Agent"] = fallback
+    return headers
 
 def _normalize_json_field_name(value: str) -> str:
     return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
@@ -338,10 +348,65 @@ def _parse_stream_url_and_headers(
     return clean_url.strip(), headers
 
 
-def _playlist_license_metadata(option_lines: Sequence[str]) -> Tuple[str, Tuple[str, ...], str]:
+def _b64url_decode(value: str) -> bytes:
+    text = str(value or "").strip()
+    padding = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + padding)
+
+
+def normalize_playlist_license_key(value: str) -> Tuple[str, ...]:
+    """Normalize the ClearKey metadata forms already supported by mature ONE BEST."""
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    if not text.startswith("{"):
+        return (text,)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return (text,)
+    jwk_keys = data.get("keys") if isinstance(data, dict) else None
+    if not isinstance(jwk_keys, list):
+        return (text,)
+
+    normalized: List[str] = []
+    for item in jwk_keys:
+        if not isinstance(item, dict):
+            continue
+        kty = str(item.get("kty") or "").strip().casefold()
+        kid_b64 = str(item.get("kid") or "").strip()
+        key_b64 = str(item.get("k") or "").strip()
+        if kty != "oct" or not kid_b64 or not key_b64:
+            continue
+        try:
+            kid_hex = _b64url_decode(kid_b64).hex()
+            key_hex = _b64url_decode(key_b64).hex()
+        except Exception as error:
+            raise RuntimeError(
+                "Invalid base64url value in ClearKey JWK license_key"
+            ) from error
+        if len(kid_hex) != 32 or len(key_hex) != 32:
+            raise RuntimeError(
+                "Invalid ClearKey JWK license_key: "
+                "KID and key must each decode to 16 bytes"
+            )
+        pair = f"{kid_hex}:{key_hex}"
+        if pair not in normalized:
+            normalized.append(pair)
+
+    if not normalized:
+        raise RuntimeError(
+            "ClearKey JWK license_key contained no usable oct keys"
+        )
+    return tuple(normalized)
+
+
+def _playlist_license_metadata(
+    option_lines: Sequence[str],
+    stream_url: str = "",
+) -> Tuple[str, Tuple[str, ...], str]:
     license_type = ""
     keys: List[str] = []
-    unsupported_drm = ""
     type_prefix = "#KODIPROP:inputstream.adaptive.license_type="
     key_prefix = "#KODIPROP:inputstream.adaptive.license_key="
     for raw_line in option_lines:
@@ -349,12 +414,29 @@ def _playlist_license_metadata(option_lines: Sequence[str]) -> Tuple[str, Tuple[
         if line.casefold().startswith(type_prefix.casefold()):
             license_type = line[len(type_prefix):].strip()
         elif line.casefold().startswith(key_prefix.casefold()):
-            value = line[len(key_prefix):].strip()
-            if value and value not in keys:
-                keys.append(value)
+            for value in normalize_playlist_license_key(
+                line[len(key_prefix):].strip()
+            ):
+                if value not in keys:
+                    keys.append(value)
+
     normalized_type = license_type.casefold().replace("-", "").replace("_", "")
-    if "widevine" in normalized_type:
-        unsupported_drm = "Widevine"
+    try:
+        parsed = urlsplit(str(stream_url or ""))
+        host = str(parsed.hostname or "").casefold()
+        path = str(parsed.path or "").casefold()
+    except Exception:
+        host = ""
+        path = str(stream_url or "").casefold()
+    direct_drmlive_dash = bool(
+        (host == "drmlive.net" or host.endswith(".drmlive.net"))
+        and path.endswith(".mpd")
+    )
+    unsupported_drm = (
+        "Widevine"
+        if "widevine" in normalized_type and direct_drmlive_dash
+        else ""
+    )
     return license_type, tuple(keys), unsupported_drm
 
 
@@ -438,7 +520,10 @@ def parse_playlist_text(
         stream_url, headers = _parse_stream_url_and_headers(raw_stream_url, option_lines)
         merged_headers = dict(stream_headers or {})
         merged_headers.update(headers)
-        license_type, keys, unsupported_drm = _playlist_license_metadata(option_lines)
+        license_type, keys, unsupported_drm = _playlist_license_metadata(
+            option_lines,
+            stream_url,
+        )
         candidates.append(
             SourceCandidate(
                 playlist_url=playlist_url,
@@ -942,12 +1027,7 @@ def _parse_dash_quality(text: str) -> Tuple[bool, int, int, float, int, str, boo
 
 def _effective_probe_headers(candidate: SourceCandidate) -> Dict[str, str]:
     provider = str(candidate.extra.get("provider") or "UNKNOWN").strip().upper()
-    headers = {"User-Agent": DEFAULT_HTTP_USER_AGENT}
-    headers.update(PROVIDER_PROBE_HEADERS.get(provider, {}))
-    # Playlist/source metadata wins over profile defaults, matching the mature
-    # recorder's precedence direction.
-    headers.update(dict(candidate.headers or {}))
-    return headers
+    return build_effective_probe_headers(provider, candidate.headers)
 
 
 def _merge_expiries(*values: Optional[float]) -> Optional[float]:
@@ -966,7 +1046,7 @@ def _candidate_url_header_expiry(candidate: SourceCandidate) -> Optional[float]:
 def probe_candidate_hls(
     candidate: SourceCandidate,
     *,
-    timeout_sec: float = 15.0,
+    timeout_sec: Optional[float] = None,
 ) -> SourceCandidate:
     """Inspect one normalized candidate and return shared quality/probe facts."""
     if not candidate.stream_url:
@@ -978,6 +1058,11 @@ def probe_candidate_hls(
         )
 
     headers = _effective_probe_headers(candidate)
+    timeout_value = (
+        source_transport.QUALITY_HTTP_TIMEOUT_SEC
+        if timeout_sec is None
+        else float(timeout_sec)
+    )
     url_header_expiry = _candidate_url_header_expiry(candidate)
     if url_header_expiry is not None and url_header_expiry <= time.time():
         return replace(
@@ -990,11 +1075,18 @@ def probe_candidate_hls(
         )
 
     try:
-        request = Request(candidate.stream_url, headers=headers)
-        with urlopen(request, timeout=float(timeout_sec)) as response:
-            payload = response.read(1024 * 1024)
-            final_url = response.geturl()
-            content_type = str(response.headers.get("Content-Type") or "")
+        def fetch_manifest_once():
+            request = Request(candidate.stream_url, headers=headers)
+            with urlopen(request, timeout=timeout_value) as response:
+                return (
+                    response.read(1024 * 1024),
+                    response.geturl(),
+                    str(response.headers.get("Content-Type") or ""),
+                )
+
+        payload, final_url, content_type = source_transport.run_retryable_http_get(
+            fetch_manifest_once,
+        )
         text = payload.decode("utf-8", errors="replace")
         manifest_expiry = _extract_expiry(final_url, text)
         expiry = _merge_expiries(url_header_expiry, manifest_expiry)
@@ -1034,12 +1126,88 @@ def probe_candidate_hls(
                 scan_type = ""
             manifest_drm = inspect_hls_manifest_drm(text)
 
+        drm_inspection_failure = ""
+        if (
+            is_hls
+            and hls_quality
+            and not candidate.keys
+            and not manifest_drm.get("drm_key_required")
+        ):
+            variant_url = str(
+                hls_quality.get("manifest_variant_url") or ""
+            ).strip()
+            if variant_url:
+                child_text = ""
+                child_error = None
+
+                def fetch_child_once():
+                    request = Request(variant_url, headers=headers)
+                    with urlopen(request, timeout=timeout_value) as response:
+                        return response.read().decode(
+                            "utf-8-sig",
+                            errors="replace",
+                        )
+
+                try:
+                    child_text = source_transport.run_retryable_http_get(
+                        fetch_child_once,
+                    )
+                except HTTPError as error:
+                    child_error = error
+                    if int(getattr(error, "code", 0) or 0) == 403:
+                        try:
+                            child_text = (
+                                source_transport.fetch_hls_child_with_master_cookie_session(
+                                    final_url or candidate.stream_url,
+                                    variant_url,
+                                    headers,
+                                    timeout_sec=timeout_value,
+                                )
+                            )
+                            child_error = None
+                        except Exception as retry_error:
+                            child_error = retry_error
+                except Exception as error:
+                    child_error = error
+
+                if child_text:
+                    if "#EXTM3U" not in child_text:
+                        drm_inspection_failure = (
+                            "HLS child DRM inspection returned a non-HLS response"
+                        )
+                    else:
+                        child_drm = inspect_hls_manifest_drm(child_text)
+                        manifest_drm = {
+                            **dict(manifest_drm),
+                            "drm_protected": bool(
+                                manifest_drm.get("drm_protected")
+                                or child_drm.get("drm_protected")
+                            ),
+                            "drm_key_required": bool(
+                                manifest_drm.get("drm_key_required")
+                                or child_drm.get("drm_key_required")
+                            ),
+                            "drm_detail": str(
+                                child_drm.get("drm_detail")
+                                or manifest_drm.get("drm_detail")
+                                or ""
+                            ),
+                        }
+                elif child_error is not None:
+                    drm_inspection_failure = (
+                        "HLS child DRM inspection failed — "
+                        f"{type(child_error).__name__}: {child_error}"
+                    )
+
         is_playlist = bool(is_hls or is_dash)
         expired_now = expiry is not None and expiry <= time.time()
         drm_key_required = bool(manifest_drm.get("drm_key_required"))
         drm_key_missing = bool(drm_key_required and not candidate.keys)
         probe_transport_launchable = bool(
-            is_playlist and not drm_key_missing and not expired_now
+            is_playlist
+            and not drm_key_missing
+            and not expired_now
+            and not drm_inspection_failure
         )
         launchable = bool(
             probe_transport_launchable and not candidate.unsupported_drm
@@ -1220,13 +1388,19 @@ def probe_candidate_hls(
                 "drm_key_required": drm_key_required,
                 "drm_key_missing": drm_key_missing,
                 "drm_detail": str(manifest_drm.get("drm_detail") or ""),
+                "drm_inspection_failure": drm_inspection_failure,
                 "ffprobe_probe_failure": ffprobe_failure,
                 "bitrate_sample_failure": bitrate_sample_failure,
                 "probe_transport_launchable": probe_transport_launchable,
             },
         )
     except HTTPError as error:
-        blocked = int(getattr(error, "code", 0) or 0) in (401, 403, 451)
+        access = source_transport.classify_http_access_error(
+            error,
+            source_group=str(candidate.extra.get("source_group") or ""),
+            provider=str(candidate.extra.get("provider") or ""),
+        )
+        blocked = bool(access.get("blocked"))
         return replace(
             candidate,
             expiry=url_header_expiry,
@@ -1236,6 +1410,12 @@ def probe_candidate_hls(
             probe_status="access_blocked" if blocked else "probe_failed",
             probe_error=f"HTTP {getattr(error, 'code', '')}",
             reason="access blocked" if blocked else f"HTTP {getattr(error, 'code', '')}",
+            extra={
+                **dict(candidate.extra),
+                "access_block_kind": str(access.get("kind") or ""),
+                "access_block_http_status": access.get("http_status"),
+                "geo_country": access.get("geo_country"),
+            },
         )
     except (URLError, TimeoutError, OSError, ValueError) as error:
         return replace(
@@ -1330,7 +1510,7 @@ def _reuse_probe_result(
 def probe_candidates(
     candidates: Sequence[SourceCandidate],
     *,
-    timeout_sec: float = 15.0,
+    timeout_sec: Optional[float] = None,
     max_workers: int = 8,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[SourceCandidate, ...]:

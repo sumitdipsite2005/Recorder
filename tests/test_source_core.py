@@ -13,6 +13,8 @@ from recorder_source.discovery import (
     adapt_json_playlist_text,
     discover_playlist_text,
     fetch_playlist_documents,
+    build_effective_probe_headers,
+    normalize_playlist_license_key,
     parse_extinf_metadata,
     parse_playlist_text,
     probe_candidate_hls,
@@ -39,6 +41,7 @@ from recorder_source.models import (
     SourceAcquisitionRequest,
     SourceCandidate,
 )
+from recorder_source import transport as source_transport
 from recorder_source.selection import (
     candidate_quality_rank,
     comparable_motion_fps,
@@ -294,14 +297,46 @@ https://cdn.test/live.mpd
         self.assertEqual(c.keys, ("abc:def",))
         self.assertEqual(c.stream_type, "DASH")
 
-    def test_widevine_playlist_metadata_is_marked_unsupported(self):
+    def test_only_direct_drmlive_dash_widevine_wrapper_is_marked_unsupported(self):
         text = '''#EXTM3U
 #EXTINF:-1 tvg-name="A",A
 #KODIPROP:inputstream.adaptive.license_type=com.widevine.alpha
-https://cdn.test/live.mpd
+https://edge.drmlive.net/live.mpd
 '''
         c = parse_playlist_text(text).candidates[0]
         self.assertEqual(c.unsupported_drm, "Widevine")
+
+        ordinary = text.replace(
+            "https://edge.drmlive.net/live.mpd",
+            "https://cdn.test/live.mpd",
+        )
+        c2 = parse_playlist_text(ordinary).candidates[0]
+        self.assertEqual(c2.unsupported_drm, "")
+
+    def test_clearkey_jwk_normalization_matches_mature_internal_format(self):
+        payload = {
+            "keys": [{
+                "kty": "oct",
+                "kid": "uoiW1gUkaHGsQkh4SR2GoQ",
+                "k": "hgDUFTA0s8vIUvE-pLdILA",
+            }]
+        }
+        self.assertEqual(
+            normalize_playlist_license_key(json.dumps(payload)),
+            ("ba8896d605246871ac424878491d86a1:8600d4153034b3cbc852f13ea4b7482c",),
+        )
+
+    def test_effective_probe_headers_use_mature_provider_defaults(self):
+        headers = build_effective_probe_headers(
+            "SONYLIV",
+            {"Referer": "https://override.test/", "User-Agent": ""},
+        )
+        self.assertEqual(headers["Origin"], "https://www.sonyliv.com")
+        self.assertEqual(headers["Referer"], "https://override.test/")
+        self.assertIn("Chrome/142.0.0.0", headers["User-Agent"])
+
+        hotstar = build_effective_probe_headers("HOTSTAR", {})
+        self.assertIn("Chrome/141.0.0.0", hotstar["User-Agent"])
 
     def test_json_adapter_keeps_metadata_only_record(self):
         payload = json.dumps({"channels": [{"name": "A", "group": "Sports"}]})
@@ -478,6 +513,36 @@ https://cdn.test/live.mpd
         self.assertEqual(same["source"],"unknown")
         self.assertEqual(changed["source"],"observed")
         self.assertEqual(changed["timestamp"],2000.0)
+
+    def test_shared_probe_transport_retries_transient_timeout_once(self):
+        calls = []
+
+        def operation():
+            calls.append(1)
+            if len(calls) == 1:
+                raise TimeoutError("timed out")
+            return "ok"
+
+        result = source_transport.run_retryable_http_get(
+            operation,
+            sleep_fn=lambda _: None,
+        )
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(calls), 2)
+
+    def test_shared_probe_transport_does_not_retry_nontransient_http_error(self):
+        calls = []
+
+        def operation():
+            calls.append(1)
+            raise HTTPError("https://x", 404, "Not Found", {}, None)
+
+        with self.assertRaises(HTTPError):
+            source_transport.run_retryable_http_get(
+                operation,
+                sleep_fn=lambda _: None,
+            )
+        self.assertEqual(len(calls), 1)
 
     def test_probe_no_playable_source_does_not_make_network_request(self):
         c = candidate(stream_url="", launchable=False, probe_status="unprobed")
@@ -784,12 +849,23 @@ https://cdn.test/live.mpd
         self.assertEqual(quality["video_fps"], 50.0)
         self.assertEqual(quality["_ffprobe_stream_index"], 1)
 
-    def test_probe_http_403_is_access_blocked(self):
+    def test_probe_fancode_http_403_uses_mature_access_classification(self):
+        error = HTTPError("https://x", 403, "Forbidden", {}, None)
+        with patch("recorder_source.discovery.urlopen", side_effect=error):
+            out = probe_candidate_hls(candidate(
+                stream_url="https://x/live.m3u8",
+                extra={"provider": "FANCODE", "source_group": "FANCODE"},
+            ))
+        self.assertTrue(out.access_blocked)
+        self.assertEqual(out.probe_status, "access_blocked")
+        self.assertEqual(out.extra["access_block_kind"], "vpn_route_suspected")
+
+    def test_probe_generic_http_403_is_not_invented_as_vpn_block(self):
         error = HTTPError("https://x", 403, "Forbidden", {}, None)
         with patch("recorder_source.discovery.urlopen", side_effect=error):
             out = probe_candidate_hls(candidate(stream_url="https://x/live.m3u8"))
-        self.assertTrue(out.access_blocked)
-        self.assertEqual(out.probe_status, "access_blocked")
+        self.assertFalse(out.access_blocked)
+        self.assertEqual(out.probe_status, "probe_failed")
 
 
 if __name__ == "__main__":

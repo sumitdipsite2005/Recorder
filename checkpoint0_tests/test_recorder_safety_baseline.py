@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import copy
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
+
+from recorder_source import discovery as shared_discovery
 
 
 HERE = Path(__file__).resolve().parent
@@ -335,6 +340,66 @@ https://example.test/rejected.m3u8
             RECORDER.get_nm3u8dl_stream_fingerprint(changed_url),
         )
         self.assertEqual(RECORDER.get_nm3u8dl_stream_fingerprint({}), "")
+
+    def test_mature_and_shared_effective_headers_are_identical(self):
+        cases = (
+            ("HOTSTAR_EVENTS", "HOTSTAR"),
+            ("JIO_STAR_SPORTS", "JIO"),
+            ("KHEL", "KHEL"),
+            ("SONYLIV_EVENTS", "SONYLIV"),
+            ("FANCODE", "FANCODE"),
+        )
+        metadata = {
+            "Referer": "https://override.test/",
+            "Cookie": "session=one",
+            "User-Agent": "",
+        }
+        for group, provider in cases:
+            with self.subTest(group=group):
+                RECORDER.NM3U8DL_PLAYLIST_GROUP = group
+                profile = RECORDER.get_nm3u8dl_playlist_profile()
+                mature = RECORDER.get_nm3u8dl_effective_headers(metadata)
+                shared = shared_discovery.build_effective_probe_headers(
+                    provider,
+                    {
+                        "Referer": "https://override.test/",
+                        "Cookie": "session=one",
+                    },
+                    base_headers=profile["added_headers"],
+                    default_user_agent=RECORDER.NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"],
+                )
+                self.assertEqual(mature, shared)
+
+    def test_mature_and_shared_clearkey_normalization_are_identical(self):
+        payload = json.dumps({
+            "keys": [{
+                "kty": "oct",
+                "kid": "uoiW1gUkaHGsQkh4SR2GoQ",
+                "k": "hgDUFTA0s8vIUvE-pLdILA",
+            }]
+        })
+        self.assertEqual(
+            RECORDER.normalize_nm3u8dl_playlist_license_key(payload),
+            list(shared_discovery.normalize_playlist_license_key(payload)),
+        )
+
+    def test_mature_access_classification_uses_shared_rule(self):
+        RECORDER.NM3U8DL_PLAYLIST_GROUP = "FANCODE"
+        error = HTTPError("https://x", 403, "Forbidden", {}, None)
+        candidate = {
+            "stream_url": "https://x/live.m3u8",
+            "headers": {},
+            "keys": [],
+        }
+        with patch.object(
+            RECORDER,
+            "_fetch_nm3u8dl_stream_manifest_text",
+            side_effect=error,
+        ):
+            quality = RECORDER._probe_nm3u8dl_candidate_quality(candidate)
+        self.assertTrue(quality["access_blocked"])
+        self.assertEqual(quality["access_block_kind"], "vpn_route_suspected")
+        self.assertEqual(quality["access_block_http_status"], 403)
 
     def test_manual_rejection_signature_is_broader_than_one_url(self):
         first = make_candidate("first", fps=50)

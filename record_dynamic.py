@@ -64,6 +64,7 @@ from recorder_source import discovery as source_discovery
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
 from recorder_source import quality as source_quality
+from recorder_source import transport as source_transport
 from recorder_source.models import (
     SelectionDecision,
     SelectionPolicy,
@@ -76,6 +77,7 @@ from recorder_source.policy import (
     PLAYLIST_GROUP_PROFILES as SHARED_PLAYLIST_GROUP_PROFILES,
     PLAYLIST_GROUP_SOURCE_BUCKETS as SHARED_PLAYLIST_GROUP_SOURCE_BUCKETS,
     PLAYLIST_USER_AGENTS as SHARED_PLAYLIST_USER_AGENTS,
+    PROVIDER_ADDED_HEADERS as SHARED_PROVIDER_ADDED_HEADERS,
     PROVIDER_SELECTION_POLICIES as SHARED_PROVIDER_SELECTION_POLICIES,
 )
 
@@ -182,10 +184,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
         "safe_overtime_min": 60,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["HOTSTAR"].allow_unknown_expiry,
-        "added_headers": {
-            "Accept": "*/*",
-            "Sec-GPC": "1",
-        },
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["HOTSTAR"]),
         "key_mode": "SHAKA",
         "extra_args": "",
         "quality_upgrade_enabled": True,
@@ -198,7 +197,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["JIO"].allow_unknown_expiry,
-        "added_headers": {},
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["JIO"]),
         "key_mode": "MP4DECRYPT",
         "extra_args": "--thread-count 1 --live-keep-segments",
         "hard_stall_required": 20,
@@ -214,10 +213,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["KHEL"].allow_unknown_expiry,
-        "added_headers": {
-            "Accept": "*/*",
-            "Sec-GPC": "1",
-        },
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["KHEL"]),
         "key_mode": "SHAKA",
         "extra_args": "",
     },
@@ -226,17 +222,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["SONYLIV"].allow_unknown_expiry,
-        "added_headers": {
-            "Accept": "*/*",
-            "Origin": "https://www.sonyliv.com",
-            "Referer": "https://www.sonyliv.com/",
-            "Sec-GPC": "1",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/142.0.0.0 Safari/537.36"
-            ),
-        },
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["SONYLIV"]),
         "key_mode": "NONE",
         "extra_args": "",
         "quality_upgrade_enabled": True,
@@ -250,17 +236,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": SHARED_PROVIDER_SELECTION_POLICIES["FANCODE"].allow_unknown_expiry,
         "prefer_unknown_expiry_on_equal_quality": SHARED_PROVIDER_SELECTION_POLICIES["FANCODE"].prefer_unknown_expiry_on_equal_quality,
-        "added_headers": {
-            "Accept": "*/*",
-            "Origin": "https://www.fancode.com",
-            "Referer": "https://www.fancode.com/",
-            "Sec-GPC": "1",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/142.0.0.0 Safari/537.36"
-            ),
-        },
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["FANCODE"]),
         "key_mode": "SHAKA",
         "extra_args": "",
         "quality_upgrade_enabled": True,
@@ -404,11 +380,13 @@ NM3U8DL_PLAYLIST_FETCH_WORKERS = 8
 
 # Dynamic source quality inspection
 NM3U8DL_QUALITY_PROBE_WORKERS = 6
-NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC = 8
-NM3U8DL_QUALITY_HTTP_MAX_ATTEMPTS = 2
-NM3U8DL_QUALITY_HTTP_RETRY_BASE_SEC = 0.5
-NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC = 2.0
-NM3U8DL_QUALITY_HTTP_RETRYABLE_STATUS_CODES = (408, 425, 429, 500, 502, 503, 504)
+NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC = source_transport.QUALITY_HTTP_TIMEOUT_SEC
+NM3U8DL_QUALITY_HTTP_MAX_ATTEMPTS = source_transport.QUALITY_HTTP_MAX_ATTEMPTS
+NM3U8DL_QUALITY_HTTP_RETRY_BASE_SEC = source_transport.QUALITY_HTTP_RETRY_BASE_SEC
+NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC = source_transport.QUALITY_HTTP_RETRY_MAX_SEC
+NM3U8DL_QUALITY_HTTP_RETRYABLE_STATUS_CODES = (
+    source_transport.QUALITY_HTTP_RETRYABLE_STATUS_CODES
+)
 NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC = 20
 NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC = 4
 NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC = 12
@@ -1481,77 +1459,15 @@ def log(*args, level="INFO", **print_kwargs):
 
 
 def _is_timeout_exception(error) -> bool:
-    """Return True only for a real operation timeout, including urllib wrapping."""
-    if isinstance(error, (subprocess.TimeoutExpired, TimeoutError)):
-        return True
-
-    if isinstance(error, URLError):
-        reason = getattr(error, "reason", None)
-        return isinstance(reason, (subprocess.TimeoutExpired, TimeoutError))
-
-    return False
+    return source_transport.is_timeout_exception(error)
 
 
 def _is_nm3u8dl_retryable_http_get_error(error: Exception) -> bool:
-    """Return whether one idempotent HTTP GET is safe to retry once."""
-    if isinstance(error, HTTPError):
-        try:
-            return int(getattr(error, "code", 0) or 0) in (
-                NM3U8DL_QUALITY_HTTP_RETRYABLE_STATUS_CODES
-            )
-        except Exception:
-            return False
-
-    if _is_timeout_exception(error):
-        return True
-
-    if isinstance(error, URLError):
-        reason = getattr(error, "reason", None)
-        return isinstance(reason, (OSError, ConnectionError))
-
-    return isinstance(error, subprocess.TimeoutExpired)
+    return source_transport.is_retryable_http_get_error(error)
 
 
 def _nm3u8dl_http_retry_delay_sec(error: Exception, retry_number: int) -> float:
-    """Bound Retry-After/exponential backoff so candidate scans remain responsive."""
-    delay = min(
-        float(NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC),
-        float(NM3U8DL_QUALITY_HTTP_RETRY_BASE_SEC)
-        * (2 ** max(0, int(retry_number) - 1)),
-    )
-
-    if isinstance(error, HTTPError):
-        headers = getattr(error, "headers", None)
-        retry_after = (
-            str(headers.get("Retry-After") or "").strip()
-            if headers is not None
-            else ""
-        )
-
-        if retry_after:
-            parsed_delay = None
-
-            try:
-                parsed_delay = max(0.0, float(retry_after))
-            except Exception:
-                try:
-                    retry_at = parsedate_to_datetime(retry_after)
-                    if retry_at.tzinfo is None:
-                        retry_at = retry_at.replace(tzinfo=timezone.utc)
-                    parsed_delay = max(
-                        0.0,
-                        retry_at.timestamp() - time.time(),
-                    )
-                except Exception:
-                    parsed_delay = None
-
-            if parsed_delay is not None:
-                delay = min(
-                    float(NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC),
-                    float(parsed_delay),
-                )
-
-    return max(0.0, float(delay))
+    return source_transport.http_retry_delay_sec(error, retry_number)
 
 
 def _run_nm3u8dl_retryable_http_get(
@@ -1559,41 +1475,10 @@ def _run_nm3u8dl_retryable_http_get(
     *,
     stop_requested: Optional[Callable[[], bool]] = None,
 ):
-    """Run a safe GET with one bounded retry for transient transport failures."""
-    max_attempts = max(1, int(NM3U8DL_QUALITY_HTTP_MAX_ATTEMPTS))
-
-    for attempt in range(1, max_attempts + 1):
-        if stop_requested is not None and stop_requested():
-            raise RuntimeError("Quality probe cancelled by stop request")
-
-        try:
-            return operation()
-        except Exception as error:
-            if (
-                attempt >= max_attempts
-                or not _is_nm3u8dl_retryable_http_get_error(error)
-            ):
-                raise
-
-            try:
-                close_fn = getattr(error, "close", None)
-                if callable(close_fn):
-                    close_fn()
-            except Exception:
-                pass
-
-            delay = _nm3u8dl_http_retry_delay_sec(
-                error,
-                retry_number=attempt,
-            )
-            deadline = time.monotonic() + delay
-
-            while time.monotonic() < deadline:
-                if stop_requested is not None and stop_requested():
-                    raise RuntimeError("Quality probe cancelled by stop request")
-                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-
-    raise RuntimeError("HTTP retry loop ended unexpectedly")
+    return source_transport.run_retryable_http_get(
+        operation,
+        stop_requested=stop_requested,
+    )
 
 
 def _format_timeout_source(source) -> str:
@@ -6654,79 +6539,8 @@ def _nm3u8dl_b64url_decode(value: str) -> bytes:
 
 
 def normalize_nm3u8dl_playlist_license_key(value: str) -> List[str]:
-    """
-    Normalize playlist license-key metadata into the internal key format.
-
-    Supported inputs:
-    - Plain KID:KEY values.
-    - ClearKey license URLs.
-    - ClearKey JWK Sets:
-        {"keys":[{"kid":"...","k":"...","kty":"oct"}], ...}
-
-    Unknown/non-JWK formats are preserved unchanged so existing playlist
-    behavior is not altered.
-    """
-    value = str(value).strip()
-
-    if not value:
-        return []
-
-    # Existing formats already understood downstream.
-    if not value.startswith("{"):
-        return [value]
-
-    try:
-        data = json.loads(value)
-    except json.JSONDecodeError:
-        # Preserve pre-existing behavior for an unrecognized value.
-        return [value]
-
-    jwk_keys = data.get("keys")
-
-    # JSON, but not the ClearKey JWK-Set representation handled here.
-    if not isinstance(jwk_keys, list):
-        return [value]
-
-    normalized_keys = []
-
-    for item in jwk_keys:
-        if not isinstance(item, dict):
-            continue
-
-        kty = str(item.get("kty") or "").strip().lower()
-        kid_b64 = str(item.get("kid") or "").strip()
-        key_b64 = str(item.get("k") or "").strip()
-
-        # ClearKey uses symmetric ("oct") JWK keys.
-        if kty != "oct" or not kid_b64 or not key_b64:
-            continue
-
-        try:
-            kid_hex = _nm3u8dl_b64url_decode(kid_b64).hex()
-            key_hex = _nm3u8dl_b64url_decode(key_b64).hex()
-        except Exception as error:
-            raise RuntimeError(
-                "Invalid base64url value in ClearKey JWK license_key"
-            ) from error
-
-        # ClearKey KIDs and AES-128 keys must each be 16 bytes.
-        if len(kid_hex) != 32 or len(key_hex) != 32:
-            raise RuntimeError(
-                "Invalid ClearKey JWK license_key: "
-                "KID and key must each decode to 16 bytes"
-            )
-
-        pair = f"{kid_hex}:{key_hex}"
-
-        if pair not in normalized_keys:
-            normalized_keys.append(pair)
-
-    if not normalized_keys:
-        raise RuntimeError(
-            "ClearKey JWK license_key contained no usable oct keys"
-        )
-
-    return normalized_keys
+    """Use the shared mature/Coordinator ClearKey metadata normalizer."""
+    return list(source_discovery.normalize_playlist_license_key(value))
 
 
 def get_nm3u8dl_playlist_license_type(
@@ -6966,101 +6780,71 @@ def get_nm3u8dl_effective_headers(
     *,
     emit_logs: bool = False,
 ) -> dict:
-    """Build the exact HTTP-header set used for this playlist group."""
-
+    """Build the exact shared HTTP-header set used for this playlist group."""
     profile = get_nm3u8dl_playlist_profile()
-    headers = dict(profile["added_headers"])
-
     group_name = NM3U8DL_PLAYLIST_GROUP.strip().upper()
-
+    provider = SHARED_PLAYLIST_GROUP_PROFILES.get(group_name, group_name)
     cookie_policy = (
         NM3U8DL_PLAYLIST_GROUP_COOKIE_POLICY
         .get(group_name, "AUTO")
         .strip()
         .upper()
     )
-
     if cookie_policy not in ("AUTO", "SUPPRESS"):
         raise RuntimeError(
             f'Unknown Cookie policy "{cookie_policy}" '
             f'for playlist group "{group_name}"'
         )
 
+    filtered_headers = {}
     for name, value in (playlist_headers or {}).items():
         header_name = canonicalize_nm3u8dl_header_name(name)
-
         if not header_name:
             continue
-
-        if (
-            header_name.lower() == "cookie"
-            and cookie_policy == "SUPPRESS"
-        ):
+        if header_name.casefold() == "cookie" and cookie_policy == "SUPPRESS":
             if emit_logs:
                 log(
                     f"Playlist Cookie found but suppressed by "
                     f"{group_name} Cookie policy",
                     level="WARN",
                 )
-
             continue
-
-        existing_name = None
-
-        for current_name in headers:
-            if current_name.lower() == header_name.lower():
-                existing_name = current_name
-                break
-
         playlist_value = str(value).strip()
-
+        existing_name = next(
+            (
+                current_name
+                for current_name in profile["added_headers"]
+                if current_name.casefold() == header_name.casefold()
+            ),
+            None,
+        )
         if not playlist_value:
-            # Blank playlist metadata is missing information, not an override.
-            # Keep a useful profile default when one exists; otherwise omit the
-            # empty header instead of sending e.g. -H "Origin: ".
             if emit_logs and existing_name is not None:
                 log(
                     f"Playlist {header_name} is blank → "
                     f"keeping profile default",
                     level="WARN",
                 )
-
             continue
-
-        if existing_name is not None:
-            existing_value = str(headers[existing_name]).strip()
-
-            if emit_logs and existing_value != playlist_value:
-                log(
-                    "Playlist/profile header conflict : "
-                    f"{header_name} differs between profile default "
-                    f"and playlist metadata; using playlist metadata",
-                    level="WARN",
-                )
-
-            del headers[existing_name]
-
-        headers[header_name] = value
-
-    has_user_agent = any(
-        str(name).casefold() == "user-agent"
-        and str(value).strip()
-        for name, value in headers.items()
-    )
-
-    if not has_user_agent:
-        default_user_agent = str(
-            NM3U8DL_PLAYLIST_USER_AGENTS.get("DEFAULT") or ""
-        ).strip()
-
-        if not default_user_agent:
-            raise RuntimeError(
-                'Missing DEFAULT user-agent profile'
+        if (
+            emit_logs
+            and existing_name is not None
+            and str(profile["added_headers"][existing_name]).strip() != playlist_value
+        ):
+            log(
+                "Playlist/profile header conflict : "
+                f"{header_name} differs between profile default "
+                f"and playlist metadata; using playlist metadata",
+                level="WARN",
             )
+        filtered_headers[header_name] = value
 
-        headers["User-Agent"] = default_user_agent
-
-    return headers
+    return source_discovery.build_effective_probe_headers(
+        provider,
+        filtered_headers,
+        base_headers=profile["added_headers"],
+        default_user_agent=NM3U8DL_PLAYLIST_USER_AGENTS.get("DEFAULT"),
+    )
 
 
 def get_nm3u8dl_ascii_safe_request_headers(
@@ -7068,47 +6852,41 @@ def get_nm3u8dl_ascii_safe_request_headers(
     *,
     emit_logs: bool = False,
 ) -> dict:
-    safe_headers = {
+    original = {
         str(name): str(value)
         for name, value in (headers or {}).items()
         if str(name).strip()
     }
-
-    for header_name in list(safe_headers):
-        if header_name.lower() != "user-agent":
-            continue
-
-        original_user_agent = str(safe_headers[header_name]).strip()
-        ascii_user_agent = (
-            original_user_agent
-            .encode("ascii", errors="ignore")
-            .decode("ascii")
-            .strip()
+    safe_headers = source_transport.ascii_safe_request_headers(original)
+    if emit_logs:
+        original_ua_name = next(
+            (name for name in original if name.casefold() == "user-agent"),
+            None,
         )
-
-        if ascii_user_agent == original_user_agent:
-            continue
-
-        if ascii_user_agent:
-            if emit_logs:
-                log(
-                    "N_m3u8DL User-Agent contains non-ASCII characters → "
-                    "using ASCII-safe value",
-                    level="WARN",
-                )
-
-            safe_headers[header_name] = ascii_user_agent
-
-        else:
-            if emit_logs:
-                log(
-                    "N_m3u8DL User-Agent contains no ASCII-safe characters → "
-                    "omitting User-Agent",
-                    level="WARN",
-                )
-
-            del safe_headers[header_name]
-
+        safe_ua_name = next(
+            (name for name in safe_headers if name.casefold() == "user-agent"),
+            None,
+        )
+        if original_ua_name is not None:
+            original_ua = str(original[original_ua_name]).strip()
+            safe_ua = (
+                str(safe_headers[safe_ua_name]).strip()
+                if safe_ua_name is not None
+                else ""
+            )
+            if safe_ua != original_ua:
+                if safe_ua:
+                    log(
+                        "N_m3u8DL User-Agent contains non-ASCII characters → "
+                        "using ASCII-safe value",
+                        level="WARN",
+                    )
+                else:
+                    log(
+                        "N_m3u8DL User-Agent contains no ASCII-safe characters → "
+                        "omitting User-Agent",
+                        level="WARN",
+                    )
     return safe_headers
 
 
@@ -8457,49 +8235,25 @@ def _fetch_nm3u8dl_hls_child_with_master_cookie_session(
     *,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> str:
-    """Fetch an HLS child after first establishing cookies on its master."""
-    if stop_requested is not None and stop_requested():
-        raise RuntimeError("Quality probe cancelled by stop request")
-
+    """Use the shared master-cookie child-fetch mechanic."""
     request_headers = get_nm3u8dl_ascii_safe_request_headers(
         headers,
         emit_logs=False,
     )
-
     if not any(
-        str(name).casefold() == "user-agent"
-        and str(value).strip()
+        str(name).casefold() == "user-agent" and str(value).strip()
         for name, value in request_headers.items()
     ):
         request_headers["User-Agent"] = str(
             NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"]
         )
-
-    cookie_jar = CookieJar()
-    opener = build_opener(HTTPCookieProcessor(cookie_jar))
-
-    master_request = Request(master_url, headers=request_headers)
-    with opener.open(
-        master_request,
-        timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-    ) as master_response:
-        # The body is not needed here; opening the response is enough for the
-        # CookieJar to consume Set-Cookie before the child request. Read a small
-        # amount so HTTP/content errors surface while the response is open.
-        master_response.read(1)
-
-    if stop_requested is not None and stop_requested():
-        raise RuntimeError("Quality probe cancelled by stop request")
-
-    child_request = Request(child_url, headers=request_headers)
-    with opener.open(
-        child_request,
-        timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-    ) as child_response:
-        return child_response.read().decode(
-            "utf-8-sig",
-            errors="replace",
-        )
+    return source_transport.fetch_hls_child_with_master_cookie_session(
+        master_url,
+        child_url,
+        request_headers,
+        timeout_sec=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
+        stop_requested=stop_requested,
+    )
 
 
 def _get_nm3u8dl_stream_type_from_url(stream_url: str) -> str:
@@ -10169,39 +9923,18 @@ def _probe_nm3u8dl_candidate_quality(
             if redirected_expiry is not None:
                 quality["manifest_expiry"] = redirected_expiry
 
-            if status_code == 403 and error_type.lower() == "geo-blocked":
-                quality["access_blocked"] = True
-                quality["access_block_kind"] = "confirmed_geo"
-                quality["access_block_http_status"] = 403
-
-                country = (
-                    str(response_headers.get("Country") or "").strip()
-                    if response_headers is not None
-                    else ""
-                )
-
-                quality["geo_country"] = country or None
-
-            elif (
-                status_code == 403
-                and NM3U8DL_PLAYLIST_GROUP.strip().upper()
-                in ("FANCODE", "JIO_STAR_SPORTS")
-            ):
-                # FanCode and JIO Star Sports can return a plain HTTP 403 when
-                # access changes with VPN/route. Treat it as actionable for these
-                # groups only; do not claim confirmed geo because the response
-                # gives no such proof.
-                quality["access_blocked"] = True
-                quality["access_block_kind"] = "vpn_route_suspected"
-                quality["access_block_http_status"] = 403
-
-            elif status_code in (450, 451):
-                # Jio/Fastly can return HTTP 450 or 451 for a source that becomes
-                # immediately reachable after changing VPN/route. Treat either
-                # as actionable access blocking, but do not claim confirmed geo.
-                quality["access_blocked"] = True
-                quality["access_block_kind"] = "vpn_route_suspected"
-                quality["access_block_http_status"] = int(status_code)
+            access = source_transport.classify_http_access_error(
+                error,
+                source_group=NM3U8DL_PLAYLIST_GROUP,
+                provider=SHARED_PLAYLIST_GROUP_PROFILES.get(
+                    NM3U8DL_PLAYLIST_GROUP.strip().upper(),
+                    "",
+                ),
+            )
+            quality["access_blocked"] = bool(access.get("blocked"))
+            quality["access_block_kind"] = str(access.get("kind") or "")
+            quality["access_block_http_status"] = access.get("http_status")
+            quality["geo_country"] = access.get("geo_country")
 
         errors.append(
             f"manifest probe failed ({type(error).__name__})"
