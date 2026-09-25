@@ -12328,6 +12328,15 @@ def resolve_nm3u8dl_playlist_source(
         profile.get("allow_unknown_expiry", False)
     )
 
+    if (
+        playlist_urls_override is None
+        and state is not None
+        and state.identity_launch_request is not None
+    ):
+        playlist_urls_override = list(
+            state.identity_launch_request.recovery_playlist_urls
+        )
+
     if playlist_urls_override is None:
         playlist_urls = get_nm3u8dl_playlist_urls()
     else:
