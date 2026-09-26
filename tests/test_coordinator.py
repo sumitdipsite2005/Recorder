@@ -376,8 +376,8 @@ class ManualRecordLaunchTests(unittest.TestCase):
                 request.target_intents[0].recovery_playlist_urls,
                 ("https://src1.test/list.m3u",),
             )
-            self.assertEqual(request.base_name, "Sports - Asian Games")
-            self.assertEqual(plan.base_name, "Sports - Asian Games")
+            self.assertEqual(request.base_name, "Sports - Asian Games - 2120305")
+            self.assertEqual(plan.base_name, "Sports - Asian Games - 2120305")
             self.assertEqual(
                 captured["config_path"],
                 config_path,
