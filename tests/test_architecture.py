@@ -187,23 +187,36 @@ class ArchitectureGuardTests(unittest.TestCase):
         manifest=(ROOT/"recorder_source"/"manifest.py").read_text(encoding="utf-8")
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
         transport=(ROOT/"recorder_source"/"transport.py").read_text(encoding="utf-8")
 
         self.assertIn("def manifest_type_from_text(", manifest)
-        self.assertIn("source_manifest.manifest_type_from_text(", recorder)
-        self.assertIn("manifest_type_from_text(", discovery)
+        self.assertIn("from .manifest import manifest_type_from_text", quality)
+        self.assertIn(
+            "manifest_type = manifest_type_from_text(manifest_text)",
+            quality,
+        )
+        self.assertIn(
+            "source_quality.inspect_manifest_probe_evidence(",
+            recorder,
+        )
+        self.assertIn("inspect_manifest_probe_evidence(", discovery)
         self.assertIn("is_manifest_text(", transport)
         mpd_pattern = r'<(?:[A-Za-z_][\w.-]*:)?MPD\b'
         self.assertIn(mpd_pattern, manifest)
         self.assertNotIn(mpd_pattern, recorder)
         self.assertNotIn(mpd_pattern, discovery)
+        self.assertNotIn(mpd_pattern, quality)
         self.assertNotIn(mpd_pattern, transport)
 
     def test_recorder_and_coordinator_share_hls_quality_parser(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
-        self.assertIn("source_quality.parse_hls_manifest_quality(",recorder)
-        self.assertIn("parse_hls_manifest_quality(",discovery)
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+        self.assertIn("def parse_hls_manifest_quality(",quality)
+        self.assertIn("parse_hls_manifest_quality(",quality)
+        self.assertIn("source_quality.inspect_manifest_probe_evidence(",recorder)
+        self.assertIn("inspect_manifest_probe_evidence(",discovery)
 
     def test_recorder_and_coordinator_share_probe_transport_policy(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
@@ -215,14 +228,22 @@ class ArchitectureGuardTests(unittest.TestCase):
     def test_recorder_and_coordinator_share_hls_variant_failure_classification(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
-        self.assertIn("source_transport.classify_hls_variant_probe_failure(", recorder)
-        self.assertIn("source_transport.classify_hls_variant_probe_failure(", discovery)
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "source_transport.classify_hls_variant_probe_failure(",
+            quality,
+        )
+        self.assertIn("source_quality.inspect_manifest_probe_evidence(", recorder)
+        self.assertIn("inspect_manifest_probe_evidence(", discovery)
 
     def test_recorder_and_coordinator_share_dash_quality_parser(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
-        self.assertIn("source_quality.parse_dash_manifest_quality(", recorder)
-        self.assertIn("parse_dash_manifest_quality(", discovery)
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+        self.assertIn("def parse_dash_manifest_quality(", quality)
+        self.assertIn("parse_dash_manifest_quality(", quality)
+        self.assertIn("source_quality.inspect_manifest_probe_evidence(", recorder)
+        self.assertIn("inspect_manifest_probe_evidence(", discovery)
         self.assertNotIn("def _parse_dash_quality(", discovery)
 
     def test_playlist_header_parsing_algorithm_has_one_shared_owner(self):
