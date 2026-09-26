@@ -48,6 +48,7 @@ from .quality import (
     QUALITY_PROBE_WORKERS,
     probe_stream_quality_ffprobe,
     quality_probe_identity,
+    quality_persistence_identity,
     run_grouped_quality_probes,
 )
 from .policy import (
@@ -850,6 +851,13 @@ def probe_candidate_hls(
         )
         manifest_expiry = _extract_expiry(final_url, text)
         current_playback_fingerprint = playback_fingerprint(final_url, headers)
+        current_quality_identity = (
+            quality_persistence_identity(
+                candidate,
+                resolved_url=final_url,
+            )
+            or current_playback_fingerprint
+        )
 
         def fetch_child_text(variant_url: str) -> str:
             child_text, _ = source_transport.fetch_stream_manifest_text(
@@ -975,10 +983,10 @@ def probe_candidate_hls(
             "video_scan_type_source": video_scan_type_source,
         }
         cached_quality = (
-            quality_evidence_registry.get(current_playback_fingerprint)
+            quality_evidence_registry.get(current_quality_identity)
             if (
                 quality_evidence_registry is not None
-                and current_playback_fingerprint
+                and current_quality_identity
             )
             else None
         )
@@ -1096,11 +1104,11 @@ def probe_candidate_hls(
         }
         if (
             quality_evidence_registry is not None
-            and current_playback_fingerprint
+            and current_quality_identity
         ):
             reusable_quality = quality_evidence_snapshot(final_quality)
             if reusable_quality:
-                quality_evidence_registry[current_playback_fingerprint] = (
+                quality_evidence_registry[current_quality_identity] = (
                     reusable_quality
                 )
 
