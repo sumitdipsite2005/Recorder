@@ -1419,6 +1419,18 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         registry_entries = fresh_registry_entries
                     if runtime_status_changed:
                         runtime_statuses = fresh_runtime_statuses
+                    if previous is not None and registry_changed:
+                        display_order = update_display_order(
+                            display_order,
+                            previous,
+                            registry_entries=registry_entries,
+                        )
+                    if previous is not None and runtime_status_changed:
+                        source_reference_registry = update_source_reference_registry(
+                            source_reference_registry,
+                            previous,
+                            runtime_statuses,
+                        )
                     if (
                             (registry_changed or runtime_status_changed)
                             and previous is not None
@@ -1541,6 +1553,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 source_reference_registry = update_source_reference_registry(
                     source_reference_registry,
                     snapshot,
+                    runtime_statuses,
                 )
                 if meaningful or clear_transient_only:
                     clear_live_status_line()
