@@ -441,6 +441,41 @@ def _runtime_candidate_rows(
     return rows
 
 
+def _runtime_selected_discovery_key(
+    runtime_status: Optional[Mapping[str, object]],
+    candidates: Sequence[object],
+) -> Optional[Tuple[object, ...]]:
+    """Map the worker's current source back to one refreshed discovery row.
+
+    Exact metadata/index matching is preferred. If refresh changed those mutable
+    fields, fall back only when the worker's playlist source identifies one
+    unambiguous row in this already identity-scoped block.
+    """
+    if not isinstance(runtime_status, Mapping):
+        return None
+    current = runtime_status.get("current_candidate")
+    if not isinstance(current, Mapping):
+        return None
+
+    candidate_list = list(candidates)
+    current_key = _runtime_candidate_key(current)
+    candidate_keys = {_runtime_candidate_key(candidate) for candidate in candidate_list}
+    if current_key in candidate_keys:
+        return current_key
+
+    current_source = str(current.get("playlist_url") or "").strip()
+    if not current_source:
+        return None
+    same_source = [
+        candidate
+        for candidate in candidate_list
+        if str(getattr(candidate, "playlist_url", "") or "").strip() == current_source
+    ]
+    if len(same_source) == 1:
+        return _runtime_candidate_key(same_source[0])
+    return None
+
+
 def _local_candidate_classification(candidate) -> Tuple[str, str]:
     state = candidate_state(candidate)
     if state == "WORKING":
@@ -660,6 +695,15 @@ def render_dashboard(
                 else ""
             )
             runtime_rows = _runtime_candidate_rows(runtime_status)
+            block_candidates = [
+                candidate
+                for source in block.observations.values()
+                for candidate in source.candidates
+            ]
+            runtime_selected_discovery_key = _runtime_selected_discovery_key(
+                runtime_status,
+                block_candidates,
+            )
 
             for event in identity_events.get(block_key, ()):
                 for detail in event.details:
@@ -746,11 +790,17 @@ def render_dashboard(
                                 details_to_show.extend(event.details)
 
                     state_text = candidate_state(candidate)
-                    runtime_row = runtime_rows.get(_runtime_candidate_key(candidate))
+                    candidate_runtime_key = _runtime_candidate_key(candidate)
+                    runtime_row = runtime_rows.get(candidate_runtime_key)
                     runtime_selected = bool(
                         isinstance(runtime_row, Mapping)
                         and runtime_row.get("selected")
                     )
+                    if (
+                        not runtime_selected
+                        and candidate_runtime_key == runtime_selected_discovery_key
+                    ):
+                        runtime_selected = True
                     runtime_classification = (
                         str(runtime_row.get("classification") or "").strip()
                         if isinstance(runtime_row, Mapping)

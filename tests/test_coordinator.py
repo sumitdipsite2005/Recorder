@@ -750,6 +750,59 @@ class SnapshotAndChangeTests(unittest.TestCase):
             colored,
         )
 
+    def test_recording_marker_survives_refreshed_discovery_row(self):
+        original=replace(
+            sony_candidate(),
+            video_resolution_source="manifest",
+            video_fps_source="manifest",
+            video_scan_type_source="event-policy",
+            video_bitrate_source="manifest",
+        )
+        refreshed=replace(
+            original,
+            matching_entry_index=99,
+            group_title="Athletics",
+        )
+        snap=snapshot([refreshed])
+        identity_key=next(
+            identity
+            for policy,identity in snap.blocks
+            if policy==coord.POLICY_MANUAL
+        )
+        runtime_row=runtime_candidate(
+            original,
+            selected=True,
+            status="SELECTED",
+            quality="1920x1080 | 50p [manifest, event-policy] | 5000 Kbps",
+        )
+        rendered=coord.render_dashboard(
+            snap,
+            (),
+            registry_entries={
+                identity_key:{
+                    "identity":identity_key,
+                    "provider":"SONYLIV",
+                    "display_name":"ENG _ Asian Games",
+                    "state":"RECORDING",
+                    "worker_pid":4321,
+                }
+            },
+            runtime_statuses={
+                identity_key:{
+                    "worker_state":"RECORDING",
+                    "current_candidate":runtime_row,
+                    "candidates":[runtime_row],
+                    "target_names":["T"],
+                    "source_count":1,
+                }
+            },
+        )
+        refreshed_line=next(
+            line for line in rendered.splitlines()
+            if "Asian Games | Asian Games | Athletics" in line
+        )
+        self.assertIn("[RECORDING] [ON]",refreshed_line)
+
     def test_dashboard_uses_shared_color_mapping_for_waiting_state(self):
         snap=snapshot([sony_candidate()])
         identity_key=next(
