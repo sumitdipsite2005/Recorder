@@ -711,6 +711,64 @@ https://edge.drmlive.net/live.mpd
         self.assertEqual(changed["source"],"observed")
         self.assertEqual(changed["timestamp"],2000.0)
 
+    def test_playlist_freshness_ignores_rotating_stream_query_and_headers(self):
+        first_text = """#EXTM3U
+#EXTINF:-1 tvg-name="Presidents Cup 2026 [English]" group-title="Golf",Presidents Cup 2026 [English]
+https://cdn.test/mumbai/4249106_english_hls_x/1080p.m3u8?token=one|Authorization=Bearer+A
+"""
+        second_text = """#EXTM3U
+#EXTINF:-1 tvg-name="Presidents Cup 2026 [English]" group-title="Golf",Presidents Cup 2026 [English]
+https://cdn.test/mumbai/4249106_english_hls_x/1080p.m3u8?token=two|Authorization=Bearer+B
+"""
+        with patch(
+            "recorder_source.discovery._github_file_commit_timestamp",
+            return_value=None,
+        ):
+            first = resolve_playlist_source_freshness(
+                "https://example.test/list.m3u",
+                first_text,
+                {},
+            )
+        second = resolve_playlist_source_freshness(
+            "https://example.test/list.m3u",
+            second_text,
+            {},
+            previous=first,
+            now_ts=2000,
+        )
+        self.assertEqual(second["content_hash"], first["content_hash"])
+        self.assertEqual(second["source"], first["source"])
+        self.assertEqual(second["timestamp"], first["timestamp"])
+
+    def test_playlist_freshness_observes_event_metadata_change(self):
+        first_text = """#EXTM3U
+#EXTINF:-1 tvg-name="Presidents Cup 2026 [English]" group-title="Golf",Presidents Cup 2026 [English]
+https://cdn.test/mumbai/4249106_english_hls_x/1080p.m3u8?token=one
+"""
+        changed_text = """#EXTM3U
+#EXTINF:-1 tvg-name="Different Event" group-title="Golf",Different Event
+https://cdn.test/mumbai/4249106_english_hls_x/1080p.m3u8?token=two
+"""
+        with patch(
+            "recorder_source.discovery._github_file_commit_timestamp",
+            return_value=None,
+        ):
+            first = resolve_playlist_source_freshness(
+                "https://example.test/list.m3u",
+                first_text,
+                {},
+            )
+        changed = resolve_playlist_source_freshness(
+            "https://example.test/list.m3u",
+            changed_text,
+            {},
+            previous=first,
+            now_ts=2000,
+        )
+        self.assertNotEqual(changed["content_hash"], first["content_hash"])
+        self.assertEqual(changed["source"], "observed")
+        self.assertEqual(changed["timestamp"], 2000.0)
+
     def test_shared_probe_transport_retries_transient_timeout_once(self):
         calls = []
 
@@ -1413,13 +1471,25 @@ seg.ts
             playlist_url="https://one.test/list.m3u",
             matching_entry_index=1,
             stream_url="https://cdn.test/live/master.m3u8",
-            extra={"provider": "SONYLIV", "source_name": "one", "source_group": "SONYLIV_EVENTS"},
+            extra={
+                "provider": "SONYLIV",
+                "source_name": "one",
+                "source_group": "SONYLIV_EVENTS",
+                "source_freshness_ts": 1000.0,
+                "source_freshness_source": "commit",
+            },
         )
         b = replace(
             a,
             playlist_url="https://two.test/list.m3u",
             matching_entry_index=2,
-            extra={"provider": "SONYLIV", "source_name": "two", "source_group": "SONYLIV_EVENTS"},
+            extra={
+                "provider": "SONYLIV",
+                "source_name": "two",
+                "source_group": "SONYLIV_EVENTS",
+                "source_freshness_ts": 2000.0,
+                "source_freshness_source": "observed",
+            },
         )
         probed = replace(
             a,
@@ -1452,6 +1522,10 @@ seg.ts
         probe.assert_called_once()
         self.assertEqual(out[0].extra["source_name"], "one")
         self.assertEqual(out[1].extra["source_name"], "two")
+        self.assertEqual(out[0].extra["source_freshness_ts"], 1000.0)
+        self.assertEqual(out[0].extra["source_freshness_source"], "commit")
+        self.assertEqual(out[1].extra["source_freshness_ts"], 2000.0)
+        self.assertEqual(out[1].extra["source_freshness_source"], "observed")
         self.assertEqual(out[0].video_fps_source, "manifest")
         self.assertEqual(out[1].video_fps_source, "manifest")
         self.assertEqual(out[0].video_bitrate_bps, out[1].video_bitrate_bps)
