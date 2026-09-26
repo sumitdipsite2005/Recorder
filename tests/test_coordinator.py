@@ -1104,7 +1104,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         )
         self.assertIn("\033[38;2;41;159;214mAsian Games\033[0m",rendered)
         self.assertIn("\033[38;2;41;159;214mHockey\033[0m",rendered)
-        self.assertIn("\033[1;93m[NEW]\033[0m",rendered)
+        self.assertIn("\033[38;2;255;215;0m[NEW]\033[0m",rendered)
 
     def test_normal_on_is_uncolored_and_off_is_bright_red(self):
         on_rendered=coord.render_dashboard(
@@ -1127,12 +1127,12 @@ class SnapshotAndChangeTests(unittest.TestCase):
         )
         self.assertIn("\033[1;91m[OFF]\033[0m",off_rendered)
 
-    def test_transient_update_marker_is_bright_yellow(self):
+    def test_transient_update_marker_uses_change_gold(self):
         old=snapshot([sony_candidate(title="Shooting")])
         new=snapshot([sony_candidate(title="Athletics")])
         events=coord.diff_snapshots(old,new)
         rendered=coord.render_dashboard(new,events,use_color=True)
-        self.assertIn("\033[1;93m[UPDATE]\033[0m",rendered)
+        self.assertIn("\033[38;2;255;215;0m[UPDATE]\033[0m",rendered)
 
     def test_source_reference_and_footer_share_muted_treatment_without_row_source_name(self):
         snap=snapshot([sony_candidate()])

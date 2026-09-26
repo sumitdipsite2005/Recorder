@@ -348,8 +348,8 @@ def _marker_text(events: Sequence[ChangeEvent], use_color: bool) -> str:
         return ""
 
     def marker(event: ChangeEvent) -> str:
-        # Change markers are temporary and should stand out from steady states.
-        return _warning_text(f"[{event.marker}]", use_color)
+        # Change markers share the same gold emphasis as changed-to values.
+        return _change_detail_text(f"[{event.marker}]", use_color)
 
     return " ".join(marker(event) for event in events) + " "
 
@@ -773,7 +773,7 @@ def render_dashboard(
                     if len(quality_keys) > 1:
                         suffix.append(_marker("[BEST]", color))
                     suffix.extend(
-                        _warning_text(f"[{event.marker}]", color)
+                        _change_detail_text(f"[{event.marker}]", color)
                         for event in quality_events.get(block_key, ())
                     )
                 suffix_text = " " + " ".join(suffix) if suffix else ""
