@@ -17,8 +17,11 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
+from urllib.error import HTTPError
 from urllib.parse import urljoin
 
+from . import transport as source_transport
+from .manifest import manifest_type_from_text
 from .models import SourceCandidate
 from .selection import (
     comparable_motion_fps,
@@ -1190,6 +1193,227 @@ def parse_dash_manifest_quality(
             motion_cap_fps=float(motion_cap_fps),
         ),
     )
+
+
+def inspect_manifest_probe_evidence(
+    manifest_text: str,
+    manifest_url: str,
+    *,
+    has_decryption_keys: bool,
+    motion_cap_fps: float = 50.0,
+    manifest_expiry: Optional[float] = None,
+    expiry_parser: Optional[Callable[[str], Optional[float]]] = None,
+    fetch_child: Optional[Callable[[str], str]] = None,
+    fetch_child_with_master_session: Optional[Callable[[str, str], str]] = None,
+    child_hls_validator: Optional[Callable[[str], bool]] = None,
+    child_error_describer: Optional[Callable[[BaseException], str]] = None,
+    child_error_callback: Optional[Callable[[BaseException, str], None]] = None,
+    resolve_dash_resource: Optional[Callable[[Mapping[str, object]], Mapping[str, object]]] = None,
+) -> Tuple[dict, Optional[dict], dict]:
+    """Inspect common HLS/DASH manifest evidence for all recorder paths.
+
+    This owns manifest-type branching, advertised quality/provenance, DRM
+    inspection, selected-HLS-child DRM inspection, and selected DASH resource
+    routing. Callers retain transport logging/error policy and any recorder-
+    specific FFprobe/SPS/idet completion that follows this shared phase.
+    """
+    evidence = {
+        "quality_known": False,
+        "quality_source": "",
+        "video_fps": 0.0,
+        "video_fps_source": "",
+        "video_width": 0,
+        "video_height": 0,
+        "video_resolution_source": "",
+        "video_scan_type": "",
+        "video_scan_type_source": "",
+        "video_bitrate_bps": 0,
+        "video_bitrate_source": "",
+        "manifest_expiry": manifest_expiry,
+        "resource_expiry": None,
+        "selected_media_final_url": "",
+        "resource_probe_failure": "",
+        "manifest_reachable": False,
+        "drm_protected": False,
+        "drm_key_required": False,
+        "drm_detail": "",
+        "drm_inspection_failure": "",
+        "hls_variant_probe_status": "",
+        "hls_variant_probe_failure": "",
+        "manifest_probe_failure": "",
+    }
+    resource_route: dict = {}
+    manifest_quality: Optional[dict] = None
+    manifest_type = manifest_type_from_text(manifest_text)
+
+    if manifest_type not in ("HLS", "DASH"):
+        evidence["manifest_probe_failure"] = (
+            "response was not a recognizable HLS/DASH manifest"
+        )
+        return evidence, None, resource_route
+
+    evidence["manifest_reachable"] = True
+    evidence["stream_type"] = manifest_type
+
+    if manifest_type == "HLS":
+        manifest_quality = parse_hls_manifest_quality(
+            manifest_text,
+            manifest_url,
+            motion_cap_fps=float(motion_cap_fps),
+            expiry_parser=expiry_parser,
+        )
+        manifest_drm = inspect_hls_manifest_drm(manifest_text)
+    else:
+        manifest_quality = parse_dash_manifest_quality(
+            manifest_text,
+            manifest_url,
+            motion_cap_fps=float(motion_cap_fps),
+        )
+        manifest_drm = inspect_dash_manifest_drm(manifest_text)
+
+    if manifest_quality:
+        manifest_quality = dict(manifest_quality)
+        manifest_quality["manifest_expiry"] = merge_auth_expiries(
+            manifest_expiry,
+            manifest_quality.get("manifest_expiry"),
+        )
+        evidence.update(manifest_quality)
+        evidence["manifest_expiry"] = manifest_quality.get("manifest_expiry")
+        evidence["quality_source"] = "manifest"
+
+        if float(evidence.get("video_fps") or 0.0) > 0:
+            evidence["video_fps_source"] = "manifest"
+        if (
+            int(evidence.get("video_width") or 0) > 0
+            or int(evidence.get("video_height") or 0) > 0
+        ):
+            evidence["video_resolution_source"] = "manifest"
+        if int(evidence.get("video_bitrate_bps") or 0) > 0:
+            evidence["video_bitrate_source"] = "manifest"
+        if evidence.get("video_scan_type"):
+            evidence["video_scan_type_source"] = "manifest"
+
+    evidence.update(manifest_drm)
+
+    if (
+        manifest_type == "HLS"
+        and manifest_quality
+        and not has_decryption_keys
+        and not evidence.get("drm_key_required")
+    ):
+        variant_url = str(
+            manifest_quality.get("manifest_variant_url") or ""
+        ).strip()
+        if variant_url and fetch_child is not None:
+            child_text = ""
+            child_error: Optional[BaseException] = None
+            try:
+                child_text = str(fetch_child(variant_url) or "")
+            except HTTPError as error:
+                child_error = error
+                if (
+                    int(getattr(error, "code", 0) or 0) == 403
+                    and fetch_child_with_master_session is not None
+                ):
+                    try:
+                        child_text = str(
+                            fetch_child_with_master_session(
+                                manifest_url,
+                                variant_url,
+                            )
+                            or ""
+                        )
+                        child_error = None
+                    except Exception as retry_error:
+                        child_error = retry_error
+            except Exception as error:
+                child_error = error
+                if child_error_callback is not None:
+                    child_error_callback(error, variant_url)
+
+            if child_text:
+                is_hls_child = (
+                    bool(child_hls_validator(child_text))
+                    if child_hls_validator is not None
+                    else "#EXTM3U" in child_text
+                )
+                if not is_hls_child:
+                    child_failure = (
+                        source_transport.classify_hls_variant_probe_failure(
+                            non_hls_response=True,
+                        )
+                    )
+                    evidence["hls_variant_probe_status"] = str(
+                        child_failure.get("status") or ""
+                    )
+                    evidence["hls_variant_probe_failure"] = str(
+                        child_failure.get("reason") or ""
+                    )
+                else:
+                    try:
+                        child_drm = inspect_hls_manifest_drm(child_text)
+                    except Exception as error:
+                        detail = (
+                            str(child_error_describer(error) or "").strip()
+                            if child_error_describer is not None
+                            else f"{type(error).__name__}: {error}"
+                        )
+                        evidence["drm_inspection_failure"] = (
+                            "HLS DRM inspection failed"
+                            + (f" — {detail}" if detail else "")
+                        )
+                    else:
+                        evidence["drm_protected"] = bool(
+                            evidence.get("drm_protected")
+                            or child_drm.get("drm_protected")
+                        )
+                        if child_drm.get("drm_key_required"):
+                            evidence["drm_key_required"] = True
+                            evidence["drm_detail"] = str(
+                                child_drm.get("drm_detail") or ""
+                            )
+            elif child_error is not None:
+                child_failure = source_transport.classify_hls_variant_probe_failure(
+                    child_error,
+                )
+                evidence["hls_variant_probe_status"] = str(
+                    child_failure.get("status") or ""
+                )
+                evidence["hls_variant_probe_failure"] = str(
+                    child_failure.get("reason") or ""
+                )
+
+    if (
+        manifest_type == "DASH"
+        and manifest_quality
+        and resolve_dash_resource is not None
+    ):
+        resource_route = dict(
+            resolve_dash_resource(manifest_quality) or {}
+        )
+        evidence["selected_media_final_url"] = str(
+            resource_route.get("final_url") or ""
+        ).strip()
+        evidence["resource_expiry"] = merge_auth_expiries(
+            evidence.get("resource_expiry"),
+            resource_route.get("resource_expiry"),
+        )
+        evidence["resource_probe_failure"] = str(
+            resource_route.get("failure") or ""
+        ).strip()
+        route_index = resource_route.get("route_index")
+        if route_index is not None:
+            evidence["_dash_selected_route_index"] = int(route_index)
+
+    evidence["quality_known"] = bool(
+        float(evidence.get("video_fps") or 0.0) > 0
+        or (
+            int(evidence.get("video_width") or 0) > 0
+            and int(evidence.get("video_height") or 0) > 0
+        )
+        or int(evidence.get("video_bitrate_bps") or 0) > 0
+    )
+    return evidence, manifest_quality, resource_route
 
 
 def build_ffprobe_quality_command(

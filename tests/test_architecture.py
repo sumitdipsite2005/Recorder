@@ -316,6 +316,52 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("merge_ffprobe_quality_evidence(", discovery)
         self.assertNotIn("ffprobe_width =", discovery)
 
+    def test_candidate_manifest_probe_orchestration_has_one_shared_owner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+
+        self.assertIn("def inspect_manifest_probe_evidence(", quality)
+
+        mature_start = recorder.index("def _probe_nm3u8dl_candidate_quality(")
+        mature_end = recorder.index(
+            "def _get_nm3u8dl_candidate_probe_identity(",
+            mature_start,
+        )
+        mature_probe = recorder[mature_start:mature_end]
+        self.assertIn(
+            "source_quality.inspect_manifest_probe_evidence(",
+            mature_probe,
+        )
+        self.assertNotIn(
+            "_parse_nm3u8dl_hls_manifest_quality(",
+            mature_probe,
+        )
+        self.assertNotIn(
+            "_parse_nm3u8dl_dash_manifest_quality(",
+            mature_probe,
+        )
+        self.assertNotIn(
+            "_inspect_nm3u8dl_hls_manifest_drm(",
+            mature_probe,
+        )
+        self.assertNotIn(
+            "classify_hls_variant_probe_failure(",
+            mature_probe,
+        )
+
+        shared_start = discovery.index("def probe_candidate_hls(")
+        shared_end = discovery.index("_PROBE_SOURCE_EXTRA_KEYS", shared_start)
+        shared_probe = discovery[shared_start:shared_end]
+        self.assertIn("inspect_manifest_probe_evidence(", shared_probe)
+        self.assertNotIn("parse_hls_manifest_quality(", shared_probe)
+        self.assertNotIn("parse_dash_manifest_quality(", shared_probe)
+        self.assertNotIn("inspect_hls_manifest_drm(", shared_probe)
+        self.assertNotIn(
+            "classify_hls_variant_probe_failure(",
+            shared_probe,
+        )
+
     def test_playback_fingerprint_has_one_shared_owner(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")

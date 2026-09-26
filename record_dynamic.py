@@ -8605,73 +8605,71 @@ def _probe_nm3u8dl_candidate_quality(
             final_manifest_url
         )
 
-        if redirected_expiry is not None:
-            quality["manifest_expiry"] = redirected_expiry
+        def fetch_child_text(variant_url: str) -> str:
+            return _fetch_nm3u8dl_stream_manifest_text(
+                variant_url,
+                effective_headers,
+                stop_requested=stop_requested,
+            )
 
-        manifest_type = source_manifest.manifest_type_from_text(
-            manifest_text
-        )
+        def fetch_child_with_master_session(
+            master_url: str,
+            variant_url: str,
+        ) -> str:
+            return _fetch_nm3u8dl_hls_child_with_master_cookie_session(
+                master_url,
+                variant_url,
+                effective_headers,
+                stop_requested=stop_requested,
+            )
 
-        if manifest_type == "HLS":
-            quality["manifest_reachable"] = True
-            quality["stream_type"] = "HLS"
-            manifest_quality = _parse_nm3u8dl_hls_manifest_quality(
+        def on_child_error(error: BaseException, variant_url: str) -> None:
+            child_timeout_route = _format_candidate_timeout_route(
+                playlist_urls_for_timeout,
+                variant_url,
+            )
+            log_timeout_exception(
+                error,
+                "HTTP",
+                (
+                    NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC + 5
+                    if _is_nm3u8dl_drmlive_host(variant_url)
+                    else NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC
+                ),
+                context=(
+                    "HLS variant check | "
+                    f"{child_timeout_route}"
+                ),
+            )
+
+        def resolve_dash_resource(quality_evidence: Mapping[str, object]):
+            return _resolve_nm3u8dl_selected_dash_resource_route(
+                quality_evidence,
+                effective_headers,
+                stop_requested=stop_requested,
+            )
+
+        inspection, manifest_quality, _resource_route = (
+            source_quality.inspect_manifest_probe_evidence(
                 manifest_text,
                 final_manifest_url,
+                has_decryption_keys=bool(candidate.get("keys") or []),
+                motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+                manifest_expiry=redirected_expiry,
+                expiry_parser=get_nm3u8dl_auth_expiry,
+                fetch_child=fetch_child_text,
+                fetch_child_with_master_session=fetch_child_with_master_session,
+                child_hls_validator=lambda value: str(value).lstrip().startswith(
+                    "#EXTM3U"
+                ),
+                child_error_describer=_describe_nm3u8dl_probe_exception,
+                child_error_callback=on_child_error,
+                resolve_dash_resource=resolve_dash_resource,
             )
+        )
+        quality.update(inspection)
 
-            quality.update(
-                _inspect_nm3u8dl_hls_manifest_drm(
-                    manifest_text
-                )
-            )
-
-            # A master playlist can look healthy while encryption is declared
-            # only in its child media playlist. For an unkeyed candidate, inspect
-            # the selected child before allowing the source to become launchable.
-            if (
-                not (candidate.get("keys") or [])
-                and not quality.get("drm_key_required")
-                and manifest_quality
-            ):
-                variant_url = str(
-                    manifest_quality.get("manifest_variant_url")
-                    or ""
-                ).strip()
-
-                if variant_url:
-                    variant_text = ""
-                    child_error = None
-
-                    try:
-                        variant_text = (
-                            _fetch_nm3u8dl_stream_manifest_text(
-                                variant_url,
-                                effective_headers,
-                                stop_requested=stop_requested,
-                            )
-                        )
-                    except HTTPError as error:
-                        child_error = error
-
-                        # Proven production case: the HLS master sets an
-                        # authorization cookie that the child requires. urllib
-                        # urlopen() calls do not retain that response cookie, so
-                        # retry the master -> child sequence in one CookieJar.
-                        if getattr(error, "code", None) == 403:
-                            try:
-                                variant_text = (
-                                    _fetch_nm3u8dl_hls_child_with_master_cookie_session(
-                                        final_manifest_url,
-                                        variant_url,
-                                        effective_headers,
-                                        stop_requested=stop_requested,
-                                    )
-                                )
-                                child_error = None
-                            except Exception as retry_error:
-                                child_error = retry_error
-                    except Exception as error:
+    except Exception as error:
                         child_timeout_route = _format_candidate_timeout_route(
                             playlist_urls_for_timeout,
                             variant_url,
@@ -8828,46 +8826,6 @@ def _probe_nm3u8dl_candidate_quality(
         errors.append(
             f"manifest probe failed ({type(error).__name__})"
         )
-
-    if manifest_quality:
-        quality.update(manifest_quality)
-        quality["quality_source"] = "manifest"
-
-        if float(quality.get("video_fps") or 0.0) > 0:
-            quality["video_fps_source"] = "manifest"
-
-        if (
-            int(quality.get("video_width") or 0) > 0
-            or int(quality.get("video_height") or 0) > 0
-        ):
-            quality["video_resolution_source"] = "manifest"
-
-        if int(quality.get("video_bitrate_bps") or 0) > 0:
-            quality["video_bitrate_source"] = "manifest"
-
-        if quality.get("stream_type") == "DASH":
-            resource_route = _resolve_nm3u8dl_selected_dash_resource_route(
-                quality,
-                effective_headers,
-                stop_requested=stop_requested,
-            )
-
-            if resource_route.get("final_url"):
-                quality["selected_media_final_url"] = str(
-                    resource_route.get("final_url") or ""
-                ).strip()
-                quality["resource_expiry"] = _merge_nm3u8dl_auth_expiries(
-                    quality.get("resource_expiry"),
-                    resource_route.get("resource_expiry"),
-                )
-
-                route_index = resource_route.get("route_index")
-                if route_index is not None:
-                    quality["_dash_selected_route_index"] = int(route_index)
-            elif resource_route.get("failure"):
-                quality["resource_probe_failure"] = str(
-                    resource_route.get("failure") or ""
-                ).strip()
 
     probe_stream_url = str(
         quality.get("manifest_variant_url")

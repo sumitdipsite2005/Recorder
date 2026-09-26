@@ -35,6 +35,7 @@ from recorder_source.quality import (
     format_candidate_quality,
     merge_ffprobe_quality_evidence,
     inspect_dash_manifest_drm,
+    inspect_manifest_probe_evidence,
     parse_dash_manifest_quality,
     QUALITY_FFPROBE_TIMEOUT_SEC,
     parse_ffprobe_quality_output,
@@ -1210,6 +1211,50 @@ https://edge.drmlive.net/live.mpd
         self.assertEqual(out[0].video_fps_source, "manifest")
         self.assertEqual(out[1].video_fps_source, "manifest")
         self.assertEqual(out[0].video_bitrate_bps, out[1].video_bitrate_bps)
+
+    def test_manifest_probe_evidence_inspects_selected_hls_child_drm(self):
+        master = """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=4963000,RESOLUTION=1920x1080,FRAME-RATE=50
+child.m3u8
+"""
+        child = """#EXTM3U
+#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://asset"
+#EXTINF:6,
+segment.ts
+"""
+        fetched = []
+
+        def fetch_child(url):
+            fetched.append(url)
+            return child
+
+        evidence, manifest_quality, resource_route = (
+            inspect_manifest_probe_evidence(
+                master,
+                "https://cdn.test/live/master.m3u8",
+                has_decryption_keys=False,
+                fetch_child=fetch_child,
+            )
+        )
+
+        self.assertEqual(evidence["stream_type"], "HLS")
+        self.assertTrue(evidence["manifest_reachable"])
+        self.assertTrue(evidence["quality_known"])
+        self.assertEqual(evidence["video_width"], 1920)
+        self.assertEqual(evidence["video_height"], 1080)
+        self.assertEqual(evidence["video_fps"], 50.0)
+        self.assertTrue(evidence["drm_protected"])
+        self.assertTrue(evidence["drm_key_required"])
+        self.assertFalse(evidence["hls_variant_probe_failure"])
+        self.assertEqual(
+            fetched,
+            ["https://cdn.test/live/child.m3u8"],
+        )
+        self.assertEqual(
+            manifest_quality["manifest_variant_url"],
+            "https://cdn.test/live/child.m3u8",
+        )
+        self.assertEqual(resource_route, {})
 
     def test_shared_hls_parser_returns_selected_variant_url(self):
         from recorder_source.quality import parse_hls_manifest_quality

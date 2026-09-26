@@ -37,6 +37,7 @@ from .quality import (
     merge_ffprobe_quality_evidence,
     inspect_dash_manifest_drm,
     inspect_hls_manifest_drm,
+    inspect_manifest_probe_evidence,
     parse_dash_manifest_quality,
     parse_hls_manifest_quality,
     QUALITY_FFPROBE_TIMEOUT_SEC,
@@ -924,165 +925,85 @@ def probe_candidate_hls(
             urlopen_fn=urlopen,
         )
         manifest_expiry = _extract_expiry(final_url, text)
-        expiry = _merge_expiries(url_header_expiry, manifest_expiry)
 
-        manifest_type = manifest_type_from_text(text)
-        is_hls = manifest_type == "HLS"
-        is_dash = manifest_type == "DASH"
-        hls_quality = None
-        dash_quality = None
-        if is_dash:
-            dash_quality = parse_dash_manifest_quality(
-                text,
-                final_url,
-                motion_cap_fps=50.0,
+        def fetch_child_text(variant_url: str) -> str:
+            child_text, _ = source_transport.fetch_stream_manifest_text(
+                variant_url,
+                headers,
+                default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
+                urlopen_fn=urlopen,
             )
-            if dash_quality:
-                quality_known = bool(dash_quality.get("quality_known"))
-                width = int(dash_quality.get("video_width") or 0)
-                height = int(dash_quality.get("video_height") or 0)
-                fps = float(dash_quality.get("video_fps") or 0.0)
-                bitrate = int(dash_quality.get("video_bitrate_bps") or 0)
-                scan_type = str(dash_quality.get("video_scan_type") or "")
-                manifest_expiry = _merge_expiries(
-                    manifest_expiry,
-                    dash_quality.get("manifest_expiry"),
-                )
-                expiry = _merge_expiries(url_header_expiry, manifest_expiry)
-            else:
-                quality_known = False
-                width = height = bitrate = 0
-                fps = 0.0
-                scan_type = ""
-            manifest_drm = inspect_dash_manifest_drm(text)
+            return child_text
 
-            resource_route = source_transport.resolve_selected_dash_resource_route(
-                dash_quality or {},
+        def fetch_child_with_master_session(
+            master_url: str,
+            variant_url: str,
+        ) -> str:
+            return source_transport.fetch_hls_child_with_master_cookie_session(
+                master_url or candidate.stream_url,
+                variant_url,
+                headers,
+                timeout_sec=timeout_value,
+            )
+
+        def resolve_dash_resource(quality: Mapping[str, object]):
+            return source_transport.resolve_selected_dash_resource_route(
+                quality,
                 headers,
                 default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
                 expiry_parser=_extract_expiry,
                 urlopen_fn=urlopen,
             )
-            resource_expiry = resource_route.get("resource_expiry")
-            expiry = _merge_expiries(
-                url_header_expiry,
-                manifest_expiry,
-                resource_expiry,
+
+        inspection, manifest_quality, resource_route = (
+            inspect_manifest_probe_evidence(
+                text,
+                final_url,
+                has_decryption_keys=bool(candidate.keys),
+                motion_cap_fps=50.0,
+                manifest_expiry=manifest_expiry,
+                expiry_parser=_extract_expiry,
+                fetch_child=fetch_child_text,
+                fetch_child_with_master_session=fetch_child_with_master_session,
+                resolve_dash_resource=resolve_dash_resource,
             )
-        else:
-            resource_route = {}
-            resource_expiry = None
-            hls_quality = _parse_hls_quality(text, final_url)
-            if hls_quality:
-                quality_known = bool(hls_quality.get("quality_known"))
-                width = int(hls_quality.get("video_width") or 0)
-                height = int(hls_quality.get("video_height") or 0)
-                fps = float(hls_quality.get("video_fps") or 0.0)
-                bitrate = int(hls_quality.get("video_bitrate_bps") or 0)
-                scan_type = str(hls_quality.get("video_scan_type") or "")
-                manifest_expiry = _merge_expiries(
-                    manifest_expiry,
-                    hls_quality.get("manifest_expiry"),
-                )
-                expiry = _merge_expiries(url_header_expiry, manifest_expiry)
-            else:
-                quality_known = False
-                width = height = bitrate = 0
-                fps = 0.0
-                scan_type = ""
-            manifest_drm = inspect_hls_manifest_drm(text)
-            resource_route = {}
-            resource_expiry = None
+        )
 
-        drm_inspection_failure = ""
-        hls_variant_probe_status = ""
-        hls_variant_probe_failure = ""
-        if (
-            is_hls
-            and hls_quality
-            and not candidate.keys
-            and not manifest_drm.get("drm_key_required")
-        ):
-            variant_url = str(
-                hls_quality.get("manifest_variant_url") or ""
-            ).strip()
-            if variant_url:
-                child_text = ""
-                child_error = None
-
-                try:
-                    child_text, _ = source_transport.fetch_stream_manifest_text(
-                        variant_url,
-                        headers,
-                        default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
-                        urlopen_fn=urlopen,
-                    )
-                except HTTPError as error:
-                    child_error = error
-                    if int(getattr(error, "code", 0) or 0) == 403:
-                        try:
-                            child_text = (
-                                source_transport.fetch_hls_child_with_master_cookie_session(
-                                    final_url or candidate.stream_url,
-                                    variant_url,
-                                    headers,
-                                    timeout_sec=timeout_value,
-                                )
-                            )
-                            child_error = None
-                        except Exception as retry_error:
-                            child_error = retry_error
-                except Exception as error:
-                    child_error = error
-
-                if child_text:
-                    if "#EXTM3U" not in child_text:
-                        child_failure = source_transport.classify_hls_variant_probe_failure(
-                            non_hls_response=True,
-                        )
-                        hls_variant_probe_status = str(
-                            child_failure.get("status") or ""
-                        )
-                        hls_variant_probe_failure = str(
-                            child_failure.get("reason") or ""
-                        )
-                    else:
-                        try:
-                            child_drm = inspect_hls_manifest_drm(child_text)
-                        except Exception as error:
-                            drm_inspection_failure = (
-                                "HLS DRM inspection failed — "
-                                f"{type(error).__name__}: {error}"
-                            )
-                        else:
-                            manifest_drm = {
-                                **dict(manifest_drm),
-                                "drm_protected": bool(
-                                    manifest_drm.get("drm_protected")
-                                    or child_drm.get("drm_protected")
-                                ),
-                                "drm_key_required": bool(
-                                    manifest_drm.get("drm_key_required")
-                                    or child_drm.get("drm_key_required")
-                                ),
-                                "drm_detail": str(
-                                    child_drm.get("drm_detail")
-                                    or manifest_drm.get("drm_detail")
-                                    or ""
-                                ),
-                            }
-                elif child_error is not None:
-                    child_failure = source_transport.classify_hls_variant_probe_failure(
-                        child_error,
-                    )
-                    hls_variant_probe_status = str(
-                        child_failure.get("status") or ""
-                    )
-                    hls_variant_probe_failure = str(
-                        child_failure.get("reason") or ""
-                    )
-
+        manifest_expiry = inspection.get("manifest_expiry")
+        resource_expiry = inspection.get("resource_expiry")
+        expiry = _merge_expiries(
+            url_header_expiry,
+            manifest_expiry,
+            resource_expiry,
+        )
+        is_hls = inspection.get("stream_type") == "HLS"
+        is_dash = inspection.get("stream_type") == "DASH"
         is_playlist = bool(is_hls or is_dash)
+        hls_quality = manifest_quality if is_hls else None
+        dash_quality = manifest_quality if is_dash else None
+
+        quality_known = bool(inspection.get("quality_known"))
+        width = int(inspection.get("video_width") or 0)
+        height = int(inspection.get("video_height") or 0)
+        fps = float(inspection.get("video_fps") or 0.0)
+        bitrate = int(inspection.get("video_bitrate_bps") or 0)
+        scan_type = str(inspection.get("video_scan_type") or "")
+
+        manifest_drm = {
+            "drm_protected": bool(inspection.get("drm_protected")),
+            "drm_key_required": bool(inspection.get("drm_key_required")),
+            "drm_detail": str(inspection.get("drm_detail") or ""),
+        }
+        drm_inspection_failure = str(
+            inspection.get("drm_inspection_failure") or ""
+        )
+        hls_variant_probe_status = str(
+            inspection.get("hls_variant_probe_status") or ""
+        )
+        hls_variant_probe_failure = str(
+            inspection.get("hls_variant_probe_failure") or ""
+        )
+
         expired_now = expiry is not None and expiry <= time.time()
         drm_key_required = bool(manifest_drm.get("drm_key_required"))
         drm_key_missing = bool(drm_key_required and not candidate.keys)
