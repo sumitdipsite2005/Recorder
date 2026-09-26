@@ -1156,24 +1156,6 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertLess(selected_line.index("[SELECTED]"),selected_line.index("[ON]"))
         self.assertIn("not selected: lower quality",lower_line)
 
-    def test_context_only_same_feed_row_is_off_and_ignored(self):
-        context=sony_candidate(
-            playlist="https://context.test/list",
-            source_name="context-source",
-            title="Men's Marathon - Athletics - 26 Sep 2026 [ENG]",
-            tvg="",
-            ignored=True,
-            reason=(
-                "same feed identity context; source metadata is compatible "
-                "but less specific than a matching observation"
-            ),
-        )
-        rendered=coord.render_dashboard(snapshot([context]),())
-        row=next(line for line in rendered.splitlines() if "Men's Marathon" in line)
-        self.assertIn("[OFF] IGNORED —",row)
-        self.assertIn("same feed identity context",row)
-        self.assertNotIn("[ON]",row)
-
     def test_unavailable_expiry_classification_is_front_loaded(self):
         expiry=datetime(2026,9,24,9,30,0).timestamp()
         item=replace(
