@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from recorder_coordinator.registry import IdentityRegistryStore
+from recorder_runtime.registry import IdentityRegistryStore
 from recorder_coordinator.worker import launch_identity_worker
 from recorder_runtime.identity_launch import (
     FrozenTargetIntent,

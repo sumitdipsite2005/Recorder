@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import recorder_identity_worker as worker
-from recorder_coordinator.registry import IdentityRegistryStore
+from recorder_runtime.registry import IdentityRegistryStore
 from recorder_runtime.identity_launch import (
     FrozenTargetIntent,
     IdentityLaunchRequest,

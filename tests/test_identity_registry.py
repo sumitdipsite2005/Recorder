@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 
-from recorder_coordinator.registry import (
+from recorder_runtime.registry import (
     IdentityLaunchBlocked,
     IdentityRegistryStore,
     InvalidRegistryTransition,

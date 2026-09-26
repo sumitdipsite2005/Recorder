@@ -65,6 +65,18 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("from recorder_runtime import sound as runtime_sound", recorder)
         self.assertIn("from recorder_runtime import sound as runtime_sound", coordinator)
 
+    def test_identity_registry_lives_in_shared_runtime_layer(self):
+        self.assertTrue((ROOT/"recorder_runtime"/"registry.py").is_file())
+        self.assertFalse((ROOT/"recorder_coordinator"/"registry.py").exists())
+        for path in (
+            ROOT/"recorder_event_coordinator.py",
+            ROOT/"recorder_identity_worker.py",
+            ROOT/"recorder_coordinator"/"worker.py",
+        ):
+            text=path.read_text(encoding="utf-8")
+            self.assertIn("recorder_runtime.registry", text)
+            self.assertNotIn("recorder_coordinator.registry", text)
+
     def test_shared_source_package_does_not_depend_on_entrypoint_files(self):
         for path in (ROOT/"recorder_source").glob("*.py"):
             text=path.read_text(encoding="utf-8")

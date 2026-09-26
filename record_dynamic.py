@@ -59,7 +59,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 
 from recorder_runtime import sound as runtime_sound
-from recorder_runtime.identity_launch import IdentityLaunchRequest
+from recorder_runtime.identity_launch import (
+    IdentityLaunchRequest,
+    target_intents_for_recovery_playlist,
+)
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_source import discovery as source_discovery
 from recorder_source import matching as source_matching
@@ -12363,11 +12366,21 @@ def finalize_playlist_history(state: RecorderState) -> bool:
 
 def _identity_worker_match_definitions(
     state: Optional[RecorderState],
+    *,
+    playlist_url: Optional[str] = None,
 ) -> Optional[tuple]:
     request = getattr(state, "identity_launch_request", None)
     if request is None:
         return None
 
+    intents = (
+        target_intents_for_recovery_playlist(
+            request.target_intents,
+            playlist_url,
+        )
+        if playlist_url is not None
+        else request.target_intents
+    )
     mode = get_nm3u8dl_playlist_match_mode()
     return tuple(
         source_matching.make_match_definition(
@@ -12378,7 +12391,7 @@ def _identity_worker_match_definitions(
             preferred=intent.preferred,
             match_all=intent.match_all,
         )
-        for intent in request.target_intents
+        for intent in intents
     )
 
 
@@ -12666,9 +12679,15 @@ def resolve_nm3u8dl_playlist_source(
 
                 continue
 
+            worker_match_definitions = _identity_worker_match_definitions(
+                state,
+                playlist_url=playlist_url,
+            )
+            if worker_match_definitions == ():
+                continue
             entries = find_nm3u8dl_playlist_entries(
                 playlist_text,
-                match_definitions=_identity_worker_match_definitions(state),
+                match_definitions=worker_match_definitions,
             )
 
             playlist_candidates = []

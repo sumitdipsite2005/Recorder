@@ -14,7 +14,7 @@ from recorder_runtime.identity_launch import (
 )
 from recorder_runtime.terminal_host import launch_terminal_tab
 
-from .registry import (
+from recorder_runtime.registry import (
     IdentityRegistryStore,
     STATE_CRASHED,
     STATE_RECORDING,

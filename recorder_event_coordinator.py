@@ -31,13 +31,13 @@ except ImportError:  # pragma: no cover - Windows is the production terminal
     msvcrt = None
 
 from recorder_runtime import sound as runtime_sound
-from recorder_runtime.identity_launch import IdentityLaunchRequest
+from recorder_runtime.identity_launch import FrozenTargetIntent, IdentityLaunchRequest
 from recorder_runtime.identity_status import IdentityRuntimeStatusStore
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_runtime.sound import SoundSnoozeState
 
 from recorder_coordinator.launch import build_manual_launch_plan
-from recorder_coordinator.registry import IdentityRegistryStore
+from recorder_runtime.registry import IdentityRegistryStore
 from recorder_coordinator.worker import launch_identity_worker
 from recorder_coordinator.models import (
     ChangeEvent,
@@ -1158,21 +1158,30 @@ def _write_registry_state_change(
     )
 
 
-def _manual_recovery_playlist_urls(
+def _freeze_manual_recovery_scope(
     snapshot: DashboardSnapshot,
     plan,
     raw_config: Mapping[str, object],
-) -> Tuple[str, ...]:
-    """Freeze only the launch-winning targets' explicit provider source scope."""
-    winning_names = {intent.name for intent in plan.target_intents}
-    urls: List[str] = []
-    seen: Set[str] = set()
+) -> Tuple[Tuple[FrozenTargetIntent, ...], Tuple[str, ...]]:
+    """Freeze each winning search together with its own launch-time source URLs."""
+    target_by_name = {
+        view.target.name: view.target
+        for view in snapshot.target_views
+    }
+    frozen_intents: List[FrozenTargetIntent] = []
+    all_urls: List[str] = []
+    all_seen: Set[str] = set()
 
-    for view in snapshot.target_views:
-        target = view.target
-        if target.name not in winning_names:
-            continue
-        for group in target.source_groups:
+    for intent in plan.target_intents:
+        target = target_by_name.get(intent.name)
+        if target is None:
+            raise RuntimeError(
+                f"Selected MANUAL target {intent.name!r} is no longer available"
+            )
+
+        intent_urls: List[str] = []
+        intent_seen: Set[str] = set()
+        for group in intent.source_groups:
             context_group = _source_context_group_for_target(target, group)
             provider = str(
                 GROUP_PROVIDER.get(context_group, context_group)
@@ -1184,16 +1193,32 @@ def _manual_recovery_playlist_urls(
                 group,
                 context_group=context_group,
             ):
-                if spec.url not in seen:
-                    seen.add(spec.url)
-                    urls.append(spec.url)
+                if spec.url not in intent_seen:
+                    intent_seen.add(spec.url)
+                    intent_urls.append(spec.url)
+                if spec.url not in all_seen:
+                    all_seen.add(spec.url)
+                    all_urls.append(spec.url)
 
-    if not urls:
+        if not intent_urls:
+            raise RuntimeError(
+                f"Selected MANUAL target {intent.name!r} has no frozen "
+                "recovery playlist source scope"
+            )
+
+        frozen_intents.append(
+            replace(
+                intent,
+                recovery_playlist_urls=tuple(intent_urls),
+            )
+        )
+
+    if not frozen_intents or not all_urls:
         raise RuntimeError(
             "Selected MANUAL identity has no frozen recovery playlist source scope"
         )
-    return tuple(urls)
 
+    return tuple(frozen_intents), tuple(all_urls)
 
 def _launch_manual_identity(
     snapshot: DashboardSnapshot,
@@ -1208,7 +1233,7 @@ def _launch_manual_identity(
     ] = None,
 ):
     plan = build_manual_launch_plan(snapshot, identity_key)
-    recovery_playlist_urls = _manual_recovery_playlist_urls(
+    target_intents, recovery_playlist_urls = _freeze_manual_recovery_scope(
         snapshot,
         plan,
         raw_config,
@@ -1220,7 +1245,7 @@ def _launch_manual_identity(
         selected_source_group=plan.selected_source_group,
         selected_candidate=plan.selected_candidate,
         initial_candidate_pool=plan.candidate_pool,
-        target_intents=plan.target_intents,
+        target_intents=target_intents,
         recovery_playlist_urls=recovery_playlist_urls,
         recording_duration_min=plan.recording_duration_min,
         base_name=plan.base_name,

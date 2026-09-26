@@ -285,12 +285,79 @@ class ManualRecordLaunchTests(unittest.TestCase):
                 request.recovery_playlist_urls,
                 ("https://src1.test/list.m3u",),
             )
+            self.assertEqual(
+                request.target_intents[0].recovery_playlist_urls,
+                ("https://src1.test/list.m3u",),
+            )
             self.assertEqual(request.base_name, "Sports - Asian Games")
             self.assertEqual(plan.base_name, "Sports - Asian Games")
             self.assertEqual(
                 captured["config_path"],
                 config_path,
             )
+
+
+    def test_tied_targets_keep_separate_recovery_source_scopes(self):
+        candidate = sony_candidate()
+        target_a = target(
+            name="Target A",
+            source_groups=("SONYLIV_EVENTS",),
+            primary=("Asian",),
+        )
+        target_b = target(
+            name="Target B",
+            source_groups=("SONY_TV",),
+            primary=("Games",),
+        )
+        now = datetime(2026, 9, 24, 10, 0, 0)
+        snap = coord.build_snapshot(
+            (view(target_a, now=now), view(target_b, now=now)),
+            {
+                "Target A": (candidate,),
+                "Target B": (candidate,),
+            },
+            now=now,
+        )
+        identity_key = next(
+            identity
+            for policy, identity in snap.blocks
+            if policy == coord.POLICY_MANUAL
+        )
+        plan = coord.build_manual_launch_plan(
+            snap,
+            identity_key,
+            now_ts=now.timestamp(),
+        )
+
+        intents, all_urls = coord._freeze_manual_recovery_scope(
+            snap,
+            plan,
+            {
+                "NM3U8DL_PLAYLIST_GROUPS": {
+                    "COMMON": [],
+                    "SONYLIV_EVENTS": ["https://events.test/list.m3u"],
+                    "TV": ["https://tv.test/list.m3u"],
+                },
+            },
+        )
+
+        self.assertEqual(
+            {
+                intent.name: intent.recovery_playlist_urls
+                for intent in intents
+            },
+            {
+                "Target A": ("https://events.test/list.m3u",),
+                "Target B": ("https://tv.test/list.m3u",),
+            },
+        )
+        self.assertEqual(
+            all_urls,
+            (
+                "https://events.test/list.m3u",
+                "https://tv.test/list.m3u",
+            ),
+        )
 
 
 class TargetConfigTests(unittest.TestCase):

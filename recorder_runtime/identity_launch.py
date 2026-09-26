@@ -47,6 +47,7 @@ class FrozenTargetIntent:
 
     name: str
     source_groups: Tuple[str, ...]
+    recovery_playlist_urls: Tuple[str, ...] = ()
     primary: Tuple[object, ...] = ()
     required: Tuple[object, ...] = ()
     rejected: Tuple[object, ...] = ()
@@ -61,6 +62,11 @@ class FrozenTargetIntent:
             source_groups=tuple(
                 str(item).strip().upper()
                 for item in (value.get("source_groups") or ())
+                if str(item).strip()
+            ),
+            recovery_playlist_urls=tuple(
+                str(item).strip()
+                for item in (value.get("recovery_playlist_urls") or ())
                 if str(item).strip()
             ),
             primary=tuple(_freeze(item) for item in (value.get("primary") or ())),
@@ -79,6 +85,7 @@ class FrozenTargetIntent:
         return {
             "name": self.name,
             "source_groups": list(self.source_groups),
+            "recovery_playlist_urls": list(self.recovery_playlist_urls),
             "primary": _json_value(self.primary),
             "required": _json_value(self.required),
             "rejected": _json_value(self.rejected),
@@ -86,6 +93,24 @@ class FrozenTargetIntent:
             "match_all": self.match_all,
             "worker_recording_duration_min": self.worker_recording_duration_min,
         }
+
+
+def target_intents_for_recovery_playlist(
+    target_intents: Sequence[FrozenTargetIntent],
+    playlist_url: str,
+) -> Tuple[FrozenTargetIntent, ...]:
+    """Keep each frozen search definition attached to its launch-time source scope."""
+    url = str(playlist_url or "").strip()
+    if not url:
+        return tuple(target_intents)
+    return tuple(
+        intent
+        for intent in target_intents
+        if (
+            not intent.recovery_playlist_urls
+            or url in intent.recovery_playlist_urls
+        )
+    )
 
 
 @dataclass(frozen=True)

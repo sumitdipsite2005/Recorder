@@ -8,6 +8,7 @@ from recorder_runtime.identity_launch import (
     FrozenTargetIntent,
     IdentityLaunchRequest,
     read_launch_request,
+    target_intents_for_recovery_playlist,
     write_launch_request_temp,
 )
 from recorder_source.models import SourceCandidate
@@ -34,6 +35,7 @@ class IdentityLaunchRequestTests(unittest.TestCase):
         target = FrozenTargetIntent(
             name="Example",
             source_groups=("SONYLIV_EVENTS",),
+            recovery_playlist_urls=("https://example.test/list.m3u",),
             primary=(("example", "event"),),
             required=("english",),
             worker_recording_duration_min=120.0,
@@ -75,10 +77,49 @@ class IdentityLaunchRequestTests(unittest.TestCase):
             request.target_intents[0].primary,
         )
         self.assertEqual(
+            loaded.target_intents[0].recovery_playlist_urls,
+            ("https://example.test/list.m3u",),
+        )
+        self.assertEqual(
             loaded.recovery_playlist_urls,
             ("https://example.test/list.m3u",),
         )
         self.assertEqual(loaded.recording_duration_min, 120.0)
+
+    def test_recovery_playlist_keeps_only_its_own_frozen_searches(self):
+        target_a = FrozenTargetIntent(
+            name="A",
+            source_groups=("SONYLIV_EVENTS",),
+            recovery_playlist_urls=("https://a.test/list.m3u",),
+            primary=("boxing",),
+        )
+        target_b = FrozenTargetIntent(
+            name="B",
+            source_groups=("SONY_TV",),
+            recovery_playlist_urls=("https://b.test/list.m3u",),
+            primary=("india",),
+        )
+
+        self.assertEqual(
+            tuple(
+                item.name
+                for item in target_intents_for_recovery_playlist(
+                    (target_a, target_b),
+                    "https://a.test/list.m3u",
+                )
+            ),
+            ("A",),
+        )
+        self.assertEqual(
+            tuple(
+                item.name
+                for item in target_intents_for_recovery_playlist(
+                    (target_a, target_b),
+                    "https://b.test/list.m3u",
+                )
+            ),
+            ("B",),
+        )
 
     def test_temp_handoff_can_be_consumed_and_deleted(self):
         request = self.make_request()

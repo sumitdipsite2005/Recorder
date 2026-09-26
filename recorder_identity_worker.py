@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Optional, Sequence
 
-from recorder_coordinator.registry import (
+from recorder_runtime.registry import (
     IdentityRegistryStore,
     STATE_CRASHED,
     STATE_ENDED,
