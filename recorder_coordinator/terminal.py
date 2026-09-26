@@ -94,7 +94,14 @@ def _group_text(text: str, use_color: bool) -> str:
 
 
 def _change_detail_text(text: str, use_color: bool) -> str:
-    return _paint_rgb(text, _CHANGE_DETAIL_RGB, use_color)
+    value = str(text or "")
+    if " -> " not in value:
+        return _paint_rgb(value, _CHANGE_DETAIL_RGB, use_color)
+    old_value, new_value = value.split(" -> ", 1)
+    return (
+        _secondary_text(old_value, use_color)
+        + _paint_rgb(" -> " + new_value, _CHANGE_DETAIL_RGB, use_color)
+    )
 
 
 def _important_text(text: str, use_color: bool) -> str:

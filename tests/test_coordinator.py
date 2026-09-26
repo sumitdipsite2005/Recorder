@@ -1151,13 +1151,14 @@ class SnapshotAndChangeTests(unittest.TestCase):
             rendered,
         )
 
-    def test_update_delta_is_highlighted_yellow(self):
+    def test_update_delta_dims_old_value_and_highlights_arrow_and_new_value(self):
         old=snapshot([sony_candidate(title="Shooting")])
         new=snapshot([sony_candidate(title="Athletics")])
         events=coord.diff_snapshots(old,new)
         rendered=coord.render_dashboard(new,events,use_color=True)
         self.assertIn(
-            "\033[38;2;255;215;0mEvent Shooting -> Athletics\033[0m",
+            "\033[38;2;176;176;176mEvent Shooting\033[0m"
+            "\033[38;2;255;215;0m -> Athletics\033[0m",
             rendered,
         )
 
