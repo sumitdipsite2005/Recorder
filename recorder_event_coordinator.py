@@ -55,15 +55,18 @@ from recorder_runtime.registry import IdentityRegistryStore
 from recorder_coordinator.worker import launch_identity_worker
 from recorder_coordinator.models import (
     ChangeEvent,
+    CoordinatorWindow,
     DashboardSnapshot,
     IdentityTarget,
     POLICY_ALL,
     POLICY_MANUAL,
+    TargetRuntime,
     TargetView,
     VALID_POLICIES,
 )
 from recorder_coordinator.snapshot import (
     build_snapshot,
+    compact_source_name,
     diff_snapshots,
 )
 from recorder_coordinator.terminal import (
@@ -81,7 +84,10 @@ from recorder_coordinator.terminal import (
     watch_status_text,
     write_log,
 )
-from recorder_source.policy import PLAYLIST_GROUP_MATCH_MODES as GROUP_MATCH_MODE
+from recorder_source.policy import (
+    PLAYLIST_GROUP_MATCH_MODES as GROUP_MATCH_MODE,
+    PLAYLIST_GROUP_PROFILES as GROUP_PROVIDER,
+)
 
 
 REGISTRY_REFRESH_INTERVAL_SEC = 1.0
