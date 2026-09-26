@@ -12,16 +12,14 @@ remains orchestration-focused.
 from __future__ import annotations
 
 import argparse
-import math
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import runpy
 import sys
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -57,18 +55,15 @@ from recorder_runtime.registry import IdentityRegistryStore
 from recorder_coordinator.worker import launch_identity_worker
 from recorder_coordinator.models import (
     ChangeEvent,
-    CoordinatorWindow,
     DashboardSnapshot,
     IdentityTarget,
     POLICY_ALL,
     POLICY_MANUAL,
-    TargetRuntime,
     TargetView,
     VALID_POLICIES,
 )
 from recorder_coordinator.snapshot import (
     build_snapshot,
-    compact_source_name,
     diff_snapshots,
 )
 from recorder_coordinator.terminal import (
@@ -86,27 +81,13 @@ from recorder_coordinator.terminal import (
     watch_status_text,
     write_log,
 )
-from recorder_source.discovery import (
-    fetch_playlist_documents,
-    parse_playlist_text,
-    probe_candidates,
-    resolve_playlist_source_freshness,
-)
-from recorder_source.identity import derive_feed_identity
-from recorder_source.matching import evaluate_match, make_match_definition
-from recorder_source.models import PlaylistSourceSpec, SourceCandidate
-from recorder_source.policy import (
-    PLAYLIST_GROUP_MATCH_MODES as GROUP_MATCH_MODE,
-    PLAYLIST_GROUP_PROFILES as GROUP_PROVIDER,
-    PLAYLIST_GROUP_SOURCE_BUCKETS as GROUP_SOURCE_BUCKET,
-    PLAYLIST_USER_AGENTS,
-)
+from recorder_source.policy import PLAYLIST_GROUP_MATCH_MODES as GROUP_MATCH_MODE
 
 
 REGISTRY_REFRESH_INTERVAL_SEC = 1.0
 
 
-ef _default_config_path() -> Path:
+def _default_config_path() -> Path:
     if sys.platform == "darwin":
         root = Path.home() / "Library/CloudStorage/OneDrive-Personal/RECORDER"
     elif os.name == "nt":
