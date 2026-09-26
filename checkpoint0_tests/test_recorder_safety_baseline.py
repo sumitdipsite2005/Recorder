@@ -439,34 +439,35 @@ https://example.test/rejected.m3u8
                 "stream_type": "HLS",
             }
 
-        first = source("https://edge.test/session-a/master.m3u8")
-        RECORDER._nm3u8dl_set_running_stream_identity(state, first)
-        self.assertEqual(
-            RECORDER._nm3u8dl_handle_playlist_stream_failure(
-                state,
-                "NO_FILE_APPEAR",
-            ),
-            "retry",
-        )
-        self.assertEqual(
-            RECORDER._nm3u8dl_handle_playlist_stream_failure(
-                state,
-                "NO_FILE_APPEAR",
-            ),
-            "rescan",
-        )
-        self.assertFalse(state.nm3u8dl_bad_stream_routes)
+        with patch.object(RECORDER, "log"):
+            first = source("https://edge.test/session-a/master.m3u8")
+            RECORDER._nm3u8dl_set_running_stream_identity(state, first)
+            self.assertEqual(
+                RECORDER._nm3u8dl_handle_playlist_stream_failure(
+                    state,
+                    "NO_FILE_APPEAR",
+                ),
+                "retry",
+            )
+            self.assertEqual(
+                RECORDER._nm3u8dl_handle_playlist_stream_failure(
+                    state,
+                    "NO_FILE_APPEAR",
+                ),
+                "rescan",
+            )
+            self.assertFalse(state.nm3u8dl_bad_stream_routes)
 
-        second = source("https://edge.test/session-b/master.m3u8")
-        RECORDER._nm3u8dl_set_running_stream_identity(state, second)
-        RECORDER._nm3u8dl_handle_playlist_stream_failure(
-            state,
-            "NO_FILE_APPEAR",
-        )
-        RECORDER._nm3u8dl_handle_playlist_stream_failure(
-            state,
-            "NO_FILE_APPEAR",
-        )
+            second = source("https://edge.test/session-b/master.m3u8")
+            RECORDER._nm3u8dl_set_running_stream_identity(state, second)
+            RECORDER._nm3u8dl_handle_playlist_stream_failure(
+                state,
+                "NO_FILE_APPEAR",
+            )
+            RECORDER._nm3u8dl_handle_playlist_stream_failure(
+                state,
+                "NO_FILE_APPEAR",
+            )
 
         route_key = RECORDER.get_nm3u8dl_stream_route_fingerprint(second)
         self.assertIn(route_key, state.nm3u8dl_bad_stream_routes)
