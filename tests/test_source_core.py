@@ -11,6 +11,11 @@ from urllib.error import HTTPError
 
 from recorder_source.headers import canonicalize_header_name
 from recorder_source.playback import playback_fingerprint
+from recorder_source.playlist_headers import (
+    MATURE_PLAYLIST_HEADER_POLICY,
+    NORMALIZED_PLAYLIST_HEADER_POLICY,
+    parse_stream_url_and_headers,
+)
 from recorder_source.discovery import (
     _github_file_commit_timestamp,
     adapt_json_playlist_text,
@@ -333,6 +338,23 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(c.extra["source_name"], "Source A")
         self.assertEqual(c.extra["source_group"], "SONYLIV_EVENTS")
         self.assertEqual(c.extra["provider"], "SONYLIV")
+
+    def test_shared_playlist_header_parser_preserves_both_existing_compatibility_profiles(self):
+        raw = "https://cdn.test/live.mpd?|Cookie=b%3D2"
+        mature_url, mature_headers = parse_stream_url_and_headers(
+            raw,
+            (),
+            policy=MATURE_PLAYLIST_HEADER_POLICY,
+        )
+        normalized_url, normalized_headers = parse_stream_url_and_headers(
+            raw,
+            (),
+            policy=NORMALIZED_PLAYLIST_HEADER_POLICY,
+        )
+        self.assertEqual(mature_url, "https://cdn.test/live.mpd")
+        self.assertEqual(mature_headers["Cookie"], "b%3D2")
+        self.assertEqual(normalized_url, "https://cdn.test/live.mpd?")
+        self.assertEqual(normalized_headers["Cookie"], "b=2")
 
     def test_header_precedence_pipe_over_exthttp_over_extvlc(self):
         text = '''#EXTM3U
