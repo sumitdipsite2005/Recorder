@@ -23,9 +23,12 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
+from .headers import canonicalize_header_name
 from .matching import evaluate_match
+from .playback import playback_fingerprint
 from .quality import (
     extract_auth_expiry,
+    merge_auth_expiries,
     inspect_dash_manifest_drm,
     inspect_hls_manifest_drm,
     parse_dash_manifest_quality,
@@ -269,26 +272,12 @@ def parse_extinf_metadata(extinf: str) -> Dict[str, str]:
     }
 
 
-def _canonical_header_name(name: str) -> str:
-    text = str(name or "").strip()
-    known = {
-        "user-agent": "User-Agent",
-        "referer": "Referer",
-        "referrer": "Referer",
-        "origin": "Origin",
-        "cookie": "Cookie",
-        "authorization": "Authorization",
-        "accept": "Accept",
-    }
-    return known.get(text.casefold(), text)
-
-
 def _apply_headers(target: Dict[str, str], values: Mapping[str, object]) -> None:
     """Apply one metadata layer case-insensitively; later layers win."""
     for raw_name, raw_value in values.items():
         if raw_value is None:
             continue
-        name = _canonical_header_name(str(raw_name))
+        name = canonicalize_header_name(str(raw_name))
         value = str(raw_value).strip()
         if not name or not value:
             continue
@@ -453,27 +442,6 @@ def _stream_type_from_url(value: str) -> str:
     if ".m3u8" in path:
         return "HLS"
     return ""
-
-
-def _fingerprint_header_value(headers: Mapping[str, str], wanted: str) -> str:
-    for name, value in headers.items():
-        if str(name).strip().casefold() == wanted.casefold():
-            return str(value or "").strip()
-    return ""
-
-
-def _playback_fingerprint(final_url: str, headers: Mapping[str, str]) -> str:
-    if not str(final_url or "").strip():
-        return ""
-    payload = {
-        "final_manifest_url": str(final_url).strip(),
-        "headers": {
-            name.casefold(): _fingerprint_header_value(headers, name)
-            for name in ("Cookie", "Authorization", "Referer", "Origin")
-        },
-    }
-    serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _candidate_decryption_key(candidate: SourceCandidate) -> str:
@@ -951,8 +919,8 @@ def _effective_probe_headers(candidate: SourceCandidate) -> Dict[str, str]:
 
 
 def _merge_expiries(*values: Optional[float]) -> Optional[float]:
-    known = [float(value) for value in values if value is not None]
-    return min(known) if known else None
+    merged = merge_auth_expiries(*values)
+    return float(merged) if merged is not None else None
 
 
 def _candidate_url_header_expiry(candidate: SourceCandidate) -> Optional[float]:
@@ -1309,7 +1277,7 @@ def probe_candidate_hls(
             expiry=expiry,
             expiry_source="URL/manifest" if expiry is not None else "",
             stream_type="DASH" if is_dash else "HLS" if is_hls else candidate.stream_type,
-            playback_fingerprint=_playback_fingerprint(final_url, headers),
+            playback_fingerprint=playback_fingerprint(final_url, headers),
             quality_known=quality_known,
             quality_source=quality_source,
             video_width=width,
