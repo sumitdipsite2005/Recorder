@@ -137,7 +137,8 @@ class ArchitectureGuardTests(unittest.TestCase):
 
         self.assertIn("def selection_nonselection_reason(",selection)
         self.assertIn("source_selection.selection_nonselection_reason(",recorder)
-        self.assertIn("selection_nonselection_reason(",terminal)
+        self.assertNotIn("selection_nonselection_reason(",terminal)
+        self.assertIn("runtime_status",terminal)
         self.assertNotIn('return "not selected: lower quality"',recorder)
 
         self.assertIn("selection_policy_for_provider(",launch)
