@@ -1,4 +1,4 @@
-"""Build an explicit MANUAL identity launch plan from one Coordinator snapshot."""
+"""Build one identity-worker launch plan from a completed Coordinator snapshot."""
 
 from __future__ import annotations
 
@@ -13,11 +13,17 @@ from recorder_source.models import SourceCandidate
 from recorder_source.policy import selection_policy_for_provider
 from recorder_source.selection import candidate_quality_rank, select_join_candidate
 
-from .models import DashboardSnapshot, IdentityTarget, POLICY_MANUAL
+from .models import (
+    DashboardSnapshot,
+    IdentityTarget,
+    POLICY_ALL,
+    POLICY_MANUAL,
+    VALID_POLICIES,
+)
 
 
 @dataclass(frozen=True)
-class ManualLaunchPlan:
+class IdentityLaunchPlan:
     identity: CanonicalFeedIdentity
     selected_candidate: SourceCandidate
     candidate_pool: Tuple[SourceCandidate, ...]
@@ -89,22 +95,34 @@ def _safe_base_name(candidate: SourceCandidate, fallback: str) -> str:
     return cleaned
 
 
-def build_manual_launch_plan(
+def build_identity_launch_plan(
     snapshot: DashboardSnapshot,
     identity_key: str,
     *,
+    launch_policy: str,
     now_ts: Optional[float] = None,
-) -> ManualLaunchPlan:
-    block = snapshot.blocks.get((POLICY_MANUAL, identity_key))
+) -> IdentityLaunchPlan:
+    normalized_policy = str(launch_policy or "").strip().upper()
+    if normalized_policy not in VALID_POLICIES:
+        raise ValueError(f"unsupported identity launch policy: {launch_policy!r}")
+
+    block = snapshot.blocks.get((normalized_policy, identity_key))
     if block is None:
-        raise ValueError(f"MANUAL identity is no longer available: {identity_key}")
+        raise ValueError(
+            f"{normalized_policy} identity is no longer available: {identity_key}"
+        )
     if block.best_candidate is None:
-        raise ValueError(f"MANUAL identity has no recordable candidate: {identity_key}")
+        raise ValueError(
+            f"{normalized_policy} identity has no recordable candidate: {identity_key}"
+        )
 
     target_views = {
         view.target.name: view
         for view in snapshot.target_views
-        if view.status == "ACTIVE" and view.target.policy == POLICY_MANUAL
+        if (
+            view.status == "ACTIVE"
+            and view.target.policy == normalized_policy
+        )
     }
 
     contexts: List[Tuple[IdentityTarget, SourceCandidate]] = []
@@ -123,28 +141,34 @@ def build_manual_launch_plan(
 
     if not contexts:
         raise ValueError(
-            f"MANUAL identity has no active target/candidate context: {identity_key}"
+            f"{normalized_policy} identity has no active target/candidate context: "
+            f"{identity_key}"
         )
 
-    policy = selection_policy_for_provider(block.identity.provider)
+    selection_policy = selection_policy_for_provider(block.identity.provider)
     decision = select_join_candidate(
         [candidate for _, candidate in contexts],
-        policy,
+        selection_policy,
         now_ts=time.time() if now_ts is None else float(now_ts),
     )
     if decision.selected_index is None or decision.selected is None:
-        raise ValueError(f"MANUAL identity has no selectable candidate: {identity_key}")
+        raise ValueError(
+            f"{normalized_policy} identity has no selectable candidate: {identity_key}"
+        )
 
     selected_target, selected_candidate = contexts[decision.selected_index]
     selected_key = _candidate_exact_key(selected_candidate)
-    selected_rank = candidate_quality_rank(selected_candidate, policy)
+    selected_rank = candidate_quality_rank(
+        selected_candidate,
+        selection_policy,
+    )
 
     winning_targets: List[IdentityTarget] = []
     seen_target_names = set()
     for target, candidate in contexts:
         if _candidate_exact_key(candidate) != selected_key:
             continue
-        if candidate_quality_rank(candidate, policy) != selected_rank:
+        if candidate_quality_rank(candidate, selection_policy) != selected_rank:
             continue
         if target.name in seen_target_names:
             continue
@@ -163,7 +187,7 @@ def build_manual_launch_plan(
         )
 
     targets_tuple = tuple(winning_targets)
-    return ManualLaunchPlan(
+    return IdentityLaunchPlan(
         identity=block.identity,
         selected_candidate=selected_candidate,
         candidate_pool=tuple(block.candidates),
@@ -171,4 +195,36 @@ def build_manual_launch_plan(
         target_intents=tuple(_target_intent(target) for target in targets_tuple),
         recording_duration_min=_combined_duration(targets_tuple),
         base_name=_safe_base_name(selected_candidate, selected_target.name),
+    )
+
+
+# Compatibility surface for existing MANUAL callers/tests.
+ManualLaunchPlan = IdentityLaunchPlan
+
+
+def build_manual_launch_plan(
+    snapshot: DashboardSnapshot,
+    identity_key: str,
+    *,
+    now_ts: Optional[float] = None,
+) -> IdentityLaunchPlan:
+    return build_identity_launch_plan(
+        snapshot,
+        identity_key,
+        launch_policy=POLICY_MANUAL,
+        now_ts=now_ts,
+    )
+
+
+def build_all_launch_plan(
+    snapshot: DashboardSnapshot,
+    identity_key: str,
+    *,
+    now_ts: Optional[float] = None,
+) -> IdentityLaunchPlan:
+    return build_identity_launch_plan(
+        snapshot,
+        identity_key,
+        launch_policy=POLICY_ALL,
+        now_ts=now_ts,
     )

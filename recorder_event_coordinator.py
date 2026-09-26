@@ -1,8 +1,8 @@
-"""Identity Coordinator — Inspect / Watch / MANUAL launch orchestration.
+"""Identity Coordinator — Inspect / Watch / identity launch orchestration.
 
-The Coordinator discovers qualifying identities, presents watch state, and for
-MANUAL policy launches an independently running mature-recorder worker only
-after the user explicitly chooses an identity.
+The Coordinator discovers qualifying identities and presents watch state.
+MANUAL launches only after user selection; ALL_IDENTITIES automatically launches
+each newly eligible canonical identity through the same worker path.
 
 State/change intelligence, launch planning, worker creation, registry ownership,
 and terminal presentation stay behind focused modules so this entry point
@@ -50,8 +50,11 @@ from recorder_coordinator.configuration import (
     target_view,
     validate_target_source_scopes,
 )
-from recorder_coordinator.launch import build_manual_launch_plan
-from recorder_runtime.registry import IdentityRegistryStore
+from recorder_coordinator.launch import (
+    build_identity_launch_plan,
+    build_manual_launch_plan,
+)
+from recorder_runtime.registry import IdentityLaunchBlocked, IdentityRegistryStore
 from recorder_coordinator.worker import launch_identity_worker
 from recorder_coordinator.models import (
     ChangeEvent,
@@ -326,7 +329,7 @@ def _write_registry_state_change(
     )
 
 
-def _freeze_manual_recovery_scope(
+def _freeze_identity_recovery_scope(
     snapshot: DashboardSnapshot,
     plan,
     raw_config: Mapping[str, object],
@@ -344,7 +347,7 @@ def _freeze_manual_recovery_scope(
         target = target_by_name.get(intent.name)
         if target is None:
             raise RuntimeError(
-                f"Selected MANUAL target {intent.name!r} is no longer available"
+                f"Selected identity target {intent.name!r} is no longer available"
             )
 
         intent_urls: List[str] = []
@@ -389,7 +392,7 @@ def _freeze_manual_recovery_scope(
 
         if not intent_urls:
             raise RuntimeError(
-                f"Selected MANUAL target {intent.name!r} has no frozen "
+                f"Selected identity target {intent.name!r} has no frozen "
                 "recovery playlist source scope"
             )
 
@@ -403,15 +406,16 @@ def _freeze_manual_recovery_scope(
 
     if not frozen_intents or not all_urls:
         raise RuntimeError(
-            "Selected MANUAL identity has no frozen recovery playlist source scope"
+            "Selected identity has no frozen recovery playlist source scope"
         )
 
     return tuple(frozen_intents), tuple(all_urls)
 
-def _launch_manual_identity(
+def _launch_identity(
     snapshot: DashboardSnapshot,
     identity_key: str,
     *,
+    launch_policy: str,
     registry_session_id: str,
     registry_store: IdentityRegistryStore,
     config_path: Path,
@@ -420,8 +424,12 @@ def _launch_manual_identity(
         Callable[[str, str, Mapping[str, object]], None]
     ] = None,
 ):
-    plan = build_manual_launch_plan(snapshot, identity_key)
-    target_intents, recovery_playlist_urls = _freeze_manual_recovery_scope(
+    plan = build_identity_launch_plan(
+        snapshot,
+        identity_key,
+        launch_policy=launch_policy,
+    )
+    target_intents, recovery_playlist_urls = _freeze_identity_recovery_scope(
         snapshot,
         plan,
         raw_config,
@@ -445,6 +453,116 @@ def _launch_manual_identity(
         registry_transition_callback=registry_transition_callback,
     )
     return plan, result
+
+
+def _launch_manual_identity(
+    snapshot: DashboardSnapshot,
+    identity_key: str,
+    *,
+    registry_session_id: str,
+    registry_store: IdentityRegistryStore,
+    config_path: Path,
+    raw_config: Mapping[str, object],
+    registry_transition_callback: Optional[
+        Callable[[str, str, Mapping[str, object]], None]
+    ] = None,
+):
+    return _launch_identity(
+        snapshot,
+        identity_key,
+        launch_policy=POLICY_MANUAL,
+        registry_session_id=registry_session_id,
+        registry_store=registry_store,
+        config_path=config_path,
+        raw_config=raw_config,
+        registry_transition_callback=registry_transition_callback,
+    )
+
+
+# Compatibility for existing tests/callers that inspect the MANUAL freeze helper.
+def _freeze_manual_recovery_scope(
+    snapshot: DashboardSnapshot,
+    plan,
+    raw_config: Mapping[str, object],
+) -> Tuple[Tuple[FrozenTargetIntent, ...], Tuple[str, ...]]:
+    return _freeze_identity_recovery_scope(snapshot, plan, raw_config)
+
+
+def _launch_all_identities(
+    snapshot: DashboardSnapshot,
+    *,
+    registry_session_id: str,
+    registry_store: IdentityRegistryStore,
+    config_path: Path,
+    raw_config: Mapping[str, object],
+    log_path: Path,
+    registry_transition_callback: Optional[
+        Callable[[str, str, Mapping[str, object]], None]
+    ] = None,
+) -> Tuple[Tuple[str, str, str], ...]:
+    """Launch every currently eligible ALL identity once for this registry session."""
+    registry = registry_store.read()
+    entries = registry.get("entries")
+    blocked = set(entries) if isinstance(entries, Mapping) else set()
+
+    identity_keys = sorted(
+        identity_key
+        for (policy, identity_key), block in snapshot.blocks.items()
+        if (
+            policy == POLICY_ALL
+            and identity_key not in blocked
+            and block.best_candidate is not None
+        )
+    )
+
+    outcomes: List[Tuple[str, str, str]] = []
+    for identity_key in identity_keys:
+        try:
+            plan, result = _launch_identity(
+                snapshot,
+                identity_key,
+                launch_policy=POLICY_ALL,
+                registry_session_id=registry_session_id,
+                registry_store=registry_store,
+                config_path=config_path,
+                raw_config=raw_config,
+                registry_transition_callback=registry_transition_callback,
+            )
+        except IdentityLaunchBlocked as error:
+            detail = str(error)
+            outcomes.append((identity_key, "SUPPRESSED", detail))
+            write_log(
+                log_path,
+                (
+                    f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                    f"ALL LAUNCH SUPPRESSED — {identity_key} — {detail}"
+                ),
+            )
+            continue
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"
+            outcomes.append((identity_key, "FAILED", detail))
+            write_log(
+                log_path,
+                (
+                    f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                    f"ALL LAUNCH FAILED — {identity_key} — {detail}"
+                ),
+            )
+            continue
+
+        detail = f"{plan.base_name} — PID {result.pid}"
+        outcomes.append((identity_key, "LAUNCHED", detail))
+        write_log(
+            log_path,
+            (
+                f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                f"ALL LAUNCH — {plan.identity.serialized} — "
+                f"{plan.base_name} — PID {result.pid}"
+            ),
+        )
+
+    return tuple(outcomes)
 
 
 def _command_reader(
@@ -755,6 +873,50 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     clear_live_status_line()
                     print("\nIdentity Coordinator stopped by user.")
                     return 0
+
+                auto_launch_outcomes = _launch_all_identities(
+                    snapshot,
+                    registry_session_id=registry_status.session_id,
+                    registry_store=registry_store,
+                    config_path=config_path,
+                    raw_config=state.raw_config or {},
+                    log_path=log_path,
+                    registry_transition_callback=capture_launch_registry_transition,
+                )
+                if auto_launch_outcomes:
+                    try:
+                        fresh_registry_entries = _registry_entries_snapshot(
+                            registry_store
+                        )
+                        fresh_runtime_statuses = runtime_status_store.read_all()
+                    except Exception as error:
+                        write_log(
+                            log_path,
+                            (
+                                f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                                "POST-AUTO STATUS READ WARNING — "
+                                f"{type(error).__name__}: {error}"
+                            ),
+                        )
+                    else:
+                        for (
+                            identity_key,
+                            previous_state,
+                            current_state,
+                            reason,
+                        ) in _registry_state_changes(
+                            registry_entries,
+                            fresh_registry_entries,
+                        ):
+                            _write_registry_state_change(
+                                log_path,
+                                identity_key,
+                                previous_state,
+                                current_state,
+                                reason,
+                            )
+                        registry_entries = fresh_registry_entries
+                        runtime_statuses = fresh_runtime_statuses
 
                 errors_changed = (
                     previous is None

@@ -3,11 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 import unittest
 
-from recorder_coordinator.launch import build_manual_launch_plan
+from recorder_coordinator.launch import (
+    build_all_launch_plan,
+    build_manual_launch_plan,
+)
 from recorder_coordinator.models import (
     DashboardSnapshot,
     IdentityBlock,
     IdentityTarget,
+    POLICY_ALL,
     POLICY_MANUAL,
     TargetView,
 )
@@ -110,6 +114,50 @@ class ManualLaunchPlanTests(unittest.TestCase):
         self.assertEqual(plan.selected_candidate.stream_url, better.stream_url)
         self.assertEqual(tuple(item.name for item in plan.target_intents), ("Target B",))
         self.assertEqual(plan.recording_duration_min, 120.0)
+
+    def test_all_policy_reuses_same_identity_launch_planner(self):
+        candidate = sony_candidate(
+            title="Auto Event",
+            fps=50.0,
+            bitrate=6_000_000,
+            playlist="https://example.test/a.m3u",
+        )
+        target = IdentityTarget(
+            name="Auto Target",
+            policy=POLICY_ALL,
+            source_groups=("SONYLIV_EVENTS",),
+            primary=("auto",),
+            worker_recording_duration_min=90,
+        )
+        identity = derive_feed_identity(candidate, "SONYLIV")
+        block = IdentityBlock(
+            policy=POLICY_ALL,
+            identity=identity,
+            target_names=[target.name],
+            candidates=[candidate],
+            best_candidate=candidate,
+            overall_state="AVAILABLE",
+        )
+        snapshot = DashboardSnapshot(
+            created_at=datetime.now(),
+            target_views=(
+                TargetView(target, "ACTIVE", datetime.now(), None),
+            ),
+            coordinator_window=None,
+            blocks={(POLICY_ALL, identity.serialized): block},
+            candidates_by_target={target.name: (candidate,)},
+        )
+
+        plan = build_all_launch_plan(
+            snapshot,
+            identity.serialized,
+            now_ts=1.0,
+        )
+
+        self.assertEqual(plan.identity.serialized, identity.serialized)
+        self.assertEqual(plan.selected_candidate.stream_url, candidate.stream_url)
+        self.assertEqual(tuple(item.name for item in plan.target_intents), ("Auto Target",))
+        self.assertEqual(plan.recording_duration_min, 90.0)
 
     def test_same_exact_winning_stream_keeps_tied_target_intents(self):
         candidate = sony_candidate(

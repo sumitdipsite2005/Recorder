@@ -214,6 +214,24 @@ class ArchitectureGuardTests(unittest.TestCase):
         )
         self.assertIn("def sample_stream_video_bitrate(", quality)
 
+    def test_all_identities_reuses_shared_identity_launch_path(self):
+        coordinator=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
+        launch=(ROOT/"recorder_coordinator"/"launch.py").read_text(encoding="utf-8")
+
+        self.assertIn("def build_identity_launch_plan(", launch)
+        self.assertIn("launch_policy=POLICY_MANUAL", launch)
+        self.assertIn("launch_policy=POLICY_ALL", launch)
+        self.assertIn("def _launch_identity(", coordinator)
+        self.assertIn("launch_policy=POLICY_ALL", coordinator)
+        self.assertEqual(
+            coordinator.count("request = IdentityLaunchRequest("),
+            1,
+        )
+        self.assertEqual(
+            coordinator.count("result = launch_identity_worker("),
+            1,
+        )
+
     def test_coordinator_quality_persistence_uses_playback_fingerprint_registry(self):
         coordinator=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
         acquisition=(ROOT/"recorder_coordinator"/"acquisition.py").read_text(encoding="utf-8")

@@ -460,6 +460,136 @@ class ManualRecordLaunchTests(unittest.TestCase):
         )
 
 
+class AllIdentitiesLaunchTests(unittest.TestCase):
+    def _all_snapshot(self, candidates):
+        return snapshot(
+            candidates,
+            policy=coord.POLICY_ALL,
+            target_name="Auto",
+        )
+
+    def test_all_launch_handoff_uses_same_identity_worker_path(self):
+        snap = self._all_snapshot([sony_candidate()])
+        identity_key = next(
+            identity
+            for policy, identity in snap.blocks
+            if policy == coord.POLICY_ALL
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = coord.build_recorder_output_paths(Path(td) / "Recordings")
+            store = coord.IdentityRegistryStore(paths)
+            status = store.prepare_session()
+            captured = {}
+
+            def fake_launch(
+                request,
+                registry_store,
+                *,
+                config_path,
+                registry_transition_callback=None,
+            ):
+                captured["request"] = request
+                captured["store"] = registry_store
+                return type("Result", (), {"pid": 5432})()
+
+            with patch.object(coord, "launch_identity_worker", fake_launch):
+                plan, result = coord._launch_identity(
+                    snap,
+                    identity_key,
+                    launch_policy=coord.POLICY_ALL,
+                    registry_session_id=status.session_id,
+                    registry_store=store,
+                    config_path=Path(td) / "config.py",
+                    raw_config={
+                        "NM3U8DL_PLAYLIST_GROUPS": {
+                            "COMMON": [],
+                            "SONYLIV_EVENTS": ["https://src1.test/list.m3u"],
+                        },
+                    },
+                )
+
+        request = captured["request"]
+        self.assertEqual(result.pid, 5432)
+        self.assertEqual(request.identity_key, identity_key)
+        self.assertEqual(request.selected_candidate, plan.selected_candidate)
+        self.assertEqual(request.target_intents[0].name, "Auto")
+        self.assertEqual(
+            request.recovery_playlist_urls,
+            ("https://src1.test/list.m3u",),
+        )
+
+    def test_all_launch_skips_claimed_identity_and_continues_after_failure(self):
+        first = sony_candidate(lane="1/A/ENG", title="First")
+        blocked = sony_candidate(lane="2/B/ENG", title="Blocked")
+        third = sony_candidate(lane="3/C/ENG", title="Third")
+        snap = self._all_snapshot([first, blocked, third])
+        identity_by_title = {
+            block.best_candidate.entry_title: identity_key
+            for (policy, identity_key), block in snap.blocks.items()
+            if policy == coord.POLICY_ALL and block.best_candidate is not None
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = coord.build_recorder_output_paths(Path(td) / "Recordings")
+            store = coord.IdentityRegistryStore(paths)
+            status = store.prepare_session()
+            store.claim(
+                identity_key=identity_by_title["Blocked"],
+                provider="SONYLIV",
+                display_name="Blocked",
+                expected_session_id=status.session_id,
+            )
+            attempted = []
+
+            def fake_launch_identity(
+                snapshot_value,
+                identity_key,
+                **kwargs,
+            ):
+                attempted.append(identity_key)
+                if identity_key == identity_by_title["First"]:
+                    raise RuntimeError("first failed")
+                plan = type("Plan", (), {
+                    "base_name": "Third",
+                    "identity": type("Identity", (), {"serialized": identity_key})(),
+                })()
+                result = type("Result", (), {"pid": 3333})()
+                return plan, result
+
+            with patch.object(
+                coord,
+                "_launch_identity",
+                side_effect=fake_launch_identity,
+            ):
+                outcomes = coord._launch_all_identities(
+                    snap,
+                    registry_session_id=status.session_id,
+                    registry_store=store,
+                    config_path=Path(td) / "config.py",
+                    raw_config={},
+                    log_path=Path(td) / "coordinator.log",
+                )
+
+        self.assertNotIn(identity_by_title["Blocked"], attempted)
+        self.assertEqual(
+            set(attempted),
+            {identity_by_title["First"], identity_by_title["Third"]},
+        )
+        outcome_by_identity = {
+            identity: state
+            for identity, state, _detail in outcomes
+        }
+        self.assertEqual(
+            outcome_by_identity[identity_by_title["First"]],
+            "FAILED",
+        )
+        self.assertEqual(
+            outcome_by_identity[identity_by_title["Third"]],
+            "LAUNCHED",
+        )
+
+
 class TargetConfigTests(unittest.TestCase):
     def test_parse_manual_target(self):
         items = coord.parse_targets({"IDENTITY_COORDINATOR_TARGETS":[{
