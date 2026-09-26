@@ -29,6 +29,7 @@ import json
 import runpy
 import base64
 import hashlib
+import ipaddress
 import socket
 import queue
 import tempfile
@@ -171,6 +172,10 @@ NM3U8DL_PLAYLIST_GROUP_PROFILES = dict(SHARED_PLAYLIST_GROUP_PROFILES)
 NM3U8DL_PLAYLIST_GROUP_PROFILE_OVERRIDES = {
     "SONY_TV": {
         "quality_upgrade_enabled": False,
+    },
+    "JIO_STAR_SPORTS": {
+        # This linear-TV group has no useful upgrade above 1080p50.
+        "quality_upgrade_1080p50_ceiling": True,
     },
 }
 
@@ -6335,11 +6340,21 @@ def get_nm3u8dl_launch_stream_url(candidate: Optional[dict]) -> str:
 
     stream_url = str(candidate.get("stream_url") or "").strip()
     final_url = str(candidate.get("manifest_final_url") or "").strip()
+    final_url_type = _get_nm3u8dl_stream_type_from_url(final_url)
+    validated_stream_type = str(
+        candidate.get("stream_type") or ""
+    ).strip().upper()
 
+    # A redirect target can be an extensionless manifest endpoint. The probe has
+    # already classified and validated it, so do not fall back to the exposed
+    # wrapper URL merely because the final URL lacks .m3u8/.mpd.
     if (
         final_url
         and bool(candidate.get("manifest_reachable", False))
-        and _get_nm3u8dl_stream_type_from_url(final_url) in ("HLS", "DASH")
+        and (
+            final_url_type in ("HLS", "DASH")
+            or validated_stream_type in ("HLS", "DASH")
+        )
     ):
         return final_url
 
@@ -6851,6 +6866,31 @@ def get_nm3u8dl_candidate_quality_rank(candidate: dict):
     return source_selection.candidate_quality_rank(
         SourceCandidate.from_mapping(candidate),
         _get_nm3u8dl_selection_policy(),
+    )
+
+
+def _nm3u8dl_quality_upgrade_cutoff_reached(
+    source: Optional[dict],
+    profile: Optional[dict] = None,
+) -> bool:
+    """Return whether this run is already at its configured quality ceiling."""
+    if not source:
+        return False
+
+    if profile is None:
+        profile = get_nm3u8dl_playlist_profile()
+
+    cutoff_applies = (
+        get_nm3u8dl_playlist_lifecycle() == "EVENT"
+        or bool(profile.get("quality_upgrade_1080p50_ceiling", False))
+    )
+    if not cutoff_applies:
+        return False
+
+    target_fps = float(profile.get("quality_upgrade_target_fps", 50))
+    return (
+        _nm3u8dl_video_resolution_class(source) >= 1080
+        and _nm3u8dl_ranking_motion_fps(source) >= target_fps
     )
 
 
@@ -7942,6 +7982,24 @@ def _detect_nm3u8dl_dash_selected_representation_scan_type(
             scan_type_cache["results"][cache_key] = result
         return result
 
+def _nm3u8dl_url_has_literal_ip_host(stream_url: str) -> bool:
+    """Return True when the URL host itself is an IPv4/IPv6 literal."""
+    try:
+        hostname = urlparse(str(stream_url or "")).hostname
+    except ValueError:
+        return False
+
+    if not hostname:
+        return False
+
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+
+    return True
+
+
 def _detect_nm3u8dl_stream_scan_type_with_idet(
     stream_url: str,
     headers: dict,
@@ -7952,6 +8010,12 @@ def _detect_nm3u8dl_stream_scan_type_with_idet(
     decryption_key: str = "",
 ) -> str:
     """Final P/I fallback using decoded frames from the targeted input."""
+    # Literal-IP stream endpoints have repeatedly consumed the full 90-second
+    # IDet budget without useful evidence. Keep the short bitrate sample, but
+    # leave scan type unknown rather than paying the IDet timeout on these routes.
+    if _nm3u8dl_url_has_literal_ip_host(stream_url):
+        return ""
+
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -13524,15 +13588,16 @@ def resolve_nm3u8dl_launch_source(
             #        f"{int(profile.get('quality_upgrade_min_remaining_min', 15))} "
             #        f"minutes when expiry is known"
             #    )
-            event_quality_cutoff_reached = (
-                get_nm3u8dl_playlist_lifecycle() == "EVENT"
-                and _nm3u8dl_video_resolution_class(source) >= 1080
-                and running_motion_fps >= quality_upgrade_target_fps
+            quality_upgrade_cutoff_reached = (
+                _nm3u8dl_quality_upgrade_cutoff_reached(
+                    source,
+                    profile,
+                )
             )
 
             if (
                 quality_upgrade_profile_enabled
-                and not event_quality_cutoff_reached
+                and not quality_upgrade_cutoff_reached
             ):
                 log(
                     f"Quality upgrade check  : every "
@@ -13551,11 +13616,11 @@ def resolve_nm3u8dl_launch_source(
 
             elif (
                 quality_upgrade_profile_enabled
-                and event_quality_cutoff_reached
+                and quality_upgrade_cutoff_reached
             ):
                 log(
                     f"Quality upgrade check   : disabled "
-                    f"(event already at "
+                    f"(already at configured ceiling: "
                     f"{int(source.get('video_width') or 0)}x"
                     f"{int(source.get('video_height') or 0)} "
                     f"{running_motion_fps:g} fps)"
@@ -14292,18 +14357,19 @@ def monitor_nm3u8dl_playlist_renewal(
     # full quality rank.
     # quality_upgrade_enabled = quality_upgrade_profile_enabled
     
-    # EVENT quality cutoff:
-    # keep looking until 1080p50 is reached, then stop quality-upgrade scans.
-    # LINEAR_TV keeps its existing behavior unchanged.
-    event_quality_cutoff_reached = (
-        get_nm3u8dl_playlist_lifecycle() == "EVENT"
-        and _nm3u8dl_video_resolution_class(running_source) >= 1080
-        and running_motion_fps >= quality_upgrade_target_fps
+    # Event streams and explicitly configured linear-TV groups can define
+    # 1080p50 as the useful ceiling. Once reached, do not spend periodic scans
+    # looking for a quality level the recorder will never prefer.
+    quality_upgrade_cutoff_reached = (
+        _nm3u8dl_quality_upgrade_cutoff_reached(
+            running_source,
+            profile,
+        )
     )
 
     quality_upgrade_enabled = (
         quality_upgrade_profile_enabled
-        and not event_quality_cutoff_reached
+        and not quality_upgrade_cutoff_reached
     )
 
     target_quality_recovery_attempt = (
