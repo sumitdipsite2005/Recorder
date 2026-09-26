@@ -9047,77 +9047,14 @@ def _probe_nm3u8dl_candidate_quality(
                 if ffprobe_quality:
                     successful_ffprobe_key = ffprobe_key
                     quality["ffprobe_reachable"] = True
-
-                    ffprobe_fps = float(
-                        ffprobe_quality.get("video_fps") or 0.0
-                    )
-                    if (
-                        not float(quality.get("video_fps") or 0.0)
-                        and ffprobe_fps > 0
-                    ):
-                        quality["video_fps"] = ffprobe_fps
-                        quality["video_fps_source"] = "ffprobe"
-
-                    resolution_filled_from_ffprobe = False
-
-                    for field in (
-                        "video_width",
-                        "video_height",
-                    ):
-                        ffprobe_value = int(
-                            ffprobe_quality.get(field) or 0
-                        )
-                        if not int(quality.get(field) or 0) and ffprobe_value > 0:
-                            quality[field] = ffprobe_value
-                            resolution_filled_from_ffprobe = True
-
-                    if resolution_filled_from_ffprobe:
-                        existing_resolution_source = str(
-                            quality.get("video_resolution_source") or ""
-                        ).strip()
-
-                        if existing_resolution_source == "manifest":
-                            quality["video_resolution_source"] = (
-                                "manifest+ffprobe"
-                            )
-                        else:
-                            quality["video_resolution_source"] = "ffprobe"
-
-                    if not quality.get("video_bitrate_bps"):
-                        ffprobe_bitrate = int(
-                            ffprobe_quality.get("video_bitrate_bps") or 0
-                        )
-                        quality["video_bitrate_bps"] = ffprobe_bitrate
-                        quality["video_bitrate_source"] = str(
-                            ffprobe_quality.get("video_bitrate_source") or ""
-                        )
-
-                    if (
-                        quality.get("stream_type") == "HLS"
-                        and not _normalize_nm3u8dl_video_scan_type(
-                            quality.get("video_scan_type")
-                        )
-                    ):
-                        ffprobe_scan_type = _normalize_nm3u8dl_video_scan_type(
-                            ffprobe_quality.get("video_scan_type")
-                        )
-                        if ffprobe_scan_type:
-                            quality["video_scan_type"] = ffprobe_scan_type
-                            quality["video_scan_type_source"] = "ffprobe"
-
-                    quality["quality_known"] = bool(
-                        quality.get("video_fps")
-                        or (
-                            quality.get("video_width")
-                            and quality.get("video_height")
-                        )
-                        or quality.get("video_bitrate_bps")
-                    )
-
-                    quality["quality_source"] = (
-                        "manifest+ffprobe"
-                        if manifest_quality
-                        else "ffprobe"
+                    quality = source_quality.merge_ffprobe_quality_evidence(
+                        quality,
+                        ffprobe_quality,
+                        include_scan_type=(
+                            quality.get("stream_type") == "HLS"
+                        ),
+                        include_sample_in_quality_source=False,
+                        default_bitrate_source="",
                     )
                     break
 

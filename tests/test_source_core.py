@@ -32,6 +32,7 @@ from recorder_source.discovery import (
 from recorder_source.quality import (
     extract_auth_expiry,
     format_candidate_quality,
+    merge_ffprobe_quality_evidence,
     inspect_dash_manifest_drm,
     parse_dash_manifest_quality,
     QUALITY_FFPROBE_TIMEOUT_SEC,
@@ -965,6 +966,64 @@ https://edge.drmlive.net/live.mpd
         )
         self.assertEqual(out.video_bitrate_bps, 3_456_000)
         self.assertEqual(out.video_bitrate_source, "sample")
+
+    def test_shared_ffprobe_evidence_merge_fills_only_missing_facts(self):
+        current = {
+            "quality_known": True,
+            "quality_source": "manifest",
+            "video_fps": 0.0,
+            "video_fps_source": "",
+            "video_width": 1920,
+            "video_height": 0,
+            "video_resolution_source": "manifest",
+            "video_bitrate_bps": 0,
+            "video_bitrate_source": "",
+            "video_scan_type": "",
+            "video_scan_type_source": "",
+        }
+        ffprobe = {
+            "video_fps": 25.0,
+            "video_width": 1280,
+            "video_height": 1080,
+            "video_bitrate_bps": 3_523_000,
+            "video_bitrate_source": "sample",
+            "video_scan_type": "progressive",
+        }
+
+        merged = merge_ffprobe_quality_evidence(
+            current,
+            ffprobe,
+            include_scan_type=True,
+            include_sample_in_quality_source=True,
+            default_bitrate_source="ffprobe",
+        )
+
+        self.assertEqual(merged["video_width"], 1920)
+        self.assertEqual(merged["video_height"], 1080)
+        self.assertEqual(merged["video_fps"], 25.0)
+        self.assertEqual(merged["video_bitrate_bps"], 3_523_000)
+        self.assertEqual(merged["video_bitrate_source"], "sample")
+        self.assertEqual(merged["video_scan_type"], "progressive")
+        self.assertEqual(
+            merged["video_resolution_source"],
+            "manifest+ffprobe",
+        )
+        self.assertEqual(
+            merged["quality_source"],
+            "manifest+ffprobe+sample",
+        )
+
+        mature_label = merge_ffprobe_quality_evidence(
+            current,
+            ffprobe,
+            include_scan_type=True,
+            include_sample_in_quality_source=False,
+            default_bitrate_source="",
+        )
+        self.assertEqual(
+            mature_label["quality_source"],
+            "manifest+ffprobe",
+        )
 
     def test_shared_quality_formatter_preserves_value_evidence(self):
         item = candidate(

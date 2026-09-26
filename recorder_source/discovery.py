@@ -33,6 +33,7 @@ from .playlist_headers import (
 from .quality import (
     extract_auth_expiry,
     merge_auth_expiries,
+    merge_ffprobe_quality_evidence,
     inspect_dash_manifest_drm,
     inspect_hls_manifest_drm,
     parse_dash_manifest_quality,
@@ -1159,58 +1160,43 @@ def probe_candidate_hls(
                     bitrate_sample_failure = str(
                         ffprobe_quality.get("_bitrate_sample_failure") or ""
                     )
-                    ffprobe_fps = float(ffprobe_quality.get("video_fps") or 0.0)
-                    if fps <= 0 and ffprobe_fps > 0:
-                        fps = ffprobe_fps
-                        video_fps_source = "ffprobe"
-
-                    ffprobe_width = int(ffprobe_quality.get("video_width") or 0)
-                    ffprobe_height = int(ffprobe_quality.get("video_height") or 0)
-                    resolution_filled = False
-                    if width <= 0 and ffprobe_width > 0:
-                        width = ffprobe_width
-                        resolution_filled = True
-                    if height <= 0 and ffprobe_height > 0:
-                        height = ffprobe_height
-                        resolution_filled = True
-                    if resolution_filled:
-                        video_resolution_source = (
-                            "manifest+ffprobe"
-                            if video_resolution_source == "manifest"
-                            else "ffprobe"
-                        )
-
-                    ffprobe_bitrate = int(
-                        ffprobe_quality.get("video_bitrate_bps") or 0
+                    merged_quality = merge_ffprobe_quality_evidence(
+                        {
+                            "quality_known": quality_known,
+                            "quality_source": quality_source,
+                            "video_fps": fps,
+                            "video_fps_source": video_fps_source,
+                            "video_width": width,
+                            "video_height": height,
+                            "video_resolution_source": video_resolution_source,
+                            "video_bitrate_bps": bitrate,
+                            "video_bitrate_source": video_bitrate_source,
+                            "video_scan_type": scan_type,
+                            "video_scan_type_source": video_scan_type_source,
+                        },
+                        ffprobe_quality,
+                        include_scan_type=is_hls,
+                        include_sample_in_quality_source=True,
+                        default_bitrate_source="ffprobe",
                     )
-                    if bitrate <= 0 and ffprobe_bitrate > 0:
-                        bitrate = ffprobe_bitrate
-                        video_bitrate_source = str(
-                            ffprobe_quality.get("video_bitrate_source") or "ffprobe"
-                        )
-
-                    ffprobe_scan_type = normalize_video_scan_type(
-                        ffprobe_quality.get("video_scan_type") or ""
+                    quality_known = bool(merged_quality["quality_known"])
+                    quality_source = str(merged_quality["quality_source"] or "")
+                    fps = float(merged_quality["video_fps"] or 0.0)
+                    video_fps_source = str(
+                        merged_quality["video_fps_source"] or ""
                     )
-                    if not scan_type and ffprobe_scan_type:
-                        scan_type = ffprobe_scan_type
-                        video_scan_type_source = "ffprobe"
-
-                    quality_known = bool(
-                        fps > 0
-                        or (width > 0 and height > 0)
-                        or bitrate > 0
+                    width = int(merged_quality["video_width"] or 0)
+                    height = int(merged_quality["video_height"] or 0)
+                    video_resolution_source = str(
+                        merged_quality["video_resolution_source"] or ""
                     )
-                    ffprobe_quality_source = (
-                        "ffprobe+sample"
-                        if str(ffprobe_quality.get("video_bitrate_source") or "")
-                        == "sample"
-                        else "ffprobe"
+                    bitrate = int(merged_quality["video_bitrate_bps"] or 0)
+                    video_bitrate_source = str(
+                        merged_quality["video_bitrate_source"] or ""
                     )
-                    quality_source = (
-                        f"{quality_source}+{ffprobe_quality_source}"
-                        if quality_source
-                        else ffprobe_quality_source
+                    scan_type = str(merged_quality["video_scan_type"] or "")
+                    video_scan_type_source = str(
+                        merged_quality["video_scan_type_source"] or ""
                     )
             except Exception as error:
                 ffprobe_failure = f"{type(error).__name__}: {error}"

@@ -76,6 +76,91 @@ def quality_probe_identity(
     return stream_url, normalized_headers, has_decryption_keys
 
 
+def merge_ffprobe_quality_evidence(
+    current: Mapping[str, object],
+    ffprobe_quality: Mapping[str, object],
+    *,
+    include_scan_type: bool = True,
+    include_sample_in_quality_source: bool = False,
+    default_bitrate_source: str = "",
+) -> dict:
+    """Fill only missing quality facts from one FFprobe result.
+
+    Existing known facts are never replaced. The caller controls only the
+    established compatibility difference in the aggregate quality_source label;
+    per-field provenance always comes from the actual evidence.
+    """
+    merged = dict(current)
+
+    ffprobe_fps = float(ffprobe_quality.get("video_fps") or 0.0)
+    if float(merged.get("video_fps") or 0.0) <= 0 and ffprobe_fps > 0:
+        merged["video_fps"] = ffprobe_fps
+        merged["video_fps_source"] = "ffprobe"
+
+    resolution_filled = False
+    for field in ("video_width", "video_height"):
+        ffprobe_value = int(ffprobe_quality.get(field) or 0)
+        if int(merged.get(field) or 0) <= 0 and ffprobe_value > 0:
+            merged[field] = ffprobe_value
+            resolution_filled = True
+
+    if resolution_filled:
+        existing_resolution_source = str(
+            merged.get("video_resolution_source") or ""
+        ).strip()
+        merged["video_resolution_source"] = (
+            "manifest+ffprobe"
+            if existing_resolution_source == "manifest"
+            else "ffprobe"
+        )
+
+    if int(merged.get("video_bitrate_bps") or 0) <= 0:
+        ffprobe_bitrate = int(ffprobe_quality.get("video_bitrate_bps") or 0)
+        if ffprobe_bitrate > 0:
+            merged["video_bitrate_bps"] = ffprobe_bitrate
+            merged["video_bitrate_source"] = str(
+                ffprobe_quality.get("video_bitrate_source")
+                or default_bitrate_source
+            )
+
+    if (
+        include_scan_type
+        and not normalize_video_scan_type(merged.get("video_scan_type") or "")
+    ):
+        ffprobe_scan_type = normalize_video_scan_type(
+            ffprobe_quality.get("video_scan_type") or ""
+        )
+        if ffprobe_scan_type:
+            merged["video_scan_type"] = ffprobe_scan_type
+            merged["video_scan_type_source"] = "ffprobe"
+
+    merged["quality_known"] = bool(
+        float(merged.get("video_fps") or 0.0) > 0
+        or (
+            int(merged.get("video_width") or 0) > 0
+            and int(merged.get("video_height") or 0) > 0
+        )
+        or int(merged.get("video_bitrate_bps") or 0) > 0
+    )
+
+    ffprobe_source = (
+        "ffprobe+sample"
+        if (
+            include_sample_in_quality_source
+            and str(ffprobe_quality.get("video_bitrate_source") or "")
+            == "sample"
+        )
+        else "ffprobe"
+    )
+    current_source = str(merged.get("quality_source") or "").strip()
+    merged["quality_source"] = (
+        f"{current_source}+{ffprobe_source}"
+        if current_source
+        else ffprobe_source
+    )
+    return merged
+
+
 _QUALITY_SOURCE_LABELS = {
     "manifest": "manifest",
     "ffprobe": "FFprobe",

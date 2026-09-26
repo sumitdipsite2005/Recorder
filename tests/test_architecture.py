@@ -217,6 +217,21 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("max_workers: int = QUALITY_PROBE_WORKERS", discovery)
         self.assertIn("QUALITY_PROBE_WORKERS = 6", quality)
         self.assertIn("QUALITY_FFPROBE_TIMEOUT_SEC = 20.0", quality)
+        general_probe_start = recorder.index(
+            "for ffprobe_key in ffprobe_key_values:"
+        )
+        general_probe_end = recorder.index(
+            "# If DASH bitrate is still absent",
+            general_probe_start,
+        )
+        general_probe = recorder[general_probe_start:general_probe_end]
+        self.assertIn(
+            "source_quality.merge_ffprobe_quality_evidence(",
+            general_probe,
+        )
+        self.assertNotIn("ffprobe_fps =", general_probe)
+        self.assertIn("merge_ffprobe_quality_evidence(", discovery)
+        self.assertNotIn("ffprobe_width =", discovery)
 
     def test_playback_fingerprint_has_one_shared_owner(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
