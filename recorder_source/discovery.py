@@ -19,7 +19,7 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
@@ -563,6 +563,58 @@ def _github_file_commit_timestamp(
     return None
 
 
+def _playlist_semantic_freshness_hash(text: str) -> str:
+    """Hash source metadata/stable routes, not rotating playback credentials.
+
+    Source freshness is used to arbitrate conflicting event metadata. Query
+    tokens, fragments and per-request header suffixes are playback/session
+    details and must not make unchanged event metadata look newer.
+    """
+    payload = str(text or "")
+    try:
+        normalized_text, _adapter_metadata = adapt_json_playlist_text(payload)
+    except Exception:
+        normalized_text = payload
+
+    stable_lines: List[str] = []
+    for raw_line in str(normalized_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTINF:"):
+            stable_lines.append(line)
+            continue
+        if not line.startswith(("http://", "https://")):
+            continue
+
+        raw_url = line.split("|", 1)[0].strip()
+        try:
+            parsed = urlsplit(raw_url)
+            path = re.sub(r"/{2,}", "/", parsed.path or "/")
+            stable_lines.append(
+                urlunsplit(
+                    (
+                        parsed.scheme.casefold(),
+                        parsed.netloc.casefold(),
+                        path,
+                        "",
+                        "",
+                    )
+                )
+            )
+        except Exception:
+            stable_lines.append(
+                raw_url.split("?", 1)[0].split("#", 1)[0]
+            )
+
+    semantic_payload = "\n".join(stable_lines)
+    if not semantic_payload:
+        semantic_payload = payload
+    return hashlib.sha256(
+        semantic_payload.encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
 def resolve_playlist_source_freshness(
     playlist_url: str,
     text: str,
@@ -583,7 +635,7 @@ def resolve_playlist_source_freshness(
     if stop_requested is not None and stop_requested():
         raise RuntimeError("Playlist scan cancelled by stop request")
     payload = str(text or "")
-    content_hash = hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+    content_hash = _playlist_semantic_freshness_hash(payload)
     previous_hash = str((previous or {}).get("content_hash") or "")
     if previous_hash:
         if previous_hash == content_hash:
@@ -1240,6 +1292,9 @@ _PROBE_SOURCE_EXTRA_KEYS = frozenset({
     "source_group",
     "provider",
     "provider_identity_hint",
+    "source_freshness_ts",
+    "source_freshness_source",
+    "freshness_disqualifying_conflict",
 })
 
 
