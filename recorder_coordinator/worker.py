@@ -16,8 +16,8 @@ from recorder_runtime.terminal_host import launch_terminal_tab
 
 from .registry import (
     IdentityRegistryStore,
-    STATE_ACTIVE,
     STATE_CRASHED,
+    STATE_RECORDING,
     STATE_ENDED,
     STATE_MANUALLY_STOPPED,
     STATE_WAITING_FOR_SOURCE,
@@ -90,8 +90,9 @@ def launch_identity_worker(
         )
 
         deadline = time.monotonic() + max(0.1, float(startup_timeout_sec))
-        terminal_states = {
-            STATE_ACTIVE,
+        startup_states = {
+            "LAUNCHING",
+            STATE_RECORDING,
             STATE_WAITING_FOR_SOURCE,
             STATE_ENDED,
             STATE_MANUALLY_STOPPED,
@@ -103,7 +104,7 @@ def launch_identity_worker(
             if isinstance(entry, dict):
                 state = entry.get("state")
                 pid = entry.get("worker_pid")
-                if state in terminal_states and isinstance(pid, int) and pid > 0:
+                if state in startup_states and isinstance(pid, int) and pid > 0:
                     if state == STATE_CRASHED:
                         raise RuntimeError(
                             "identity worker entered CRASHED during startup: "
