@@ -338,7 +338,14 @@ def _event_maps(events: Sequence[ChangeEvent]):
 def _marker_text(events: Sequence[ChangeEvent], use_color: bool) -> str:
     if not events:
         return ""
-    return " ".join(_marker(f"[{event.marker}]", use_color) for event in events) + " "
+
+    def marker(event: ChangeEvent) -> str:
+        text = f"[{event.marker}]"
+        if event.marker == "NEW":
+            return _warning_text(text, use_color)
+        return _marker(text, use_color)
+
+    return " ".join(marker(event) for event in events) + " "
 
 
 def _provider_summary(snapshot: DashboardSnapshot) -> str:
@@ -435,6 +442,13 @@ def _runtime_candidate_rows(
 
 
 def _local_candidate_classification(candidate) -> Tuple[str, str]:
+    if getattr(candidate, "ignored", False):
+        return (
+            "IGNORED",
+            str(getattr(candidate, "reason", "") or "").strip()
+            or "same feed identity context only",
+        )
+
     state = candidate_state(candidate)
     if state == "WORKING":
         return "", ""
@@ -564,11 +578,17 @@ def render_dashboard(
                     else "[S?]"
                 )
                 quality = str(current_candidate.get("quality") or "unknown")
+                continuation_indent = " " * (
+                    2 + len(f"[{state}]") + 1
+                )
                 lines.append(
                     f"  {state_flag} {event_name} | {tvg_name} | {group_name} "
-                    f"| {provider} | {source_text} | {quality} "
-                    f"| Identity: {identity_value} | Targets: {target_text} "
-                    f"| Sources: {source_count_text} | PID {pid_text}"
+                    f"| {provider} | {source_text} | {quality}"
+                )
+                lines.append(
+                    f"{continuation_indent}Identity: {identity_value} "
+                    f"| Targets: {target_text} | Sources: {source_count_text} "
+                    f"| PID {pid_text}"
                 )
             else:
                 lines.append(
@@ -738,6 +758,11 @@ def render_dashboard(
                         isinstance(runtime_row, Mapping)
                         and runtime_row.get("selected")
                     )
+                    runtime_status = (
+                        str(runtime_row.get("status") or "").strip().upper()
+                        if isinstance(runtime_row, Mapping)
+                        else ""
+                    )
                     runtime_classification = (
                         str(runtime_row.get("classification") or "").strip()
                         if isinstance(runtime_row, Mapping)
@@ -764,14 +789,27 @@ def render_dashboard(
                     classification = runtime_classification or local_classification
                     decision_reason = runtime_reason or local_reason
 
+                    runtime_nonworking = runtime_status in {
+                        "IGNORED",
+                        "EXCLUDED",
+                        "EXPIRED",
+                        "EXPIRY UNKNOWN",
+                        "BLOCKED",
+                        "NOT WORKING",
+                    }
+                    effective_working = (
+                        state_text == "WORKING"
+                        and not getattr(candidate, "ignored", False)
+                        and not runtime_nonworking
+                    )
                     on_off = (
                         _on_text("[ON]", color)
-                        if state_text == "WORKING"
+                        if effective_working
                         else _off_text("[OFF]", color)
                     )
                     classification_prefix = (
                         _classification_text(classification, color) + " — "
-                        if classification and state_text != "WORKING"
+                        if classification and not effective_working
                         else ""
                     )
                     event_name = candidate.entry_title or candidate.tvg_name or "-"
