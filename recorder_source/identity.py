@@ -64,47 +64,48 @@ def _candidate_urls(candidate: SourceCandidate) -> Tuple[str, ...]:
     return tuple(values)
 
 
-def _sony_lane_from_url(value: str) -> str:
-    """Return Sony's stable provider lane, independent of CDN/manifest variant.
+def canonical_delivery_path(
+    value: str,
+    *,
+    drop_terminal_file: bool,
+) -> str:
+    """Return a provider-agnostic path identity with delivery/session noise removed.
 
-    Captured Sony delivery has two stable lane shapes relevant to the current
-    project:
-
-    * ``/(hls|dash)/live/<feed-id>/<provider-path>/<language>/...``
-    * ``/.../clients/dash/enc/<lane>/out/v1/<output-id>/...``
-
-    In both cases the CDN hostname and manifest leaf are delivery details, not
-    feed identity.  These are Sony-specific rules; unknown providers remain
-    conservative rather than using generic URL stripping.
+    The hostname, query string and fragment are never part of this path identity.
+    When ``drop_terminal_file`` is true, a terminal file-like path component
+    (anything with a suffix such as .m3u8 or .mpd) is also removed.  Path
+    components themselves remain otherwise untouched because they can carry
+    provider feed/language/region identity.
     """
+    text = strip_transport_suffix(value)
     try:
-        path = re.sub(r"/{2,}", "/", urlsplit(value).path or "/")
+        parsed = urlsplit(text)
     except Exception:
         return ""
 
-    live_match = re.search(
-        r"/(?:hls|dash)/live/"
-        r"(?P<feed_id>[^/]+)/(?P<lane>[^/]+)/(?P<language>[^/]+)(?:/|$)",
-        path,
-        flags=re.IGNORECASE,
-    )
-    if live_match:
-        feed_id = live_match.group("feed_id")
-        lane = live_match.group("lane")
-        language = live_match.group("language")
-        return f"lane:{feed_id}/{lane}/{language}"
+    if not parsed.scheme or not parsed.netloc:
+        return ""
 
-    dash_match = re.search(
-        r"/clients/dash/enc/"
-        r"(?P<lane>[^/]+)/out/v1/(?P<output_id>[^/]+)(?:/|$)",
-        path,
-        flags=re.IGNORECASE,
-    )
-    if dash_match:
-        lane = dash_match.group("lane")
-        output_id = dash_match.group("output_id")
-        return f"dash-lane:{lane}/{output_id}"
+    normalized_path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    parts = [part for part in normalized_path.split("/") if part]
 
+    if (
+        drop_terminal_file
+        and parts
+        and re.search(r"\.[^./]+$", parts[-1])
+    ):
+        parts.pop()
+
+    if not parts:
+        return ""
+    return "/" + "/".join(parts)
+
+
+def filename_sub_id(lane_key: str) -> str:
+    """Return the first all-numeric slash/underscore component for filenames."""
+    for part in re.split(r"[/_]+", str(lane_key or "").strip()):
+        if part.isdigit():
+            return part
     return ""
 
 
@@ -145,16 +146,21 @@ def derive_feed_identity(
     provider_name = normalize_provider_name(provider)
     urls = _candidate_urls(candidate)
 
-    if provider_name in SONY_PROVIDER_NAMES:
-        for value in urls:
-            lane_key = _sony_lane_from_url(value)
-            if lane_key:
-                return CanonicalFeedIdentity(
-                    provider="SONYLIV",
-                    lane_key=lane_key,
-                    confidence="provider",
-                    evidence="sony stable live lane",
-                )
+    for value in urls:
+        lane_key = canonical_delivery_path(
+            value,
+            drop_terminal_file=True,
+        )
+        if lane_key:
+            return CanonicalFeedIdentity(
+                provider=provider_name,
+                lane_key=lane_key,
+                confidence="path",
+                evidence=(
+                    "provider-scoped path; host/query/fragment and terminal "
+                    "file removed"
+                ),
+            )
 
     # A provider/acquisition adapter may supply stable native lane evidence when
     # its delivery URL does not itself expose the provider lane.  The hint is
@@ -176,7 +182,7 @@ def derive_feed_identity(
             provider=provider_name,
             lane_key=_conservative_url_key(urls[0]),
             confidence="conservative",
-            evidence="full provider-scoped URL retained",
+            evidence="no usable parent path; full provider-scoped URL retained",
         )
 
     # No URL evidence: keep observations conservative without making mutable
