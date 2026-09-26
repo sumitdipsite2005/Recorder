@@ -48,6 +48,7 @@ from .policy import (
     PLAYLIST_GROUP_LIFECYCLES,
     PLAYLIST_USER_AGENTS,
     PROVIDER_ADDED_HEADERS,
+    apply_lifecycle_scan_type_policy,
 )
 from . import transport as source_transport
 from .selection import normalize_video_scan_type
@@ -1103,12 +1104,11 @@ def probe_candidate_hls(
         video_bitrate_source = "manifest" if bitrate > 0 else ""
 
         source_group = str(candidate.extra.get("source_group") or "").strip().upper()
-        if (
-            is_playlist
-            and PLAYLIST_GROUP_LIFECYCLES.get(source_group) == "EVENT"
-        ):
-            scan_type = "progressive"
-            video_scan_type_source = "event-policy"
+        scan_type, video_scan_type_source = apply_lifecycle_scan_type_policy(
+            PLAYLIST_GROUP_LIFECYCLES.get(source_group, "") if is_playlist else "",
+            scan_type,
+            video_scan_type_source,
+        )
 
         ffprobe_failure = ""
         bitrate_sample_failure = ""

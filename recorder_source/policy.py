@@ -40,6 +40,17 @@ PLAYLIST_GROUP_LIFECYCLES = {
     "SONY_TV": "LINEAR_TV",
 }
 
+
+def apply_lifecycle_scan_type_policy(
+    lifecycle: object,
+    scan_type: object,
+    scan_type_source: object,
+) -> tuple[str, str]:
+    """Apply the shared lifecycle rule for presentation/quality scan type."""
+    if str(lifecycle or "").strip().upper() == "EVENT":
+        return "progressive", "event-policy"
+    return str(scan_type or ""), str(scan_type_source or "")
+
 PLAYLIST_GROUP_SOURCE_BUCKETS = {
     "JIO_STAR_SPORTS": "TV",
     "KHEL": "TV",

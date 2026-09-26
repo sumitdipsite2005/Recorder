@@ -58,6 +58,7 @@ from recorder_source.models import (
 )
 from recorder_source import transport as source_transport
 from recorder_source.policy import (
+    apply_lifecycle_scan_type_policy,
     is_vpn_route_suspected_403,
     selection_policy_for_provider,
 )
@@ -322,6 +323,16 @@ class SelectionTests(unittest.TestCase):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_lifecycle_scan_type_policy_is_shared_and_provider_agnostic(self):
+        self.assertEqual(
+            apply_lifecycle_scan_type_policy("EVENT", "interlaced", "manifest"),
+            ("progressive", "event-policy"),
+        )
+        self.assertEqual(
+            apply_lifecycle_scan_type_policy("LINEAR_TV", "interlaced", "manifest"),
+            ("interlaced", "manifest"),
+        )
+
     def test_parse_extinf_metadata(self):
         parsed = parse_extinf_metadata('#EXTINF:-1 tvg-name="Name" group-title="Group",Entry Title')
         self.assertEqual(parsed, {"tvg_name": "Name", "group_title": "Group", "entry_title": "Entry Title"})

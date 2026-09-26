@@ -87,6 +87,7 @@ from recorder_source.policy import (
     PLAYLIST_GROUP_SOURCE_BUCKETS as SHARED_PLAYLIST_GROUP_SOURCE_BUCKETS,
     PLAYLIST_USER_AGENTS as SHARED_PLAYLIST_USER_AGENTS,
     PROVIDER_ADDED_HEADERS as SHARED_PROVIDER_ADDED_HEADERS,
+    apply_lifecycle_scan_type_policy as shared_apply_lifecycle_scan_type_policy,
     selection_policy_for_provider as shared_selection_policy_for_provider,
 )
 
@@ -8877,17 +8878,20 @@ def _probe_nm3u8dl_candidate_quality(
         quality.get("manifest_final_url") or probe_stream_url,
     )
 
-    # EVENT policy: event streams are treated as progressive.
-    # This deliberately prevents DASH/HLS P/I probing, including idet.
-    # LINEAR_TV is completely unchanged and continues through the existing
-    # manifest/SPS/picture/FFprobe/idet P/I detection path below.
-    event_lifecycle = (
-        NM3U8DL_SOURCE_MODE == "playlist"
-        and get_nm3u8dl_playlist_lifecycle() == "EVENT"
+    # Lifecycle quality policy is shared with Inspect/Watch.
+    lifecycle = (
+        get_nm3u8dl_playlist_lifecycle()
+        if NM3U8DL_SOURCE_MODE == "playlist"
+        else ""
     )
-    if event_lifecycle:
-        quality["video_scan_type"] = "progressive"
-        quality["video_scan_type_source"] = "event-policy"
+    (
+        quality["video_scan_type"],
+        quality["video_scan_type_source"],
+    ) = shared_apply_lifecycle_scan_type_policy(
+        lifecycle,
+        quality.get("video_scan_type"),
+        quality.get("video_scan_type_source"),
+    )
 
     # DASH P/I is independent from ffprobe quality fallback. MPD scanType has
     # already been applied by the parser. Only a missing DASH scan type enters

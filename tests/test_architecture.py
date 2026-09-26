@@ -166,6 +166,23 @@ class ArchitectureGuardTests(unittest.TestCase):
         )
         self.assertNotIn("def _stream_type_from_url(", discovery)
 
+    def test_lifecycle_scan_type_policy_has_one_shared_owner(self):
+        policy=(ROOT/"recorder_source"/"policy.py").read_text(encoding="utf-8")
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+
+        self.assertIn("def apply_lifecycle_scan_type_policy(", policy)
+        self.assertIn("shared_apply_lifecycle_scan_type_policy(", recorder)
+        self.assertIn("apply_lifecycle_scan_type_policy(", discovery)
+        self.assertNotIn(
+            'quality["video_scan_type_source"] = "event-policy"',
+            recorder,
+        )
+        self.assertNotIn(
+            'video_scan_type_source = "event-policy"',
+            discovery,
+        )
+
     def test_manifest_content_classification_has_one_shared_owner(self):
         manifest=(ROOT/"recorder_source"/"manifest.py").read_text(encoding="utf-8")
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
