@@ -97,11 +97,11 @@ class IdentityLaunchRequest:
     provider: str
     selected_source_group: str
     selected_candidate: SourceCandidate
-    initial_candidate_pool: Tuple[SourceCandidate, ...]
     target_intents: Tuple[FrozenTargetIntent, ...]
     recovery_playlist_urls: Tuple[str, ...]
     recording_duration_min: Optional[float]
     base_name: str
+    initial_candidate_pool: Tuple[SourceCandidate, ...] = ()
     version: int = LAUNCH_REQUEST_VERSION
 
     def __post_init__(self) -> None:
