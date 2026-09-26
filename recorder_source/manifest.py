@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 _DASH_MPD_RE = re.compile(
-    r'<(?:[A-Za-z_][\\w.-]*:)?MPD\\b',
+    r'<(?:[A-Za-z_][\w.-]*:)?MPD\b',
     re.IGNORECASE,
 )
 

@@ -160,7 +160,7 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("source_manifest.manifest_type_from_text(", recorder)
         self.assertIn("manifest_type_from_text(", discovery)
         self.assertIn("is_manifest_text(", transport)
-        mpd_pattern = r'<(?:[A-Za-z_][\\w.-]*:)?MPD\\b'
+        mpd_pattern = r'<(?:[A-Za-z_][\w.-]*:)?MPD\b'
         self.assertIn(mpd_pattern, manifest)
         self.assertNotIn(mpd_pattern, recorder)
         self.assertNotIn(mpd_pattern, discovery)
