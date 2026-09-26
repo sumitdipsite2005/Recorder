@@ -706,6 +706,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
                 "worker_pid":4321,
             }
         }
+        recording_started_at=datetime(2026,9,25,20,53,4).timestamp()
         runtime_statuses={
             identity_key:{
                 "worker_state":"RECORDING",
@@ -713,6 +714,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
                 "candidates":[runtime_row],
                 "target_names":["T"],
                 "source_count":1,
+                "recording_started_at":recording_started_at,
             }
         }
         rendered=coord.render_dashboard(
@@ -742,7 +744,10 @@ class SnapshotAndChangeTests(unittest.TestCase):
             "1920x1080 | 50p [manifest, event-policy] | 5000 Kbps",
             recording_line,
         )
-        self.assertIn("Targets: T | Sources: 1 | PID 4321",identity_detail_line)
+        self.assertIn(
+            "Targets: T | Sources: 1 | Started: 2026-09-25 20:53:04 | PID 4321",
+            identity_detail_line,
+        )
         self.assertEqual(
             recording_line.index("Asian Games"),
             identity_detail_line.index("Identity:"),

@@ -522,6 +522,20 @@ def _dashboard_decision_reason(value: object) -> str:
     return text
 
 
+def _recording_started_text(runtime_status: object) -> str:
+    if not isinstance(runtime_status, Mapping):
+        return "-"
+    value = runtime_status.get("recording_started_at")
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    try:
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return "-"
+
+
 def render_dashboard(
     snapshot: DashboardSnapshot,
     events: Sequence[ChangeEvent],
@@ -603,6 +617,7 @@ def render_dashboard(
             )
             target_text = ", ".join(str(value) for value in target_names) or "-"
             source_count_text = str(source_count) if source_count is not None else "-"
+            recording_started_text = _recording_started_text(runtime_status)
 
             if state == "RECORDING" and isinstance(current_candidate, Mapping):
                 event_name = str(
@@ -630,7 +645,7 @@ def render_dashboard(
                 lines.append(
                     f"{continuation_indent}Identity: {identity_value} "
                     f"| Targets: {target_text} | Sources: {source_count_text} "
-                    f"| PID {pid_text}"
+                    f"| Started: {recording_started_text} | PID {pid_text}"
                 )
             else:
                 lines.append(

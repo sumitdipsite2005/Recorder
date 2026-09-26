@@ -10318,6 +10318,7 @@ def _publish_identity_runtime_status(
             "candidates": rows,
             "target_names": [target.name for target in request.target_intents],
             "source_count": source_count,
+            "recording_started_at": state.stats.get("process_start"),
             "reason": str(reason or ""),
         })
     except Exception as error:
@@ -18744,14 +18745,21 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
     Format: "YYYY-MM-DD HH:MM" in local time.
     """
     if not SCHEDULE_START:
-        # Manual start (no scheduling)
+        # Manual start (no scheduling). Capture the session start once here so
+        # the live header, runtime state, Coordinator, and final summary agree.
         mode = "manual"
-        now = datetime.now()
+        state.start_time = time.time()
+        state.stats["process_start"] = state.start_time
+        now = datetime.fromtimestamp(state.start_time)
         if RUN_DURATION_MIN is not None:
             end_time = now + timedelta(minutes=RUN_DURATION_MIN)
             log(f"RECORDING ENGINE  : {selected_engine.name}")
             log(f"Recording mode    : {mode}")
             log(f"Base name         : {BASE_NAME}")
+            log(
+                "Recording start   : "
+                + datetime.fromtimestamp(state.start_time).strftime("%Y-%m-%d %H:%M:%S")
+            )
             for line in selected_engine.summary_lines():
                 log(line)
             log(f"Planned duration  : {RUN_DURATION_MIN} minutes")
@@ -18760,6 +18768,10 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
             log(f"RECORDING ENGINE  : {selected_engine.name}")
             log(f"Recording mode    : {mode}")
             log(f"Base name         : {BASE_NAME}")
+            log(
+                "Recording start   : "
+                + datetime.fromtimestamp(state.start_time).strftime("%Y-%m-%d %H:%M:%S")
+            )
             for line in selected_engine.summary_lines():
                 log(line)
             log("Planned duration  : until stopped")
@@ -18901,8 +18913,9 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
     init_termcap()
     init_raw_external_capture()
     
-    state.start_time = time.time()
-    state.stats["process_start"] = state.start_time
+    if not state.stats["process_start"]:
+        state.start_time = time.time()
+        state.stats["process_start"] = state.start_time
     state.original_duration_min = (float(RUN_DURATION_MIN) if RUN_DURATION_MIN is not None else None)
     state.deadline_ts = (state.start_time + RUN_DURATION_MIN * 60) if RUN_DURATION_MIN is not None else None
     state.original_deadline_ts = state.deadline_ts

@@ -10,11 +10,13 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+from datetime import datetime
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError
 
@@ -144,6 +146,44 @@ class RecorderSafetyBaselineTests(unittest.TestCase):
         RECORDER.NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = required or []
         RECORDER.NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = rejected or []
         RECORDER.NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = preferred or []
+
+    def test_manual_header_and_runtime_status_share_recording_start(self):
+        state = RECORDER.RecorderState()
+        state.identity_launch_request = SimpleNamespace(
+            target_intents=(SimpleNamespace(name="Asian Games"),)
+        )
+        published = []
+        state.identity_status_callback = published.append
+        engine = RECORDER.build_engine_registry()[RECORDER.ENGINE_NM3U8DL]
+        start_ts = datetime(2026, 9, 25, 20, 53, 4).timestamp()
+        logged = []
+
+        with (
+            patch.object(RECORDER, "SCHEDULE_START", None),
+            patch.object(RECORDER, "RUN_DURATION_MIN", None),
+            patch.object(RECORDER.time, "time", return_value=start_ts),
+            patch.object(
+                RECORDER,
+                "log",
+                side_effect=lambda message="", *args, **kwargs: logged.append(str(message)),
+            ),
+        ):
+            RECORDER.wait_until_start(state, engine)
+            RECORDER._publish_identity_runtime_status(
+                state,
+                "WAITING_FOR_SOURCE",
+                reason="test",
+            )
+
+        self.assertEqual(state.stats["process_start"], start_ts)
+        self.assertIn(
+            "Recording start   : 2026-09-25 20:53:04",
+            logged,
+        )
+        self.assertEqual(
+            published[-1]["recording_started_at"],
+            start_ts,
+        )
 
     def test_event_matching_keeps_and_or_and_qualifier_semantics(self):
         self.set_match_rules(
