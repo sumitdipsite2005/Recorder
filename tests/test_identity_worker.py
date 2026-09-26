@@ -103,6 +103,67 @@ class IdentityWorkerLifecycleTests(unittest.TestCase):
             entry = store.read()["entries"][request.identity_key]
             self.assertEqual(entry["state"], "ENDED")
 
+    def test_waiting_for_source_recovers_to_recording_before_normal_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            store, request, config_path, request_path, output_paths = self.make_case(td)
+            observed_states = []
+
+            def run_recorder_process(*, identity_launch_request, identity_status_callback):
+                self.assertEqual(
+                    identity_launch_request.identity_key,
+                    request.identity_key,
+                )
+
+                identity_status_callback({
+                    "worker_state": "RECORDING",
+                    "reason": "recorder output file appeared",
+                })
+                observed_states.append(
+                    store.read()["entries"][request.identity_key]["state"]
+                )
+
+                identity_status_callback({
+                    "worker_state": "WAITING_FOR_SOURCE",
+                    "reason": "no usable playlist source found",
+                })
+                observed_states.append(
+                    store.read()["entries"][request.identity_key]["state"]
+                )
+
+                identity_status_callback({
+                    "worker_state": "RECORDING",
+                    "reason": "source recovered",
+                })
+                observed_states.append(
+                    store.read()["entries"][request.identity_key]["state"]
+                )
+
+                return types.SimpleNamespace(
+                    status="ended",
+                    reason="live_stream_ended",
+                )
+
+            fake_record_dynamic = types.SimpleNamespace(
+                OUTPUT_PATHS=output_paths,
+                run_recorder_process=run_recorder_process,
+            )
+            with patch.dict(sys.modules, {"record_dynamic": fake_record_dynamic}):
+                rc = worker.main([
+                    "--request",
+                    str(request_path),
+                    "--config",
+                    str(config_path),
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                observed_states,
+                ["RECORDING", "WAITING_FOR_SOURCE", "RECORDING"],
+            )
+            entry = store.read()["entries"][request.identity_key]
+            self.assertEqual(entry["state"], "ENDED")
+            self.assertEqual(entry["reason"], "live_stream_ended")
+
     def test_exceptional_worker_failure_becomes_crashed(self):
         with tempfile.TemporaryDirectory() as td:
             store, request, config_path, request_path, output_paths = self.make_case(td)
