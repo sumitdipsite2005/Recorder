@@ -9192,17 +9192,6 @@ def enrich_nm3u8dl_candidate_qualities(
             total_candidates,
         )
 
-    probe_groups = {}
-
-    for candidate in candidates:
-        probe_identity = _get_nm3u8dl_candidate_probe_identity(candidate)
-        probe_groups.setdefault(probe_identity, []).append(candidate)
-
-    worker_count = min(
-        max(1, int(NM3U8DL_QUALITY_PROBE_WORKERS)),
-        len(probe_groups),
-    )
-
     # One scan-local cache lets duplicate playlist routes share one P/I result
     # when their provider-neutral effective stream identity is the same.
     scan_type_cache = {
@@ -9211,119 +9200,119 @@ def enrich_nm3u8dl_candidate_qualities(
         "results": {},
     }
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {}
+    def representative(grouped_candidates: Sequence[dict]) -> dict:
+        return grouped_candidates[0]
 
-        for grouped_candidates in probe_groups.values():
-            representative = grouped_candidates[0]
-            future = executor.submit(
-                _probe_nm3u8dl_candidate_quality,
-                representative,
-                stop_requested=stop_requested,
-                scan_type_cache=scan_type_cache,
-                timeout_playlist_urls=[
-                    str(candidate.get("playlist_url") or "").strip()
-                    for candidate in grouped_candidates
-                    if str(candidate.get("playlist_url") or "").strip()
-                ],
+    def probe_group(
+        representative_candidate: dict,
+        grouped_candidates: Sequence[dict],
+    ) -> dict:
+        return _probe_nm3u8dl_candidate_quality(
+            representative_candidate,
+            stop_requested=stop_requested,
+            scan_type_cache=scan_type_cache,
+            timeout_playlist_urls=[
+                str(candidate.get("playlist_url") or "").strip()
+                for candidate in grouped_candidates
+                if str(candidate.get("playlist_url") or "").strip()
+            ],
+        )
+
+    def failure_result(representative_candidate: dict, error: BaseException) -> dict:
+        return {
+            "quality_known": False,
+            "quality_source": "",
+            "video_fps": 0.0,
+            "video_width": 0,
+            "video_height": 0,
+            "video_scan_type": "",
+            "video_scan_type_source": "",
+            "video_bitrate_bps": 0,
+            "video_bitrate_source": "",
+            "manifest_expiry": None,
+            "resource_expiry": None,
+            "manifest_final_url": "",
+            "selected_media_final_url": "",
+            "resource_probe_failure": "",
+            "manifest_reachable": False,
+            "ffprobe_reachable": False,
+            "launchable": False,
+            "drm_protected": False,
+            "drm_key_required": False,
+            "drm_key_missing": False,
+            "drm_detail": "",
+            "drm_inspection_failure": "",
+            "access_blocked": False,
+            "access_block_kind": "",
+            "access_block_http_status": None,
+            "geo_country": None,
+            "stream_type": _get_nm3u8dl_stream_type_from_url(
+                representative_candidate.get("stream_url") or ""
+            ),
+            "header_preparation_failure": "",
+            "manifest_probe_failure": "",
+            "ffprobe_probe_failure": (
+                f"quality probe failed ({type(error).__name__})"
+            ),
+            "quality_probe_error": (
+                f"quality probe failed ({type(error).__name__})"
+            ),
+            "effective_headers": dict(
+                representative_candidate.get("headers") or {}
+            ),
+            "probe_duration_sec": None,
+        }
+
+    def apply_result(candidate: dict, quality: dict) -> dict:
+        candidate_quality = dict(quality)
+
+        if isinstance(quality.get("effective_headers"), dict):
+            candidate_quality["effective_headers"] = dict(
+                quality["effective_headers"]
             )
-            future_map[future] = grouped_candidates
 
-        completed_candidates = 0
+        url_header_expiry = candidate.get("url_header_expiry")
+        candidate.update(candidate_quality)
 
-        for future in as_completed(future_map):
-            if stop_requested is not None and stop_requested():
-                break
+        if candidate.get("unsupported_drm"):
+            # Keep all probe evidence (quality, redirect, expiry), but never
+            # promote a DRM mode the recorder cannot decrypt into selection.
+            candidate["launchable"] = False
 
-            grouped_candidates = future_map[future]
-            representative = grouped_candidates[0]
+        manifest_expiry = candidate.get("manifest_expiry")
+        resource_expiry = candidate.get("resource_expiry")
+        candidate["expiry"] = _merge_nm3u8dl_auth_expiries(
+            url_header_expiry,
+            manifest_expiry,
+            resource_expiry,
+        )
+        candidate["expiry_source"] = get_nm3u8dl_expiry_source(
+            url_header_expiry,
+            manifest_expiry,
+            resource_expiry,
+        )
+        return candidate
 
-            try:
-                quality = future.result()
-            except Exception as error:
-                quality = {
-                    "quality_known": False,
-                    "quality_source": "",
-                    "video_fps": 0.0,
-                    "video_width": 0,
-                    "video_height": 0,
-                    "video_scan_type": "",
-                    "video_scan_type_source": "",
-                    "video_bitrate_bps": 0,
-                    "video_bitrate_source": "",
-                    "manifest_expiry": None,
-                    "resource_expiry": None,
-                    "manifest_final_url": "",
-                    "selected_media_final_url": "",
-                    "resource_probe_failure": "",
-                    "manifest_reachable": False,
-                    "ffprobe_reachable": False,
-                    "launchable": False,
-                    "drm_protected": False,
-                    "drm_key_required": False,
-                    "drm_key_missing": False,
-                    "drm_detail": "",
-                    "drm_inspection_failure": "",
-                    "access_blocked": False,
-                    "access_block_kind": "",
-                    "access_block_http_status": None,
-                    "geo_country": None,
-                    "stream_type": _get_nm3u8dl_stream_type_from_url(
-                        representative.get("stream_url") or ""
-                    ),
-                    "header_preparation_failure": "",
-                    "manifest_probe_failure": "",
-                    "ffprobe_probe_failure": (
-                        f"quality probe failed ({type(error).__name__})"
-                    ),
-                    "quality_probe_error": (
-                        f"quality probe failed ({type(error).__name__})"
-                    ),
-                    "effective_headers": dict(
-                        representative.get("headers") or {}
-                    ),
-                    "probe_duration_sec": None,
-                }
+    progress_callback = None
+    if show_progress:
+        def progress_callback(completed_candidates: int, total: int):
+            render_dynamic_playlist_progress(
+                "checking matched candidates",
+                completed_candidates,
+                total,
+            )
 
-            for candidate in grouped_candidates:
-                candidate_quality = dict(quality)
-
-                if isinstance(quality.get("effective_headers"), dict):
-                    candidate_quality["effective_headers"] = dict(
-                        quality["effective_headers"]
-                    )
-
-                url_header_expiry = candidate.get("url_header_expiry")
-
-                candidate.update(candidate_quality)
-
-                if candidate.get("unsupported_drm"):
-                    # Keep all probe evidence (quality, redirect, expiry), but never
-                    # promote a DRM mode the recorder cannot decrypt into selection.
-                    candidate["launchable"] = False
-
-                manifest_expiry = candidate.get("manifest_expiry")
-                resource_expiry = candidate.get("resource_expiry")
-
-                candidate["expiry"] = _merge_nm3u8dl_auth_expiries(
-                    url_header_expiry,
-                    manifest_expiry,
-                    resource_expiry,
-                )
-                candidate["expiry_source"] = get_nm3u8dl_expiry_source(
-                    url_header_expiry,
-                    manifest_expiry,
-                    resource_expiry,
-                )
-
-            completed_candidates += len(grouped_candidates)
-
-            if show_progress:
-                render_dynamic_playlist_progress(
-                    "checking matched candidates",
-                    completed_candidates,
-                    total_candidates,
-                )
+    source_quality.run_grouped_quality_probes(
+        candidates,
+        group_key=_get_nm3u8dl_candidate_probe_identity,
+        representative=representative,
+        probe=probe_group,
+        apply_result=apply_result,
+        failure_result=failure_result,
+        max_workers=NM3U8DL_QUALITY_PROBE_WORKERS,
+        progress_callback=progress_callback,
+        stop_requested=stop_requested,
+    )
 
     if stop_requested is not None and stop_requested():
         if show_progress:

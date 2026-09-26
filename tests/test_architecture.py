@@ -277,6 +277,29 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("max_workers: int = QUALITY_PROBE_WORKERS", discovery)
         self.assertIn("QUALITY_PROBE_WORKERS = 6", quality)
         self.assertIn("QUALITY_FFPROBE_TIMEOUT_SEC = 20.0", quality)
+        self.assertIn("def run_grouped_quality_probes(", quality)
+
+        mature_batch_start = recorder.index(
+            "def enrich_nm3u8dl_candidate_qualities("
+        )
+        mature_batch_end = recorder.index(
+            "def format_nm3u8dl_access_block_warning(",
+            mature_batch_start,
+        )
+        mature_batch = recorder[mature_batch_start:mature_batch_end]
+        self.assertIn(
+            "source_quality.run_grouped_quality_probes(",
+            mature_batch,
+        )
+        self.assertNotIn("ThreadPoolExecutor(", mature_batch)
+        self.assertNotIn("as_completed(", mature_batch)
+
+        shared_batch_start = discovery.index("def probe_candidates(")
+        shared_batch = discovery[shared_batch_start:]
+        self.assertIn("run_grouped_quality_probes(", shared_batch)
+        self.assertNotIn("ThreadPoolExecutor(", shared_batch)
+        self.assertNotIn("as_completed(", shared_batch)
+
         general_probe_start = recorder.index(
             "for ffprobe_key in ffprobe_key_values:"
         )

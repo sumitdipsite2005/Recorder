@@ -43,6 +43,7 @@ from .quality import (
     QUALITY_PROBE_WORKERS,
     probe_stream_quality_ffprobe,
     quality_probe_identity,
+    run_grouped_quality_probes,
 )
 from .policy import (
     PLAYLIST_GROUP_LIFECYCLES,
@@ -1395,61 +1396,51 @@ def probe_candidates(
     if not candidates:
         return ()
 
-    grouped: Dict[Tuple[object, ...], List[Tuple[int, SourceCandidate]]] = {}
-    for index, candidate in enumerate(candidates):
-        key = quality_probe_identity(
+    now = time.time()
+
+    def group_key(candidate: SourceCandidate):
+        return quality_probe_identity(
             candidate,
             effective_headers=_effective_probe_headers(candidate),
         )
-        grouped.setdefault(key, []).append((index, candidate))
 
-    result: List[Optional[SourceCandidate]] = [None] * len(candidates)
-    worker_count = min(max(1, int(max_workers)), len(grouped))
-    now = time.time()
-
-    def representative(entries: List[Tuple[int, SourceCandidate]]) -> SourceCandidate:
-        for _, candidate in entries:
+    def representative(grouped_candidates: Sequence[SourceCandidate]) -> SourceCandidate:
+        for candidate in grouped_candidates:
             expiry = _candidate_url_header_expiry(candidate)
             if expiry is None or expiry > now:
                 return candidate
-        return entries[0][1]
+        return grouped_candidates[0]
 
-    with ThreadPoolExecutor(
-        max_workers=worker_count,
+    def probe_group(
+        representative_candidate: SourceCandidate,
+        grouped_candidates: Sequence[SourceCandidate],
+    ) -> SourceCandidate:
+        del grouped_candidates
+        return probe_candidate_hls(
+            representative_candidate,
+            timeout_sec=timeout_sec,
+        )
+
+    def failure_result(
+        representative_candidate: SourceCandidate,
+        error: BaseException,
+    ) -> SourceCandidate:
+        return replace(
+            representative_candidate,
+            launchable=False,
+            probe_status="probe_failed",
+            probe_error=f"{type(error).__name__}: {error}",
+            reason="probe failed",
+        )
+
+    return tuple(run_grouped_quality_probes(
+        candidates,
+        group_key=group_key,
+        representative=representative,
+        probe=probe_group,
+        apply_result=_reuse_probe_result,
+        failure_result=failure_result,
+        max_workers=max_workers,
+        progress_callback=progress_callback,
         thread_name_prefix="candidate_probe",
-    ) as executor:
-        future_map = {
-            executor.submit(
-                probe_candidate_hls,
-                representative(entries),
-                timeout_sec=timeout_sec,
-            ): entries
-            for entries in grouped.values()
-        }
-        completed_count = 0
-        for future in as_completed(future_map):
-            entries = future_map[future]
-            representative_candidate = representative(entries)
-            try:
-                probed = future.result()
-            except Exception as error:
-                probed = replace(
-                    representative_candidate,
-                    launchable=False,
-                    probe_status="probe_failed",
-                    probe_error=f"{type(error).__name__}: {error}",
-                    reason="probe failed",
-                )
-
-            for index, candidate in entries:
-                result[index] = _reuse_probe_result(candidate, probed)
-
-            completed_count += len(entries)
-            if progress_callback is not None:
-                progress_callback(completed_count, len(candidates))
-
-    return tuple(
-        item if item is not None else candidates[index]
-        for index, item in enumerate(result)
-    )
-
+    ))

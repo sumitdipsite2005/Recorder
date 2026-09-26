@@ -14,6 +14,7 @@ import re
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import urljoin
@@ -33,6 +34,76 @@ QUALITY_PROBE_WORKERS = 6
 QUALITY_FFPROBE_TIMEOUT_SEC = 20.0
 QUALITY_BITRATE_SAMPLE_SEC = 4.0
 QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC = 12.0
+
+
+def run_grouped_quality_probes(
+    candidates: Sequence[object],
+    *,
+    group_key: Callable[[object], object],
+    representative: Callable[[Sequence[object]], object],
+    probe: Callable[[object, Sequence[object]], object],
+    apply_result: Callable[[object, object], object],
+    failure_result: Callable[[object, BaseException], object],
+    max_workers: int = QUALITY_PROBE_WORKERS,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    thread_name_prefix: str = "",
+) -> Tuple[object, ...]:
+    """Run one probe per effective group and fan its result back to every member.
+
+    Callers own probe semantics and result interpretation. This function owns only
+    the shared batch mechanics: grouping, representative selection, bounded
+    concurrency, failure dispatch, result reuse, progress, and cooperative stop
+    observation between completed groups.
+    """
+    items = tuple(candidates)
+    if not items:
+        return ()
+
+    grouped = {}
+    for index, candidate in enumerate(items):
+        grouped.setdefault(group_key(candidate), []).append((index, candidate))
+
+    results = [None] * len(items)
+    worker_count = min(max(1, int(max_workers)), len(grouped))
+    executor_args = {"max_workers": worker_count}
+    if thread_name_prefix:
+        executor_args["thread_name_prefix"] = str(thread_name_prefix)
+
+    with ThreadPoolExecutor(**executor_args) as executor:
+        future_map = {}
+        for entries in grouped.values():
+            grouped_candidates = tuple(candidate for _, candidate in entries)
+            group_representative = representative(grouped_candidates)
+            future = executor.submit(
+                probe,
+                group_representative,
+                grouped_candidates,
+            )
+            future_map[future] = (entries, group_representative)
+
+        completed_count = 0
+        for future in as_completed(future_map):
+            if stop_requested is not None and stop_requested():
+                break
+
+            entries, group_representative = future_map[future]
+            try:
+                probed = future.result()
+            except Exception as error:
+                probed = failure_result(group_representative, error)
+
+            for index, candidate in entries:
+                results[index] = apply_result(candidate, probed)
+
+            completed_count += len(entries)
+            if progress_callback is not None:
+                progress_callback(completed_count, len(items))
+
+    return tuple(
+        item if item is not None else items[index]
+        for index, item in enumerate(results)
+    )
 
 
 def _quality_value(candidate: QualityLike, name: str, default: object = "") -> object:
