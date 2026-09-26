@@ -223,6 +223,12 @@ def acquire_active_targets(
         if stop_requested is not None and stop_requested():
             raise RuntimeError("Coordinator scan cancelled by stop request")
 
+    cancellation_kwargs = (
+        {"stop_requested": stop_requested}
+        if stop_requested is not None
+        else {}
+    )
+
     raise_if_cancelled()
     active = [view for view in target_views if view.status == "ACTIVE"]
     if not active:
@@ -253,18 +259,18 @@ def acquire_active_targets(
     if progress_callback is None:
         documents, fetch_errors, fetch_diagnostics = fetch_playlist_documents(
             source_specs,
-            stop_requested=stop_requested,
+            **cancellation_kwargs,
         )
     else:
         progress_callback(f"Scanning playlists 0/{len(source_specs)}")
         documents, fetch_errors, fetch_diagnostics = fetch_playlist_documents(
             source_specs,
-            stop_requested=stop_requested,
             progress_callback=(
                 lambda done, total: progress_callback(
                     f"Scanning playlists {done}/{total}"
                 )
             ),
+            **cancellation_kwargs,
         )
 
     raise_if_cancelled()
@@ -290,7 +296,7 @@ def acquire_active_targets(
                 fetch_diagnostics.get(spec.url),
                 previous=previous_freshness,
                 now_ts=freshness_now,
-                stop_requested=stop_requested,
+                **cancellation_kwargs,
             ),
         )
 
@@ -448,18 +454,18 @@ def acquire_active_targets(
     if progress_callback is None:
         probed = probe_candidates(
             probe_pool,
-            stop_requested=stop_requested,
+            **cancellation_kwargs,
         )
     else:
         progress_callback(f"Checking candidates 0/{len(probe_pool)}")
         probed = probe_candidates(
             probe_pool,
-            stop_requested=stop_requested,
             progress_callback=(
                 lambda done, total: progress_callback(
                     f"Checking candidates {done}/{total}"
                 )
             ),
+            **cancellation_kwargs,
         )
     raise_if_cancelled()
     probed_by_key = {_observation_key(candidate): candidate for candidate in probed}
