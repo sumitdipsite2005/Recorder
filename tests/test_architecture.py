@@ -101,6 +101,49 @@ class ArchitectureGuardTests(unittest.TestCase):
         for duplicate in ("GROUP_PROVIDER = {","GROUP_MATCH_MODE = {","GROUP_SOURCE_BUCKET = {","PROVIDER_SELECTION_POLICY = {","PLAYLIST_USER_AGENTS = {"):
             self.assertNotIn(duplicate,text)
 
+    def test_generic_refactored_layers_do_not_hardcode_provider_brands(self):
+        allowed = {
+            ROOT/"recorder_source"/"policy.py",
+            ROOT/"recorder_source"/"identity.py",
+        }
+        forbidden = ("FANCODE", "HOTSTAR", "SONYLIV", "SONY_TV", "JIO_STAR", "KHEL")
+        paths = [
+            *sorted((ROOT/"recorder_coordinator").glob("*.py")),
+            *sorted((ROOT/"recorder_runtime").glob("*.py")),
+            *sorted((ROOT/"recorder_source").glob("*.py")),
+        ]
+        for path in paths:
+            if path in allowed:
+                continue
+            text = path.read_text(encoding="utf-8").upper()
+            for brand in forbidden:
+                self.assertNotIn(brand, text, f"{brand} leaked into generic module {path.name}")
+
+    def test_refactored_modules_do_not_copy_substantial_function_bodies(self):
+        roots = (
+            ROOT/"recorder_coordinator",
+            ROOT/"recorder_runtime",
+            ROOT/"recorder_source",
+        )
+        seen = {}
+        for folder in roots:
+            for path in sorted(folder.glob("*.py")):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                for node in ast.walk(tree):
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    span = int(getattr(node, "end_lineno", node.lineno)) - int(node.lineno) + 1
+                    if span < 12:
+                        continue
+                    body = ast.dump(ast.Module(body=node.body, type_ignores=[]), include_attributes=False)
+                    previous = seen.get(body)
+                    if previous is not None:
+                        self.fail(
+                            "substantial duplicate function body: "
+                            f"{previous[0]}:{previous[1]} and {path}:{node.lineno}"
+                        )
+                    seen[body] = (path, node.lineno)
+
     def test_entrypoint_file_names_follow_python_convention(self):
         for path in ROOT.glob("*.py"):
             self.assertEqual(path.name, path.name.lower(), path.name)
