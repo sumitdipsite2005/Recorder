@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError
 
+from recorder_source.headers import canonicalize_header_name
+from recorder_source.playback import playback_fingerprint
 from recorder_source.discovery import (
     _github_file_commit_timestamp,
     adapt_json_playlist_text,
@@ -953,6 +955,41 @@ https://edge.drmlive.net/live.mpd
             format_candidate_quality(item),
             "1920x1080 | 50p [manifest, event-policy] | ~3456 Kbps [FFmpeg sample]",
         )
+
+    def test_shared_header_canonicalization_matches_mature_alias_rules(self):
+        self.assertEqual(canonicalize_header_name("user_agent"), "User-Agent")
+        self.assertEqual(canonicalize_header_name("referrer"), "Referer")
+        self.assertEqual(canonicalize_header_name("AUTHORIZATION"), "Authorization")
+        self.assertEqual(canonicalize_header_name("X-Custom"), "X-Custom")
+
+    def test_shared_playback_fingerprint_contract(self):
+        base = {
+            "Cookie": "session=one",
+            "Authorization": "Bearer A",
+            "Referer": "https://example.test/",
+            "Origin": "https://example.test",
+            "User-Agent": "ignored-one",
+        }
+        same_effective = dict(base, **{"User-Agent": "ignored-two"})
+        changed_auth = dict(base, **{"Authorization": "Bearer B"})
+        url = "https://media.example.test/live/master.m3u8?token=one"
+
+        self.assertEqual(
+            playback_fingerprint(url, base),
+            playback_fingerprint(url, same_effective),
+        )
+        self.assertNotEqual(
+            playback_fingerprint(url, base),
+            playback_fingerprint(url, changed_auth),
+        )
+        self.assertNotEqual(
+            playback_fingerprint(url, base),
+            playback_fingerprint(
+                "https://media.example.test/live/master.m3u8?token=two",
+                base,
+            ),
+        )
+        self.assertEqual(playback_fingerprint("", base), "")
 
     def test_quality_probe_identity_ignores_playlist_provenance(self):
         a = candidate(
