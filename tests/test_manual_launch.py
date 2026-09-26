@@ -4,6 +4,7 @@ from datetime import datetime
 import unittest
 
 from recorder_coordinator.launch import (
+    _safe_base_name,
     build_all_launch_plan,
     build_manual_launch_plan,
 )
@@ -45,6 +46,20 @@ def sony_candidate(*, title: str, fps: float, bitrate: int, playlist: str) -> So
 
 
 class ManualLaunchPlanTests(unittest.TestCase):
+    def test_fancode_filename_marker_uses_numeric_identity_sub_id(self):
+        item = SourceCandidate(
+            entry_title="Presidents Cup 2026 [English]",
+            group_title="FanCode",
+        )
+        self.assertEqual(
+            _safe_base_name(
+                item,
+                "fallback",
+                "/mumbai/4249106_english_hls_b86f41b4c015704_1ta-di_h264",
+            ),
+            "FanCode - Presidents Cup 2026 [English] - 4249106",
+        )
+
     def snapshot_for(self, targets, candidates_by_target):
         all_candidates = [
             candidate
