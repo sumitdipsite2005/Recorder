@@ -49,7 +49,10 @@ from recorder_source.models import (
     SourceCandidate,
 )
 from recorder_source import transport as source_transport
-from recorder_source.policy import selection_policy_for_provider
+from recorder_source.policy import (
+    is_vpn_route_suspected_403,
+    selection_policy_for_provider,
+)
 from recorder_source.selection import (
     candidate_quality_rank,
     comparable_motion_fps,
@@ -954,6 +957,17 @@ https://edge.drmlive.net/live.mpd
         self.assertEqual(
             format_candidate_quality(item),
             "1920x1080 | 50p [manifest, event-policy] | ~3456 Kbps [FFmpeg sample]",
+        )
+
+    def test_provider_specific_403_policy_lives_in_policy_layer(self):
+        self.assertTrue(
+            is_vpn_route_suspected_403(provider="FANCODE")
+        )
+        self.assertTrue(
+            is_vpn_route_suspected_403(source_group="JIO_STAR_SPORTS")
+        )
+        self.assertFalse(
+            is_vpn_route_suspected_403(provider="SONYLIV")
         )
 
     def test_shared_header_canonicalization_matches_mature_alias_rules(self):
