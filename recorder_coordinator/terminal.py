@@ -18,11 +18,6 @@ except ImportError:  # pragma: no cover - non-Windows development/test hosts
 
 from recorder_runtime import sound as runtime_sound
 from recorder_runtime.sound import SoundSnoozeState
-from recorder_source.policy import selection_policy_for_provider
-from recorder_source.selection import (
-    same_selection_candidate,
-    selection_nonselection_reason,
-)
 
 from .models import (
     ChangeEvent,
@@ -39,7 +34,10 @@ _LIVE_STATUS_ACTIVE = False
 _LIVE_STATUS_TEXT = ""
 
 _RUNTIME_REGISTRY_STATES = frozenset(
-    {"LAUNCHING", "ACTIVE", "WAITING_FOR_SOURCE"}
+    {"RECORDING", "WAITING_FOR_SOURCE"}
+)
+_TERMINAL_REGISTRY_STATES = frozenset(
+    {"ENDED", "MANUALLY_STOPPED", "CRASHED"}
 )
 
 
@@ -63,6 +61,7 @@ _IMPORTANT_RGB = (220, 220, 220)
 _RUNTIME_STATE_RGB = {
     "AVAILABLE": _IMPORTANT_RGB,
     "LAUNCHING": _EVENT_RGB,
+    "RECORDING": _CHANGE_DETAIL_RGB,
     "ACTIVE": _CHANGE_DETAIL_RGB,
     "WAITING_FOR_SOURCE": _MARKER_RGB,
     "ENDED": _MUTED_RGB,
@@ -121,8 +120,42 @@ def _compact_timestamp(value: datetime, reference: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def _ansi_text(text: str, code: str, use_color: bool) -> str:
+    if not use_color:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _on_text(text: str, use_color: bool) -> str:
+    return _ansi_text(text, "1;92", use_color)
+
+
 def _off_text(text: str, use_color: bool) -> str:
-    return _paint_rgb(text, _ERROR_RGB, use_color)
+    return _ansi_text(text, "1;93", use_color)
+
+
+def _warning_text(text: str, use_color: bool) -> str:
+    return _ansi_text(text, "1;93", use_color)
+
+
+def _hard_failure_text(text: str, use_color: bool) -> str:
+    return _ansi_text(text, "1;91", use_color)
+
+
+def _selected_text(text: str, use_color: bool) -> str:
+    return _ansi_text(text, "1;97;42", use_color)
+
+
+def _selection_reason_text(text: str, use_color: bool) -> str:
+    value = str(text or "")
+    if not value:
+        return value
+    lowered = value.casefold()
+    if "expiry unknown" in lowered or "unknown-expiry source preferred" in lowered:
+        return _warning_text(value, use_color)
+    if "less preferred match" in lowered or "min remaining" in lowered:
+        return _ansi_text(value, "36", use_color)
+    return _secondary_text(value, use_color)
 
 
 def _runtime_state_text(
@@ -316,7 +349,10 @@ def _provider_summary(snapshot: DashboardSnapshot) -> str:
     return f"{label}={','.join(providers)}"
 
 
-def _dashboard_source_ids(snapshot: DashboardSnapshot) -> Tuple[str, ...]:
+def _dashboard_source_ids(
+    snapshot: DashboardSnapshot,
+    runtime_statuses: Optional[Mapping[str, Mapping[str, object]]] = None,
+) -> Tuple[str, ...]:
     source_ids: List[str] = []
     seen = set()
     for block in snapshot.blocks.values():
@@ -325,12 +361,25 @@ def _dashboard_source_ids(snapshot: DashboardSnapshot) -> Tuple[str, ...]:
             if source_id and source_id not in seen:
                 seen.add(source_id)
                 source_ids.append(source_id)
+
+    for status in (runtime_statuses or {}).values():
+        if not isinstance(status, Mapping):
+            continue
+        current = status.get("current_candidate")
+        if not isinstance(current, Mapping):
+            continue
+        source_id = str(current.get("playlist_url") or "").strip()
+        if source_id and source_id not in seen:
+            seen.add(source_id)
+            source_ids.append(source_id)
+
     return tuple(source_ids)
 
 
 def update_source_reference_registry(
     previous: Mapping[str, int],
     snapshot: DashboardSnapshot,
+    runtime_statuses: Optional[Mapping[str, Mapping[str, object]]] = None,
 ) -> Dict[str, int]:
     """Keep source reference numbers stable for the life of a Coordinator run."""
     result = {
@@ -339,11 +388,83 @@ def update_source_reference_registry(
         if str(source_id).strip() and int(number) > 0
     }
     next_number = max(result.values(), default=0) + 1
-    for source_id in _dashboard_source_ids(snapshot):
+    for source_id in _dashboard_source_ids(snapshot, runtime_statuses):
         if source_id not in result:
             result[source_id] = next_number
             next_number += 1
     return result
+
+
+def _expiry_display_text(expiry: object, expiry_source: object = "") -> str:
+    if expiry is None:
+        return "unknown"
+    try:
+        text = datetime.fromtimestamp(float(expiry)).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "unknown"
+    source = str(expiry_source or "").strip()
+    if source:
+        text += f" [{source}]"
+    return text
+
+
+def _runtime_candidate_key(value: object) -> Tuple[object, ...]:
+    if isinstance(value, Mapping):
+        getter = value.get
+    else:
+        getter = lambda name, default=None: getattr(value, name, default)
+    return (
+        str(getter("playlist_url", "") or ""),
+        int(getter("matching_entry_index", 0) or 0),
+        str(getter("stream_url", "") or ""),
+        str(getter("entry_title", "") or ""),
+        str(getter("tvg_name", "") or ""),
+        str(getter("group_title", "") or ""),
+    )
+
+
+def _runtime_candidate_rows(
+    runtime_status: Optional[Mapping[str, object]],
+) -> Dict[Tuple[object, ...], Mapping[str, object]]:
+    if not isinstance(runtime_status, Mapping):
+        return {}
+    rows = {}
+    for row in runtime_status.get("candidates") or ():
+        if isinstance(row, Mapping):
+            rows[_runtime_candidate_key(row)] = row
+    return rows
+
+
+def _local_candidate_classification(candidate) -> Tuple[str, str]:
+    state = candidate_state(candidate)
+    if state == "WORKING":
+        return "", ""
+    if state == "AUTH_UNKNOWN":
+        return (
+            "EXPIRY UNKNOWN",
+            "no recognizable authorization expiry — cannot use with current profile",
+        )
+    if state == "EXPIRED":
+        return (
+            "EXPIRED",
+            "expired " + _expiry_display_text(
+                getattr(candidate, "expiry", None),
+                getattr(candidate, "expiry_source", ""),
+            ),
+        )
+    if state == "ACCESS_BLOCKED":
+        return "BLOCKED", "source access restriction detected"
+    if state == "UNSUPPORTED_DRM":
+        reason = str(getattr(candidate, "unsupported_drm", "") or "").strip()
+        return "DRM UNSUPPORTED", reason or "unsupported DRM"
+    classification = state.replace("_", " ")
+    return classification, classification.casefold()
+
+
+def _classification_text(text: str, use_color: bool) -> str:
+    if str(text or "").startswith("DRM "):
+        return _hard_failure_text(text, use_color)
+    return _warning_text(text, use_color)
 
 
 def render_dashboard(
@@ -355,6 +476,7 @@ def render_dashboard(
     refresh_interval_sec: Optional[float] = None,
     use_color: Optional[bool] = None,
     registry_entries: Optional[Mapping[str, Mapping[str, object]]] = None,
+    runtime_statuses: Optional[Mapping[str, Mapping[str, object]]] = None,
     source_references: Optional[Mapping[str, int]] = None,
 ) -> str:
     color = _terminal_is_interactive() if use_color is None else bool(use_color)
@@ -362,9 +484,9 @@ def render_dashboard(
     effective_source_references = (
         dict(source_references)
         if source_references is not None
-        else update_source_reference_registry({}, snapshot)
+        else update_source_reference_registry({}, snapshot, runtime_statuses)
     )
-    current_source_ids = _dashboard_source_ids(snapshot)
+    current_source_ids = _dashboard_source_ids(snapshot, runtime_statuses)
 
     lines: List[str] = _header_lines(
         snapshot,
@@ -373,6 +495,7 @@ def render_dashboard(
     )
 
     current_registry = registry_entries or {}
+    current_runtime = runtime_statuses or {}
     active_entries = []
     for identity_key, entry in current_registry.items():
         if not isinstance(entry, Mapping):
@@ -384,7 +507,7 @@ def render_dashboard(
 
     if active_entries:
         lines.append("")
-        lines.append(_event_title("ACTIVE RECORDINGS", color))
+        lines.append(_event_title("RECORDINGS", color))
         for identity_key, entry, state in sorted(
             active_entries,
             key=lambda item: (
@@ -394,6 +517,12 @@ def render_dashboard(
         ):
             display_name = str(entry.get("display_name") or identity_key)
             provider = str(entry.get("provider") or "-")
+            provider_prefix = f"{provider}|"
+            identity_value = (
+                identity_key[len(provider_prefix):]
+                if identity_key.startswith(provider_prefix)
+                else identity_key
+            )
             pid = entry.get("worker_pid")
             pid_text = (
                 str(pid)
@@ -401,9 +530,53 @@ def render_dashboard(
                 else "-"
             )
             state_flag = _runtime_state_text(state, color, bracketed=True)
-            lines.append(
-                f"  {state_flag} {display_name} | {provider} | PID {pid_text}"
+            runtime_status = current_runtime.get(identity_key)
+            current_candidate = (
+                runtime_status.get("current_candidate")
+                if isinstance(runtime_status, Mapping)
+                else None
             )
+            target_names = (
+                runtime_status.get("target_names") or ()
+                if isinstance(runtime_status, Mapping)
+                else ()
+            )
+            source_count = (
+                runtime_status.get("source_count")
+                if isinstance(runtime_status, Mapping)
+                else None
+            )
+            target_text = ", ".join(str(value) for value in target_names) or "-"
+            source_count_text = str(source_count) if source_count is not None else "-"
+
+            if state == "RECORDING" and isinstance(current_candidate, Mapping):
+                event_name = str(
+                    current_candidate.get("entry_title")
+                    or current_candidate.get("tvg_name")
+                    or display_name
+                )
+                tvg_name = str(current_candidate.get("tvg_name") or "-")
+                group_name = str(current_candidate.get("group_title") or "-")
+                source_id = str(current_candidate.get("playlist_url") or "")
+                source_number = effective_source_references.get(source_id)
+                source_text = (
+                    f"[S{source_number}]"
+                    if source_number is not None
+                    else "[S?]"
+                )
+                quality = str(current_candidate.get("quality") or "unknown")
+                lines.append(
+                    f"  {state_flag} {event_name} | {tvg_name} | {group_name} "
+                    f"| {provider} | {source_text} | {quality} "
+                    f"| Identity: {identity_value} | Targets: {target_text} "
+                    f"| Sources: {source_count_text} | PID {pid_text}"
+                )
+            else:
+                lines.append(
+                    f"  {state_flag} {display_name} | {provider} "
+                    f"| Identity: {identity_value} | Targets: {target_text} "
+                    f"| Sources: {source_count_text} | PID {pid_text}"
+                )
 
     lines.append("")
     lines.append("=" * 88)
@@ -450,13 +623,31 @@ def render_dashboard(
                 else ""
             )
             visible_state = registry_state or block.overall_state
-            state_label = _runtime_state_text(visible_state, color)
+            state_label = _runtime_state_text(
+                visible_state,
+                color,
+                bracketed=visible_state in _TERMINAL_REGISTRY_STATES,
+            )
+            suppression_text = (
+                " | suppressed for this registry/session"
+                if visible_state in _TERMINAL_REGISTRY_STATES
+                else ""
+            )
             lines.append(
                 f"{identity_marker}[{index}] {state_label} {block.identity.provider} "
                 f"| Identity: {_identity_text(identity_value, color)} "
                 f"| Targets: {', '.join(block.target_names)} "
                 f"| Sources: {len(block.observations)}"
+                f"{suppression_text}"
             )
+
+            runtime_status = current_runtime.get(serialized)
+            runtime_worker_state = (
+                str(runtime_status.get("worker_state") or "").strip().upper()
+                if isinstance(runtime_status, Mapping)
+                else ""
+            )
+            runtime_rows = _runtime_candidate_rows(runtime_status)
 
             for event in identity_events.get(block_key, ()):
                 for detail in event.details:
@@ -543,19 +734,47 @@ def render_dashboard(
                                 details_to_show.extend(event.details)
 
                     state_text = candidate_state(candidate)
-                    on_off = "[ON]" if state_text == "WORKING" else _off_text("[OFF]", color)
-                    selection_marker = ""
-                    selection_reason = ""
-                    if state_text == "WORKING" and block.best_candidate is not None:
-                        if same_selection_candidate(candidate, block.best_candidate):
-                            selection_marker = " " + _marker("[SELECTED]", color)
-                        else:
-                            selection_reason = selection_nonselection_reason(
-                                candidate,
-                                block.best_candidate,
-                                selection_policy_for_provider(block.identity.provider),
-                                now_ts=snapshot.created_at.timestamp(),
-                            )
+                    runtime_row = runtime_rows.get(_runtime_candidate_key(candidate))
+                    runtime_selected = bool(
+                        isinstance(runtime_row, Mapping)
+                        and runtime_row.get("selected")
+                    )
+                    runtime_classification = (
+                        str(runtime_row.get("classification") or "").strip()
+                        if isinstance(runtime_row, Mapping)
+                        else ""
+                    )
+                    runtime_reason = (
+                        str(runtime_row.get("selection_reason") or "").strip()
+                        if isinstance(runtime_row, Mapping)
+                        else ""
+                    )
+
+                    state_prefix = ""
+                    if runtime_selected and runtime_worker_state == "SELECTED":
+                        state_prefix = _selected_text("[SELECTED]", color) + " "
+                    elif runtime_selected and runtime_worker_state == "RECORDING":
+                        state_prefix = (
+                            _runtime_state_text("RECORDING", color, bracketed=True)
+                            + " "
+                        )
+
+                    local_classification, local_reason = _local_candidate_classification(
+                        candidate
+                    )
+                    classification = runtime_classification or local_classification
+                    decision_reason = runtime_reason or local_reason
+
+                    on_off = (
+                        _on_text("[ON]", color)
+                        if state_text == "WORKING"
+                        else _off_text("[OFF]", color)
+                    )
+                    classification_prefix = (
+                        _classification_text(classification, color) + " — "
+                        if classification and state_text != "WORKING"
+                        else ""
+                    )
                     event_name = candidate.entry_title or candidate.tvg_name or "-"
                     tvg_name = candidate.tvg_name or "-"
                     group_name = candidate.group_title or "-"
@@ -581,37 +800,37 @@ def render_dashboard(
                             freshness_text = "Source Updated - [unknown]"
                     else:
                         freshness_text = f"Source Updated - [{freshness_source}]"
-                    trailing_state = (
-                        ""
-                        if state_text == "WORKING"
-                        else " | " + _off_text(state_text, color)
+                    trailing_decision = (
+                        " | " + _selection_reason_text(decision_reason, color)
+                        if decision_reason and not runtime_selected
+                        else ""
                     )
-                    trailing_selection = ""
-                    if selection_marker:
-                        trailing_selection = " | " + selection_marker.strip()
-                    elif selection_reason:
-                        trailing_selection = (
-                            " | " + _secondary_text(selection_reason, color)
-                        )
                     source_reference = effective_source_references.get(
                         str(source.source_id)
                     )
                     source_reference_text = (
-                        " " + _source_reference_text(f"[S{source_reference}]", color)
+                        _source_reference_text(f"[S{source_reference}]", color)
                         if source_reference is not None
-                        else ""
+                        else _source_reference_text("[S?]", color)
+                    )
+                    expiry_text = (
+                        "expires "
+                        + _expiry_display_text(
+                            getattr(candidate, "expiry", None),
+                            getattr(candidate, "expiry_source", ""),
+                        )
                     )
                     lines.append(
                         "        "
-                        f"{marker_prefix}{on_off} "
-                        f"{_event_title(event_name, color)} | "
+                        f"{marker_prefix}{state_prefix}{on_off} "
+                        f"{classification_prefix}{_event_title(event_name, color)} | "
                         f"{_secondary_text(tvg_name, color)} | "
                         f"{_group_text(group_name, color)} | "
-                        f"{_source_reference_text(source.source_name, color)}{source_reference_text} | "
+                        f"{source_reference_text} | "
+                        f"{_secondary_text(expiry_text, color)} | "
                         f"{_secondary_text(last_updated_text, color)} | "
                         f"{_secondary_text(freshness_text, color)}"
-                        f"{trailing_state}"
-                        f"{trailing_selection}"
+                        f"{trailing_decision}"
                     )
                     for detail in details_to_show:
                         lines.append(
@@ -647,19 +866,22 @@ def render_dashboard(
     return "\n".join(lines)
 
 
-def _identity_usefulness_rank(block) -> Tuple[int, int]:
-    """Rank identities by how much of their visible source evidence is usable."""
+def _identity_usefulness_rank(
+    block,
+    registry_state: str = "",
+) -> Tuple[int, int]:
+    """Rank recordable identities, then terminal identities, then unusable ones."""
     states = [
         candidate_state(candidate)
         for candidate in block.candidates
     ]
-    total = len(states)
     unusable = sum(state != "WORKING" for state in states)
+    has_working = any(state == "WORKING" for state in states)
 
-    if unusable == 0:
-        category = 0
-    elif total > 0 and unusable < total:
+    if registry_state in _TERMINAL_REGISTRY_STATES:
         category = 1
+    elif has_working:
+        category = 0
     else:
         category = 2
 
@@ -669,6 +891,8 @@ def _identity_usefulness_rank(block) -> Tuple[int, int]:
 def update_display_order(
     previous_order: Mapping[str, Sequence[str]],
     snapshot: DashboardSnapshot,
+    *,
+    registry_entries: Optional[Mapping[str, Mapping[str, object]]] = None,
 ) -> Dict[str, List[str]]:
     """Order useful identities first while preserving stable order within ties."""
     result: Dict[str, List[str]] = {}
@@ -700,7 +924,14 @@ def update_display_order(
 
         policy_blocks.sort(
             key=lambda block: (
-                *_identity_usefulness_rank(block),
+                *_identity_usefulness_rank(
+                    block,
+                    str(
+                        (registry_entries or {})
+                        .get(block.identity.serialized, {})
+                        .get("state", "")
+                    ).strip().upper(),
+                ),
                 0 if block.identity.serialized in new_position else 1,
                 new_position.get(
                     block.identity.serialized,
