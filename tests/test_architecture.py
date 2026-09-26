@@ -153,6 +153,15 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("QUALITY_PROBE_WORKERS = 6", quality)
         self.assertIn("QUALITY_FFPROBE_TIMEOUT_SEC = 20.0", quality)
 
+    def test_playback_fingerprint_has_one_shared_owner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        playback=(ROOT/"recorder_source"/"playback.py").read_text(encoding="utf-8")
+        self.assertIn("def playback_fingerprint(", playback)
+        self.assertIn("source_playback.playback_fingerprint(", recorder)
+        self.assertIn("playback_fingerprint(", discovery)
+        self.assertNotIn("def _playback_fingerprint(", discovery)
+
     def test_mature_recorder_consumes_shared_policy(self):
         text=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         self.assertIn("from recorder_source.policy import",text)
