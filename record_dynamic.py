@@ -67,6 +67,7 @@ from recorder_runtime.paths import build_recorder_output_paths
 from recorder_source import discovery as source_discovery
 from recorder_source import headers as source_headers
 from recorder_source import playback as source_playback
+from recorder_source import playlist_headers as source_playlist_headers
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
 from recorder_source import quality as source_quality
@@ -6274,256 +6275,82 @@ def canonicalize_nm3u8dl_header_name(name: str) -> str:
 def split_nm3u8dl_stream_url_metadata(
     stream_url: str
 ):
-    stream_url = str(stream_url).strip()
-
-    clean_url, separator, metadata_text = (
-        stream_url.partition("|")
+    return source_playlist_headers.split_stream_url_metadata(
+        stream_url,
+        policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
     )
-
-    clean_url = clean_url.strip()
-
-    # Some playlists use:
-    #
-    #   index.mpd?|cookie=...
-    #
-    # Here the "?" is empty and belongs to the player-style
-    # pipe syntax rather than to a real URL query.
-    #
-    # Genuine query strings remain untouched:
-    #
-    #   index.mpd?hdnea=...|cookie=...
-    #
-    pipe_headers = {}
-
-    if not separator:
-        return clean_url, pipe_headers
-
-    if clean_url.endswith("?"):
-        clean_url = clean_url[:-1]
-
-    for item in metadata_text.split("&"):
-        item = item.strip()
-
-        if not item:
-            continue
-
-        name, equals, value = item.partition("=")
-
-        if not equals:
-            continue
-
-        header_name = canonicalize_nm3u8dl_header_name(
-            name
-        )
-
-        if not header_name:
-            continue
-
-        pipe_headers[header_name] = value.strip()
-
-    return clean_url, pipe_headers
 
 
 def get_nm3u8dl_playlist_header_sources(
     option_lines: List[str]
 ):
-    extvlc_headers = {}
-    exthttp_headers = {}
+    return source_playlist_headers.playlist_header_sources(
+        option_lines,
+        policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
+    )
 
-    for line in option_lines:
-        if line.startswith("#EXTHTTP:"):
-            raw_json = line[len("#EXTHTTP:"):].strip()
-            data = json.loads(raw_json)
-
-            for name, value in data.items():
-                if value is None:
-                    continue
-
-                header_name = (
-                    canonicalize_nm3u8dl_header_name(name)
-                )
-
-                exthttp_headers[header_name] = (
-                    str(value).strip()
-                )
-
-        elif line.startswith(
-            "#EXTVLCOPT:http-cookie="
-        ):
-            extvlc_headers["Cookie"] = (
-                line.split("=", 1)[1].strip()
-            )
-
-        elif line.startswith(
-            "#EXTVLCOPT:http-referrer="
-        ):
-            extvlc_headers["Referer"] = (
-                line.split("=", 1)[1].strip()
-            )
-
-        elif line.startswith(
-            "#EXTVLCOPT:http-user-agent="
-        ):
-            extvlc_headers["User-Agent"] = (
-                line.split("=", 1)[1].strip()
-            )
-
-        elif line.startswith(
-            "#EXTVLCOPT:http-extra-headers="
-        ):
-            raw_header = line.split("=", 1)[1]
-
-            name, separator, value = (
-                raw_header.partition(":")
-            )
-
-            if separator:
-                header_name = (
-                    canonicalize_nm3u8dl_header_name(name)
-                )
-
-                extvlc_headers[header_name] = (
-                    value.strip()
-                )
-
-    return extvlc_headers, exthttp_headers
 
 NM3U8DL_METADATA_CONFLICTS_SEEN = set()
+
+
+def _log_nm3u8dl_playlist_header_conflict(
+    header_name: str,
+    existing_source: str,
+    source_name: str,
+    existing_value: str,
+    new_value: str,
+):
+    conflict_signature = (
+        header_name.casefold(),
+        existing_source,
+        source_name,
+        existing_value,
+        new_value,
+    )
+    if conflict_signature in NM3U8DL_METADATA_CONFLICTS_SEEN:
+        return
+
+    if new_value == "<blank>":
+        log(
+            "Playlist metadata conflict : "
+            f"{header_name} is blank in {source_name}; "
+            f"keeping {existing_source}",
+            level="WARN",
+        )
+    else:
+        log(
+            "Playlist metadata conflict : "
+            f"{header_name} differs between "
+            f"{existing_source} and {source_name}; "
+            f"using {source_name}",
+            level="WARN",
+        )
+    NM3U8DL_METADATA_CONFLICTS_SEEN.add(conflict_signature)
+
 
 def merge_nm3u8dl_playlist_headers(
     extvlc_headers: dict,
     exthttp_headers: dict,
     pipe_headers: dict,
 ) -> dict:
-
-    headers = {}
-    header_sources = {}
-
-    def apply_headers(
-        source_name: str,
-        source_headers: dict,
-    ):
-        for name, value in source_headers.items():
-            header_name = (
-                canonicalize_nm3u8dl_header_name(name)
-            )
-
-            header_key = header_name.lower()
-            value = str(value).strip()
-
-            existing_name = None
-
-            for current_name in headers:
-                if current_name.lower() == header_key:
-                    existing_name = current_name
-                    break
-
-            if existing_name is not None:
-                existing_value = headers[existing_name]
-                existing_source = header_sources[
-                    header_key
-                ]
-
-                if not value and str(existing_value).strip():
-                    # A blank higher-precedence value is missing information,
-                    # not an instruction to erase a useful header already found
-                    # on this same playlist entry.
-                    conflict_signature = (
-                        header_key,
-                        existing_source,
-                        source_name,
-                        existing_value,
-                        "<blank>",
-                    )
-
-                    if (
-                        conflict_signature
-                        not in NM3U8DL_METADATA_CONFLICTS_SEEN
-                    ):
-                        log(
-                            "Playlist metadata conflict : "
-                            f"{header_name} is blank in {source_name}; "
-                            f"keeping {existing_source}",
-                            level="WARN",
-                        )
-
-                        NM3U8DL_METADATA_CONFLICTS_SEEN.add(
-                            conflict_signature
-                        )
-
-                    continue
-
-                if existing_value != value:
-                    conflict_signature = (
-                        header_key,
-                        existing_source,
-                        source_name,
-                        existing_value,
-                        value,
-                    )
-
-                    if (
-                        conflict_signature
-                        not in NM3U8DL_METADATA_CONFLICTS_SEEN
-                    ):
-                        log(
-                            "Playlist metadata conflict : "
-                            f"{header_name} differs between "
-                            f"{existing_source} and {source_name}; "
-                            f"using {source_name}",
-                            level="WARN",
-                        )
-
-                        NM3U8DL_METADATA_CONFLICTS_SEEN.add(
-                            conflict_signature
-                        )
-
-                del headers[existing_name]
-
-            headers[header_name] = value
-            header_sources[header_key] = source_name
-
-    # Lowest → highest precedence.
-    apply_headers(
-        "#EXTVLCOPT",
-        extvlc_headers,
+    return source_playlist_headers.merge_header_layers(
+        ("#EXTVLCOPT", extvlc_headers),
+        ("#EXTHTTP", exthttp_headers),
+        ("URL pipe metadata", pipe_headers),
+        policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
+        conflict_callback=_log_nm3u8dl_playlist_header_conflict,
     )
-
-    apply_headers(
-        "#EXTHTTP",
-        exthttp_headers,
-    )
-
-    apply_headers(
-        "URL pipe metadata",
-        pipe_headers,
-    )
-
-    return headers
 
 
 def normalize_nm3u8dl_playlist_entry(
     entry: dict
 ) -> dict:
-
-    clean_stream_url, pipe_headers = (
-        split_nm3u8dl_stream_url_metadata(
-            entry["stream_url"]
-        )
+    clean_stream_url, headers = source_playlist_headers.parse_stream_url_and_headers(
+        entry["stream_url"],
+        entry["option_lines"],
+        policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
+        conflict_callback=_log_nm3u8dl_playlist_header_conflict,
     )
-
-    extvlc_headers, exthttp_headers = (
-        get_nm3u8dl_playlist_header_sources(
-            entry["option_lines"]
-        )
-    )
-
-    headers = merge_nm3u8dl_playlist_headers(
-        extvlc_headers=extvlc_headers,
-        exthttp_headers=exthttp_headers,
-        pipe_headers=pipe_headers,
-    )
-
     return {
         "extinf": entry["extinf"],
         "option_lines": entry["option_lines"],
