@@ -424,6 +424,109 @@ https://example.test/rejected.m3u8
         )
         self.assertEqual(RECORDER.get_nm3u8dl_stream_fingerprint({}), "")
 
+    def test_rotating_redirector_is_quarantined_after_two_failed_sessions(self):
+        state = RECORDER.RecorderState()
+        exposed_url = "https://wrapper.test/live/channel.m3u8"
+        headers = {"Referer": "https://wrapper.test/"}
+
+        def source(final_url):
+            return {
+                "stream_url": exposed_url,
+                "manifest_final_url": final_url,
+                "manifest_reachable": True,
+                "headers": dict(headers),
+                "effective_headers": dict(headers),
+                "stream_type": "HLS",
+            }
+
+        first = source("https://edge.test/session-a/master.m3u8")
+        RECORDER._nm3u8dl_set_running_stream_identity(state, first)
+        self.assertEqual(
+            RECORDER._nm3u8dl_handle_playlist_stream_failure(
+                state,
+                "NO_FILE_APPEAR",
+            ),
+            "retry",
+        )
+        self.assertEqual(
+            RECORDER._nm3u8dl_handle_playlist_stream_failure(
+                state,
+                "NO_FILE_APPEAR",
+            ),
+            "rescan",
+        )
+        self.assertFalse(state.nm3u8dl_bad_stream_routes)
+
+        second = source("https://edge.test/session-b/master.m3u8")
+        RECORDER._nm3u8dl_set_running_stream_identity(state, second)
+        RECORDER._nm3u8dl_handle_playlist_stream_failure(
+            state,
+            "NO_FILE_APPEAR",
+        )
+        RECORDER._nm3u8dl_handle_playlist_stream_failure(
+            state,
+            "NO_FILE_APPEAR",
+        )
+
+        route_key = RECORDER.get_nm3u8dl_stream_route_fingerprint(second)
+        self.assertIn(route_key, state.nm3u8dl_bad_stream_routes)
+
+        third = source("https://edge.test/session-c/master.m3u8")
+        RECORDER._nm3u8dl_mark_bad_fingerprint_candidates(state, [third])
+        self.assertTrue(third["failover_excluded"])
+        self.assertIn(
+            "redirecting source repeatedly failed",
+            third["failover_exclusion_reason"],
+        )
+        self.assertNotIn(
+            RECORDER.get_nm3u8dl_stream_fingerprint(third),
+            state.nm3u8dl_bad_stream_fingerprints,
+        )
+
+        unrelated = {
+            **source("https://edge.test/session-d/master.m3u8"),
+            "stream_url": "https://other-wrapper.test/live/channel.m3u8",
+        }
+        RECORDER._nm3u8dl_mark_bad_fingerprint_candidates(
+            state,
+            [unrelated],
+        )
+        self.assertFalse(unrelated.get("failover_excluded", False))
+
+    def test_launch_uses_validated_final_manifest_url(self):
+        source = {
+            "stream_url": "https://wrapper.test/channel.m3u8",
+            "manifest_final_url": "https://edge.test/session/master.m3u8",
+            "manifest_reachable": True,
+        }
+        self.assertEqual(
+            RECORDER.get_nm3u8dl_launch_stream_url(source),
+            "https://edge.test/session/master.m3u8",
+        )
+        source["manifest_reachable"] = False
+        self.assertEqual(
+            RECORDER.get_nm3u8dl_launch_stream_url(source),
+            "https://wrapper.test/channel.m3u8",
+        )
+
+    def test_external_probe_text_decode_replaces_invalid_bytes(self):
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(RECORDER.subprocess, "run", side_effect=fake_run):
+            RECORDER._run_nm3u8dl_external_capture_redacted(
+                ["ffprobe", "-version"],
+                raw_tool="ffprobe",
+                raw_context="decode test",
+                timeout=1,
+            )
+
+        self.assertTrue(captured["text"])
+        self.assertEqual(captured["errors"], "replace")
+
     def test_mature_and_shared_effective_headers_are_identical(self):
         cases = (
             ("HOTSTAR_EVENTS", "HOTSTAR"),

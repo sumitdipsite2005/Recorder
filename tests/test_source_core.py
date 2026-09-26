@@ -1302,6 +1302,46 @@ seg.ts
             is_vpn_route_suspected_403(provider="SONYLIV")
         )
 
+    def test_shared_manifest_fetch_uses_bounded_read_not_short_read1(self):
+        class Response:
+            def __init__(self):
+                self.read_calls = 0
+                self.read1_calls = 0
+                self.parts = [
+                    b'<?xml version="1.0"?><MPD type="static"></MPD>',
+                    b"",
+                ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read1(self, size=-1):
+                self.read1_calls += 1
+                return b'<?xml version="1.0"?>'
+
+            def read(self, size=-1):
+                self.read_calls += 1
+                return self.parts.pop(0)
+
+            def geturl(self):
+                return "https://cdn.test/live.mpd"
+
+        response = Response()
+        text_value, final_url = source_transport.fetch_stream_manifest_text(
+            "https://wrapper.test/live.mpd",
+            {},
+            default_user_agent="RecorderTest",
+            urlopen_fn=lambda request, timeout: response,
+        )
+
+        self.assertIn("<MPD", text_value)
+        self.assertEqual(final_url, "https://cdn.test/live.mpd")
+        self.assertEqual(response.read1_calls, 0)
+        self.assertGreaterEqual(response.read_calls, 2)
+
     def test_shared_header_canonicalization_matches_mature_alias_rules(self):
         self.assertEqual(canonicalize_header_name("user_agent"), "User-Agent")
         self.assertEqual(canonicalize_header_name("referrer"), "Referer")

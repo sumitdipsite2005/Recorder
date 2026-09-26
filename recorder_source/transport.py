@@ -296,7 +296,11 @@ def fetch_stream_manifest_text(
     def fetch_once():
         request = Request(stream_url, headers=request_headers)
         with urlopen_fn(request, timeout=QUALITY_HTTP_TIMEOUT_SEC) as response:
-            read_chunk = getattr(response, "read1", response.read)
+            # read1() may return only an arbitrarily short buffered prefix (for
+            # example the XML declaration of a valid DASH MPD). The mature
+            # recorder deliberately uses bounded read() here so manifest
+            # classification sees up to the requested 64 KiB unless EOF.
+            read_chunk = response.read
             if stop_requested is not None and stop_requested():
                 raise RuntimeError("Quality probe cancelled by stop request")
             first_bytes = read_chunk(64 * 1024)

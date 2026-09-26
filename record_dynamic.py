@@ -591,6 +591,10 @@ class RecorderState:
     nm3u8dl_failover_probations: dict = field(default_factory=dict)
     nm3u8dl_failover_retry_source: Optional[dict] = None
     nm3u8dl_bad_stream_fingerprints: dict = field(default_factory=dict)
+    # Second-level protection for redirectors that evade exact-fingerprint
+    # exclusion by returning a different final playback URL every fresh scan.
+    # The key is the original exposed request URL + playback-relevant headers.
+    nm3u8dl_bad_stream_routes: dict = field(default_factory=dict)
     # Operator rejections are intentionally separate from automatic failover.
     # They last only for this RecorderState/recording and must survive VPN/access
     # resets that are allowed to forgive route-dependent automatic failures.
@@ -1868,8 +1872,17 @@ def raw_external_end(invocation, returncode=None, status: str = ""):
     )
 
 
+def _safe_subprocess_text_kwargs(kwargs: dict) -> dict:
+    """Prevent undecodable external-tool bytes from killing reader threads."""
+    safe = dict(kwargs)
+    if safe.get("text") or safe.get("universal_newlines"):
+        safe.setdefault("errors", "replace")
+    return safe
+
+
 def run_external_capture(cmd, *, raw_tool: str, raw_context: str = "", **kwargs):
     """subprocess.run wrapper that adds raw diagnostics without changing live output."""
+    kwargs = _safe_subprocess_text_kwargs(kwargs)
     invocation = raw_external_start(raw_tool, raw_context)
     raw_external_write(invocation, repr(cmd), "command")
     raw_external_write(
@@ -1902,6 +1915,7 @@ def run_external_capture(cmd, *, raw_tool: str, raw_context: str = "", **kwargs)
 
 def check_output_external(cmd, *, raw_tool: str, raw_context: str = "", **kwargs):
     """subprocess.check_output wrapper; preserves its existing stdout semantics."""
+    kwargs = _safe_subprocess_text_kwargs(kwargs)
     invocation = raw_external_start(raw_tool, raw_context)
     raw_external_write(invocation, repr(cmd), "command")
     raw_external_write(
@@ -6289,6 +6303,49 @@ def get_nm3u8dl_stream_fingerprint(candidate: Optional[dict]) -> str:
     )
 
 
+def get_nm3u8dl_stream_route_fingerprint(candidate: Optional[dict]) -> str:
+    """Identify one exposed playback request before redirects."""
+    if not candidate:
+        return ""
+
+    stream_url = str(candidate.get("stream_url") or "").strip()
+    if not stream_url:
+        return ""
+
+    effective_headers = dict(candidate.get("effective_headers") or {})
+    if not effective_headers:
+        try:
+            effective_headers = get_nm3u8dl_effective_headers(
+                candidate.get("headers") or {},
+                emit_logs=False,
+            )
+        except Exception:
+            effective_headers = dict(candidate.get("headers") or {})
+
+    return source_playback.playback_fingerprint(
+        stream_url,
+        effective_headers,
+    )
+
+
+def get_nm3u8dl_launch_stream_url(candidate: Optional[dict]) -> str:
+    """Launch the same validated manifest endpoint that quality probing used."""
+    if not candidate:
+        return ""
+
+    stream_url = str(candidate.get("stream_url") or "").strip()
+    final_url = str(candidate.get("manifest_final_url") or "").strip()
+
+    if (
+        final_url
+        and bool(candidate.get("manifest_reachable", False))
+        and _get_nm3u8dl_stream_type_from_url(final_url) in ("HLS", "DASH")
+    ):
+        return final_url
+
+    return stream_url
+
+
 def get_nm3u8dl_manual_feed_signature(candidate: Optional[dict]) -> Optional[dict]:
     """Return the recording-local manual feed identity, or None if incomplete."""
     if not candidate:
@@ -6376,6 +6433,11 @@ def _nm3u8dl_mark_bad_fingerprint_candidates(
         if state is not None
         else {}
     ) or {}
+    bad_routes = (
+        getattr(state, "nm3u8dl_bad_stream_routes", {})
+        if state is not None
+        else {}
+    ) or {}
     manual_excluded_signatures = (
         getattr(state, "nm3u8dl_manual_excluded_feed_signatures", {})
         if state is not None
@@ -6386,10 +6448,15 @@ def _nm3u8dl_mark_bad_fingerprint_candidates(
         candidate.pop("failover_excluded", None)
         candidate.pop("failover_exclusion_reason", None)
         candidate.pop("stream_fingerprint", None)
+        candidate.pop("stream_route_fingerprint", None)
 
         fingerprint = get_nm3u8dl_stream_fingerprint(candidate)
         if fingerprint:
             candidate["stream_fingerprint"] = fingerprint
+
+        route_fingerprint = get_nm3u8dl_stream_route_fingerprint(candidate)
+        if route_fingerprint:
+            candidate["stream_route_fingerprint"] = route_fingerprint
 
         manual_signature = get_nm3u8dl_manual_feed_signature(candidate)
         manual_signature_key = (
@@ -6402,6 +6469,11 @@ def _nm3u8dl_mark_bad_fingerprint_candidates(
             candidate["failover_excluded"] = True
             candidate["failover_exclusion_reason"] = (
                 "manually rejected feed signature during this recording"
+            )
+        elif route_fingerprint and route_fingerprint in bad_routes:
+            candidate["failover_excluded"] = True
+            candidate["failover_exclusion_reason"] = (
+                "redirecting source repeatedly failed across changing playback sessions"
             )
         elif fingerprint and fingerprint in bad_fingerprints:
             candidate["failover_excluded"] = True
@@ -6612,6 +6684,7 @@ def _nm3u8dl_handle_playlist_stream_failure(
         return "rescan"
 
     probations = state.nm3u8dl_failover_probations
+    route_fingerprint = get_nm3u8dl_stream_route_fingerprint(source)
 
     if fingerprint in probations:
         first_failure = str(
@@ -6622,7 +6695,37 @@ def _nm3u8dl_handle_playlist_stream_failure(
             "marked_ts": time.time(),
             "first_failure": first_failure,
             "second_failure": str(failure_type),
+            "route_fingerprint": route_fingerprint,
+            "stream_url": str(source.get("stream_url") or "").strip(),
+            "manifest_final_url": str(
+                source.get("manifest_final_url") or ""
+            ).strip(),
         }
+
+        route_quarantined_now = False
+        if route_fingerprint:
+            failed_route_fingerprints = {
+                bad_fingerprint
+                for bad_fingerprint, metadata
+                in state.nm3u8dl_bad_stream_fingerprints.items()
+                if str(
+                    (metadata or {}).get("route_fingerprint") or ""
+                ).strip() == route_fingerprint
+            }
+            if (
+                len(failed_route_fingerprints) >= 2
+                and route_fingerprint not in state.nm3u8dl_bad_stream_routes
+            ):
+                state.nm3u8dl_bad_stream_routes[route_fingerprint] = {
+                    "marked_ts": time.time(),
+                    "stream_url": str(source.get("stream_url") or "").strip(),
+                    "failed_fingerprints": tuple(
+                        sorted(failed_route_fingerprints)
+                    ),
+                    "reason": "rotating_redirect_failures",
+                }
+                route_quarantined_now = True
+
         probations.pop(fingerprint, None)
         state.nm3u8dl_failover_retry_source = None
         state.nm3u8dl_failover_waiting_for_alternative = True
@@ -6639,6 +6742,13 @@ def _nm3u8dl_handle_playlist_stream_failure(
             "stream marked EXCLUDED; full playlist rescan required.",
             level="WARN",
         )
+        if route_quarantined_now:
+            log(
+                "STREAM_FAILOVER redirector quarantine → original source "
+                "produced 2 distinct playback fingerprints that each failed 2/2; "
+                "this exposed source route is excluded for the rest of the recording.",
+                level="WARN",
+            )
         return "rescan"
 
     probations[fingerprint] = {
@@ -7223,6 +7333,7 @@ def _run_nm3u8dl_external_capture_redacted(
             command,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -9552,6 +9663,11 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
         "nm3u8dl_bad_stream_fingerprints",
         {},
     ) or {}
+    bad_routes = getattr(
+        state,
+        "nm3u8dl_bad_stream_routes",
+        {},
+    ) or {}
     probations = getattr(
         state,
         "nm3u8dl_failover_probations",
@@ -9559,12 +9675,14 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
     ) or {}
 
     excluded_count = len(bad_fingerprints)
+    route_count = len(bad_routes)
     probation_count = len(probations)
 
-    if excluded_count <= 0 and probation_count <= 0:
+    if excluded_count <= 0 and route_count <= 0 and probation_count <= 0:
         return False
 
     bad_fingerprints.clear()
+    bad_routes.clear()
     probations.clear()
     state.nm3u8dl_failover_retry_source = None
     state.nm3u8dl_failover_waiting_for_alternative = False
@@ -9580,7 +9698,8 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
 
     log(
         "Access/VPN environment change confirmed → stream-failover state reset; "
-        f"{excluded_count} excluded fingerprint(s) and "
+        f"{excluded_count} excluded fingerprint(s), "
+        f"{route_count} redirector quarantine(s), and "
         f"{probation_count} one-failure probation(s) cleared. "
         "Previously excluded streams are eligible for fresh evaluation.",
         level="WARN",
@@ -9609,6 +9728,7 @@ def _nm3u8dl_confirm_access_change_and_reset_failover(
         and previous_snapshot
         and (
             getattr(state, "nm3u8dl_bad_stream_fingerprints", {})
+            or getattr(state, "nm3u8dl_bad_stream_routes", {})
             or getattr(state, "nm3u8dl_failover_probations", {})
         )
     ):
@@ -10214,9 +10334,18 @@ def log_nm3u8dl_playlist_scan_results(
     ]
     if excluded_rows:
         excluded_fingerprints = {
-            str(candidate_row.get("stream_fingerprint") or "").strip()
+            (
+                "route:"
+                + str(candidate_row.get("stream_route_fingerprint") or "").strip()
+                if str(candidate_row.get("stream_route_fingerprint") or "").strip()
+                else "stream:"
+                + str(candidate_row.get("stream_fingerprint") or "").strip()
+            )
             for candidate_row in excluded_rows
-            if str(candidate_row.get("stream_fingerprint") or "").strip()
+            if (
+                str(candidate_row.get("stream_route_fingerprint") or "").strip()
+                or str(candidate_row.get("stream_fingerprint") or "").strip()
+            )
         }
         excluded_unique = len(excluded_fingerprints)
         excluded_entries = len(excluded_rows)
@@ -12034,15 +12163,32 @@ def resolve_nm3u8dl_playlist_source(
         state is not None
         and getattr(state, "nm3u8dl_bad_stream_fingerprints", {})
     )
-    probe_candidates = [
-        candidate
-        for candidate in candidates
+    quarantined_routes = (
+        getattr(state, "nm3u8dl_bad_stream_routes", {})
+        if state is not None
+        else {}
+    ) or {}
+
+    probe_candidates = []
+    for candidate in candidates:
+        route_fingerprint = get_nm3u8dl_stream_route_fingerprint(candidate)
+        if (
+            route_fingerprint
+            and route_fingerprint in quarantined_routes
+        ):
+            candidate["stream_route_fingerprint"] = route_fingerprint
+            candidate["failover_excluded"] = True
+            candidate["failover_exclusion_reason"] = (
+                "redirecting source repeatedly failed across changing playback sessions"
+            )
+            continue
+
         if (
             failover_fingerprint_check_active
             or candidate.get("expiry") is None
             or candidate["expiry"] > selection_now
-        )
-    ]
+        ):
+            probe_candidates.append(candidate)
 
     if show_progress:
         finish_dynamic_playlist_progress(
@@ -12078,7 +12224,7 @@ def resolve_nm3u8dl_playlist_source(
 
     _nm3u8dl_mark_bad_fingerprint_candidates(
         state,
-        probe_candidates,
+        candidates,
     )
 
     authorization_candidates = [
@@ -13697,9 +13843,13 @@ def get_nm3u8dl_part_a(
         headers,
     )
 
+    launch_stream_url = get_nm3u8dl_launch_stream_url(source)
+    if not launch_stream_url:
+        raise RuntimeError("Selected source has no launchable stream URL")
+
     parts = [
         "N_m3u8DL-RE",
-        f'"{source["stream_url"]}"',
+        f'"{launch_stream_url}"',
     ]
 
     for name, value in headers.items():
@@ -16319,6 +16469,7 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                errors="replace",
                 bufsize=1,
                 cwd=CHUNKS_DIR,
                 env=popen_env
