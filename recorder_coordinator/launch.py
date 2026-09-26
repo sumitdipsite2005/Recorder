@@ -20,6 +20,7 @@ from .models import DashboardSnapshot, IdentityTarget, POLICY_MANUAL
 class ManualLaunchPlan:
     identity: CanonicalFeedIdentity
     selected_candidate: SourceCandidate
+    candidate_pool: Tuple[SourceCandidate, ...]
     selected_source_group: str
     target_intents: Tuple[FrozenTargetIntent, ...]
     recording_duration_min: Optional[float]
@@ -165,6 +166,7 @@ def build_manual_launch_plan(
     return ManualLaunchPlan(
         identity=block.identity,
         selected_candidate=selected_candidate,
+        candidate_pool=tuple(block.candidates),
         selected_source_group=source_group,
         target_intents=tuple(_target_intent(target) for target in targets_tuple),
         recording_duration_min=_combined_duration(targets_tuple),
