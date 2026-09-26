@@ -600,6 +600,11 @@ class RecorderState:
     # exclusion by returning a different final playback URL every fresh scan.
     # The key is the original exposed request URL + playback-relevant headers.
     nm3u8dl_bad_stream_routes: dict = field(default_factory=dict)
+    # Literal-IP playback endpoints are excluded recording-wide after one exact
+    # session has used both normal downloader attempts and failed 2/2. Every
+    # playlist entry that resolves to the same IP is then excluded together,
+    # regardless of wrapper URL, token, or playlist source.
+    nm3u8dl_bad_stream_ips: dict = field(default_factory=dict)
     # Operator rejections are intentionally separate from automatic failover.
     # They last only for this RecorderState/recording and must survive VPN/access
     # resets that are allowed to forgive route-dependent automatic failures.
@@ -6453,6 +6458,11 @@ def _nm3u8dl_mark_bad_fingerprint_candidates(
         if state is not None
         else {}
     ) or {}
+    bad_literal_ips = (
+        getattr(state, "nm3u8dl_bad_stream_ips", {})
+        if state is not None
+        else {}
+    ) or {}
     manual_excluded_signatures = (
         getattr(state, "nm3u8dl_manual_excluded_feed_signatures", {})
         if state is not None
@@ -6480,10 +6490,18 @@ def _nm3u8dl_mark_bad_fingerprint_candidates(
             else ""
         )
 
+        candidate_literal_ip = _get_nm3u8dl_candidate_literal_ip(candidate)
+
         if manual_signature_key and manual_signature_key in manual_excluded_signatures:
             candidate["failover_excluded"] = True
             candidate["failover_exclusion_reason"] = (
                 "manually rejected feed signature during this recording"
+            )
+        elif candidate_literal_ip and candidate_literal_ip in bad_literal_ips:
+            candidate["failover_excluded"] = True
+            candidate["failover_exclusion_reason"] = (
+                f"literal IP {candidate_literal_ip} failed 2 consecutive downloader "
+                "attempts during this recording"
             )
         elif route_fingerprint and route_fingerprint in bad_routes:
             candidate["failover_excluded"] = True
@@ -6717,8 +6735,22 @@ def _nm3u8dl_handle_playlist_stream_failure(
             ).strip(),
         }
 
+        literal_ip_quarantined_now = False
+        literal_ip = _get_nm3u8dl_candidate_literal_ip(source)
+        if literal_ip and literal_ip not in state.nm3u8dl_bad_stream_ips:
+            state.nm3u8dl_bad_stream_ips[literal_ip] = {
+                "marked_ts": time.time(),
+                "stream_url": str(source.get("stream_url") or "").strip(),
+                "manifest_final_url": str(
+                    source.get("manifest_final_url") or ""
+                ).strip(),
+                "failed_fingerprint": fingerprint,
+                "reason": "literal_ip_failed_2_of_2",
+            }
+            literal_ip_quarantined_now = True
+
         route_quarantined_now = False
-        if route_fingerprint:
+        if route_fingerprint and not literal_ip:
             failed_route_fingerprints = {
                 bad_fingerprint
                 for bad_fingerprint, metadata
@@ -6757,6 +6789,13 @@ def _nm3u8dl_handle_playlist_stream_failure(
             "stream marked EXCLUDED; full playlist rescan required.",
             level="WARN",
         )
+        if literal_ip_quarantined_now:
+            log(
+                f"STREAM_FAILOVER literal-IP quarantine → {literal_ip} failed 2/2; "
+                "all playlist candidates resolving to this IP are excluded for "
+                "the rest of the recording.",
+                level="WARN",
+            )
         if route_quarantined_now:
             log(
                 "STREAM_FAILOVER redirector quarantine → original source "
@@ -7987,22 +8026,41 @@ def _detect_nm3u8dl_dash_selected_representation_scan_type(
             scan_type_cache["results"][cache_key] = result
         return result
 
-def _nm3u8dl_url_has_literal_ip_host(stream_url: str) -> bool:
-    """Return True when the URL host itself is an IPv4/IPv6 literal."""
+def _nm3u8dl_literal_ip_host(stream_url: str) -> str:
+    """Return a normalized literal IPv4/IPv6 host, or an empty string."""
     try:
         hostname = urlparse(str(stream_url or "")).hostname
     except ValueError:
-        return False
+        return ""
 
     if not hostname:
-        return False
+        return ""
 
     try:
-        ipaddress.ip_address(hostname)
+        return str(ipaddress.ip_address(hostname))
     except ValueError:
-        return False
+        return ""
 
-    return True
+
+def _nm3u8dl_url_has_literal_ip_host(stream_url: str) -> bool:
+    return bool(_nm3u8dl_literal_ip_host(stream_url))
+
+
+def _get_nm3u8dl_candidate_literal_ip(candidate: Optional[dict]) -> str:
+    """Return the literal IP used by the candidate's effective playback route."""
+    if not candidate:
+        return ""
+
+    for field_name in (
+        "selected_media_final_url",
+        "manifest_final_url",
+        "stream_url",
+    ):
+        literal_ip = _nm3u8dl_literal_ip_host(candidate.get(field_name) or "")
+        if literal_ip:
+            return literal_ip
+
+    return ""
 
 
 def _detect_nm3u8dl_stream_scan_type_with_idet(
@@ -8178,6 +8236,7 @@ def _probe_nm3u8dl_candidate_quality(
     stop_requested: Optional[Callable[[], bool]] = None,
     scan_type_cache: Optional[dict] = None,
     timeout_playlist_urls: Optional[List[str]] = None,
+    excluded_literal_ips: Optional[set] = None,
 ) -> dict:
     probe_started = time.monotonic()
 
@@ -8244,6 +8303,11 @@ def _probe_nm3u8dl_candidate_quality(
     }
 
     errors = []
+    excluded_literal_ips = {
+        str(value or "").strip()
+        for value in (excluded_literal_ips or set())
+        if str(value or "").strip()
+    }
 
     try:
         effective_headers = get_nm3u8dl_effective_headers(
@@ -8260,6 +8324,20 @@ def _probe_nm3u8dl_candidate_quality(
         errors.append(
             quality["header_preparation_failure"]
         )
+
+    direct_literal_ip = _nm3u8dl_literal_ip_host(candidate.get("stream_url") or "")
+    if direct_literal_ip and direct_literal_ip in excluded_literal_ips:
+        quality["manifest_final_url"] = str(candidate.get("stream_url") or "").strip()
+        quality["failover_excluded"] = True
+        quality["failover_exclusion_reason"] = (
+            f"literal IP {direct_literal_ip} failed 2 consecutive downloader attempts "
+            "during this recording"
+        )
+        quality["probe_duration_sec"] = round(
+            time.monotonic() - probe_started,
+            6,
+        )
+        return quality
 
     manifest_quality = None
 
@@ -8280,6 +8358,20 @@ def _probe_nm3u8dl_candidate_quality(
         )
         if final_manifest_type:
             quality["stream_type"] = final_manifest_type
+
+        final_literal_ip = _nm3u8dl_literal_ip_host(final_manifest_url)
+        if final_literal_ip and final_literal_ip in excluded_literal_ips:
+            quality["manifest_reachable"] = True
+            quality["failover_excluded"] = True
+            quality["failover_exclusion_reason"] = (
+                f"literal IP {final_literal_ip} failed 2 consecutive downloader attempts "
+                "during this recording"
+            )
+            quality["probe_duration_sec"] = round(
+                time.monotonic() - probe_started,
+                6,
+            )
+            return quality
 
         redirected_expiry = get_nm3u8dl_auth_expiry(
             final_manifest_url
@@ -8725,6 +8817,7 @@ def enrich_nm3u8dl_candidate_qualities(
     *,
     stop_requested: Optional[Callable[[], bool]] = None,
     show_progress: bool = True,
+    excluded_literal_ips: Optional[set] = None,
 ) -> bool:
     if not candidates:
         return True
@@ -8765,6 +8858,7 @@ def enrich_nm3u8dl_candidate_qualities(
                 for candidate in grouped_candidates
                 if str(candidate.get("playlist_url") or "").strip()
             ],
+            excluded_literal_ips=excluded_literal_ips,
         )
 
     def failure_result(representative_candidate: dict, error: BaseException) -> dict:
@@ -9748,6 +9842,11 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
         "nm3u8dl_bad_stream_routes",
         {},
     ) or {}
+    bad_literal_ips = getattr(
+        state,
+        "nm3u8dl_bad_stream_ips",
+        {},
+    ) or {}
     probations = getattr(
         state,
         "nm3u8dl_failover_probations",
@@ -9756,13 +9855,20 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
 
     excluded_count = len(bad_fingerprints)
     route_count = len(bad_routes)
+    literal_ip_count = len(bad_literal_ips)
     probation_count = len(probations)
 
-    if excluded_count <= 0 and route_count <= 0 and probation_count <= 0:
+    if (
+        excluded_count <= 0
+        and route_count <= 0
+        and literal_ip_count <= 0
+        and probation_count <= 0
+    ):
         return False
 
     bad_fingerprints.clear()
     bad_routes.clear()
+    bad_literal_ips.clear()
     probations.clear()
     state.nm3u8dl_failover_retry_source = None
     state.nm3u8dl_failover_waiting_for_alternative = False
@@ -9779,7 +9885,8 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
     log(
         "Access/VPN environment change confirmed → stream-failover state reset; "
         f"{excluded_count} excluded fingerprint(s), "
-        f"{route_count} redirector quarantine(s), and "
+        f"{route_count} redirector quarantine(s), "
+        f"{literal_ip_count} literal-IP quarantine(s), and "
         f"{probation_count} one-failure probation(s) cleared. "
         "Previously excluded streams are eligible for fresh evaluation.",
         level="WARN",
@@ -9809,6 +9916,7 @@ def _nm3u8dl_confirm_access_change_and_reset_failover(
         and (
             getattr(state, "nm3u8dl_bad_stream_fingerprints", {})
             or getattr(state, "nm3u8dl_bad_stream_routes", {})
+            or getattr(state, "nm3u8dl_bad_stream_ips", {})
             or getattr(state, "nm3u8dl_failover_probations", {})
         )
     ):
@@ -12255,7 +12363,10 @@ def resolve_nm3u8dl_playlist_source(
     # bad stream or has become a new eligible fingerprint.
     failover_fingerprint_check_active = bool(
         state is not None
-        and getattr(state, "nm3u8dl_bad_stream_fingerprints", {})
+        and (
+            getattr(state, "nm3u8dl_bad_stream_fingerprints", {})
+            or getattr(state, "nm3u8dl_bad_stream_ips", {})
+        )
     )
     quarantined_routes = (
         getattr(state, "nm3u8dl_bad_stream_routes", {})
@@ -12295,6 +12406,13 @@ def resolve_nm3u8dl_playlist_source(
         probe_candidates,
         stop_requested=scan_stop_requested,
         show_progress=show_progress,
+        excluded_literal_ips=set(
+            (
+                getattr(state, "nm3u8dl_bad_stream_ips", {})
+                if state is not None
+                else {}
+            ) or {}
+        ),
     )
 
     if not candidate_scan_completed:
