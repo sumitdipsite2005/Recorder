@@ -1027,6 +1027,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         muted="\033[38;2;118;118;118m"
         reset="\033[0m"
         self.assertIn(f"{muted}[S1]{reset}",rendered)
+        self.assertIn("\033[1;93mexpires unknown\033[0m",rendered)
         self.assertNotIn(f"{muted}src1{reset}",rendered)
         self.assertIn(
             f"{muted}  [S1] https://src1.test/list.m3u{reset}",
@@ -1106,6 +1107,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
             selected=True,
             status="SELECTED",
         )
+        selected_row["stream_url"] = "https://rotated-token.test/master.m3u8"
         lower_row=runtime_candidate(
             lower,
             reason="not selected: lower quality",
