@@ -7942,6 +7942,11 @@ def _detect_nm3u8dl_dash_selected_representation_scan_type(
                     sample_headers,
                     scan_type_cache=None,
                     timeout_route=timeout_route,
+                    effective_stream_url=str(
+                        quality.get("manifest_final_url")
+                        or candidate.get("manifest_final_url")
+                        or ""
+                    ).strip(),
                     decryption_key=key_value,
                 )
                 if idet_scan_type:
@@ -8007,13 +8012,19 @@ def _detect_nm3u8dl_stream_scan_type_with_idet(
     stream_index: Optional[int] = None,
     scan_type_cache: Optional[dict] = None,
     timeout_route: str = "",
+    effective_stream_url: str = "",
     decryption_key: str = "",
 ) -> str:
     """Final P/I fallback using decoded frames from the targeted input."""
-    # Literal-IP stream endpoints have repeatedly consumed the full 90-second
-    # IDet budget without useful evidence. Keep the short bitrate sample, but
-    # leave scan type unknown rather than paying the IDet timeout on these routes.
-    if _nm3u8dl_url_has_literal_ip_host(stream_url):
+    # The FFmpeg input can be a hostname wrapper that redirects to a literal-IP
+    # endpoint. Check both the command input and the already-known effective
+    # manifest/media URL; checking only stream_url misses exactly that case.
+    # Keep the short bitrate/FFprobe work, but never pay the 90-second IDet
+    # timeout once the effective playback route is known to be a literal IP.
+    if (
+        _nm3u8dl_url_has_literal_ip_host(stream_url)
+        or _nm3u8dl_url_has_literal_ip_host(effective_stream_url)
+    ):
         return ""
 
     command = [
@@ -8639,6 +8650,11 @@ def _probe_nm3u8dl_candidate_quality(
                 effective_headers,
                 scan_type_cache=scan_type_cache,
                 timeout_route=probe_timeout_route,
+                effective_stream_url=str(
+                    quality.get("selected_media_final_url")
+                    or quality.get("manifest_final_url")
+                    or ""
+                ).strip(),
                 decryption_key=idet_key,
             )
             if idet_scan_type:
