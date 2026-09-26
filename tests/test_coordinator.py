@@ -1143,6 +1143,24 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("\033[38;2;41;159;214mHockey\033[0m",rendered)
         self.assertIn("\033[38;2;255;215;0m[NEW]\033[0m",rendered)
 
+    def test_launching_and_recording_share_user_facing_state_color(self):
+        launching=coordinator_terminal._runtime_state_text(
+            "LAUNCHING",
+            True,
+            bracketed=True,
+        )
+        recording=coordinator_terminal._runtime_state_text(
+            "RECORDING",
+            True,
+            bracketed=True,
+        )
+        self.assertEqual(
+            launching.replace("[LAUNCHING]","[STATE]"),
+            recording.replace("[RECORDING]","[STATE]"),
+        )
+        self.assertIn("\033[38;2;255;135;3m[LAUNCHING]\033[0m",launching)
+        self.assertIn("\033[38;2;255;135;3m[RECORDING]\033[0m",recording)
+
     def test_normal_on_is_uncolored_and_off_is_bright_red(self):
         on_rendered=coord.render_dashboard(
             snapshot([sony_candidate()]),
