@@ -153,7 +153,7 @@ def stream_type_from_url(url: str) -> str:
     return ""
 
 
-def _curl_get_text(
+def curl_get_text(
     url: str,
     user_agent: str,
     *,
@@ -224,7 +224,29 @@ def _curl_get_text(
             None,
             None,
         )
-    return body.decode("utf-8-sig", errors="replace"), final_url
+    text = body.decode("utf-8-sig", errors="replace")
+    return text, status, final_url, body
+
+
+def _curl_get_text(
+    url: str,
+    user_agent: str,
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout_sec: float,
+    runner: Callable[..., object] = subprocess.run,
+    timeout_callback: Optional[Callable[[BaseException, float, str], None]] = None,
+):
+    """Compatibility shape for manifest transport: return text and final URL."""
+    text, _status, final_url, _body = curl_get_text(
+        url,
+        user_agent,
+        headers=headers,
+        timeout_sec=timeout_sec,
+        runner=runner,
+        timeout_callback=timeout_callback,
+    )
+    return text, final_url
 
 
 def fetch_stream_manifest_text(

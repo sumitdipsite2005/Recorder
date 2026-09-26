@@ -166,6 +166,54 @@ class ArchitectureGuardTests(unittest.TestCase):
         )
         self.assertNotIn("def _stream_type_from_url(", discovery)
 
+    def test_remaining_probe_primitives_have_shared_owners(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        transport=(ROOT/"recorder_source"/"transport.py").read_text(encoding="utf-8")
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+
+        self.assertIn("def curl_get_text(", transport)
+        curl_start = recorder.index("def _run_nm3u8dl_curl_get_text(")
+        curl_end = recorder.index(
+            "def _run_nm3u8dl_curl_status_request(",
+            curl_start,
+        )
+        mature_curl = recorder[curl_start:curl_end]
+        self.assertIn("source_transport.curl_get_text(", mature_curl)
+        self.assertNotIn("__RECORDER_CURL_HTTP_STATUS__", mature_curl)
+        self.assertNotIn("subprocess.run(", mature_curl)
+
+        frame_start = recorder.index("def _parse_nm3u8dl_frame_rate(")
+        frame_end = recorder.index(
+            "def _normalize_nm3u8dl_video_scan_type(",
+            frame_start,
+        )
+        mature_frame = recorder[frame_start:frame_end]
+        self.assertIn("source_quality.parse_frame_rate(value)", mature_frame)
+        self.assertNotIn('if "/" in text:', mature_frame)
+        self.assertIn("def parse_frame_rate(", quality)
+
+        bitrate_start = recorder.index(
+            "def _sample_nm3u8dl_stream_video_bitrate("
+        )
+        bitrate_end = recorder.index(
+            "def _parse_nm3u8dl_idet_scan_type(",
+            bitrate_start,
+        )
+        mature_bitrate = recorder[bitrate_start:bitrate_end]
+        self.assertIn(
+            "source_quality.sample_stream_video_bitrate(",
+            mature_bitrate,
+        )
+        self.assertNotIn(
+            "source_quality.build_ffmpeg_bitrate_sample_command(",
+            mature_bitrate,
+        )
+        self.assertNotIn(
+            "source_quality.parse_ffmpeg_bitrate_progress(",
+            mature_bitrate,
+        )
+        self.assertIn("def sample_stream_video_bitrate(", quality)
+
     def test_lifecycle_scan_type_policy_has_one_shared_owner(self):
         policy=(ROOT/"recorder_source"/"policy.py").read_text(encoding="utf-8")
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")

@@ -4872,123 +4872,27 @@ def _run_nm3u8dl_curl_get_text(
     headers: Optional[dict] = None,
     timeout_sec: float = 25,
 ) -> tuple:
-    """
-    Fetch one small text resource with real curl and return
-    (text, http_status, final_url, raw_bytes).
-
-    Used only for the DRMLive path whose server behavior has been proven
-    manually with curl but not with Python urllib.
-    """
-    status_marker = b"\n__RECORDER_CURL_HTTP_STATUS__:"
-    final_url_marker = b"\n__RECORDER_CURL_FINAL_URL__:"
-
-    curl_args = [
-        _get_nm3u8dl_curl_binary(),
-        "-sS",
-        "-L",
-        "--compressed",
-        "-A",
-        str(user_agent),
-    ]
-
-    for name, value in (headers or {}).items():
-        header_name = str(name or "").strip()
-
-        if (
-            not header_name
-            or value is None
-            or header_name.casefold() == "user-agent"
-        ):
-            continue
-
-        curl_args.extend([
-            "-H",
-            f"{header_name}: {str(value)}",
-        ])
-
-    curl_args.extend([
-        "-w",
-        (
-            "\n__RECORDER_CURL_HTTP_STATUS__:%{http_code}"
-            "\n__RECORDER_CURL_FINAL_URL__:%{url_effective}"
-        ),
-        str(url),
-    ])
-
-    try:
-        result = subprocess.run(
-            curl_args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=float(timeout_sec),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
+    """Use the shared real-curl text transport with mature timeout logging."""
+    def timeout_callback(
+        error: BaseException,
+        timeout_value: float,
+        source_url: str,
+    ) -> None:
         log_timeout_exception(
             error,
             "curl",
-            timeout_sec,
+            timeout_value,
             context="GET",
-            source=url,
-        )
-        raise
-
-    if result.returncode != 0:
-        stderr_text = result.stderr.decode(
-            "utf-8",
-            errors="replace",
-        ).strip()
-        raise RuntimeError(
-            "curl GET failed"
-            + (f": {stderr_text}" if stderr_text else "")
+            source=source_url,
         )
 
-    body, separator, trailer = result.stdout.rpartition(
-        status_marker
+    return source_transport.curl_get_text(
+        url,
+        user_agent,
+        headers=headers,
+        timeout_sec=timeout_sec,
+        timeout_callback=timeout_callback,
     )
-
-    if not separator:
-        raise RuntimeError(
-            "curl GET returned no HTTP status marker"
-        )
-
-    status_bytes, separator, final_url_bytes = trailer.partition(
-        final_url_marker
-    )
-
-    if not separator:
-        raise RuntimeError(
-            "curl GET returned no final-URL marker"
-        )
-
-    try:
-        http_status = int(status_bytes.strip())
-    except Exception as error:
-        raise RuntimeError(
-            "curl GET returned an invalid HTTP status"
-        ) from error
-
-    final_url = final_url_bytes.decode(
-        "utf-8",
-        errors="replace",
-    ).strip()
-
-    if not (200 <= http_status < 300):
-        raise HTTPError(
-            final_url or str(url),
-            http_status,
-            f"HTTP Error {http_status}",
-            None,
-            None,
-        )
-
-    text = body.decode(
-        "utf-8-sig",
-        errors="replace",
-    )
-
-    return text, http_status, final_url, body
-
 
 def _run_nm3u8dl_curl_status_request(
     args: List[str],
@@ -6760,30 +6664,7 @@ def _nm3u8dl_handle_playlist_stream_failure(
 
 
 def _parse_nm3u8dl_frame_rate(value) -> float:
-    if value is None:
-        return 0.0
-
-    text = str(value).strip()
-
-    if not text:
-        return 0.0
-
-    try:
-        if "/" in text:
-            numerator_text, denominator_text = text.split("/", 1)
-            numerator = float(numerator_text)
-            denominator = float(denominator_text)
-
-            if denominator == 0:
-                return 0.0
-
-            return numerator / denominator
-
-        return float(text)
-
-    except (TypeError, ValueError):
-        return 0.0
-
+    return source_quality.parse_frame_rate(value)
 
 def _normalize_nm3u8dl_video_scan_type(value) -> str:
     return source_selection.normalize_video_scan_type(value)
@@ -7122,16 +7003,7 @@ def _sample_nm3u8dl_stream_video_bitrate(
     decryption_key: str = "",
     stream_index: Optional[int] = None,
 ) -> int:
-    """Estimate video bitrate from a short copied-media sample."""
-    command = source_quality.build_ffmpeg_bitrate_sample_command(
-        stream_url,
-        headers,
-        sample_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC,
-        byte_range=byte_range,
-        decryption_key=decryption_key,
-        stream_index=stream_index,
-    )
-
+    """Use the shared bitrate sampler with mature external-probe diagnostics."""
     parsed_url = urlparse(stream_url)
     probe_identity = (
         parsed_url.netloc + parsed_url.path
@@ -7139,47 +7011,31 @@ def _sample_nm3u8dl_stream_video_bitrate(
         else "candidate stream"
     )
     timeout_identity = str(timeout_route or probe_identity).strip()
-    invocation = raw_external_start(
-        "ffmpeg",
-        f"candidate bitrate sample | {timeout_identity}",
-    )
-    try:
-        result = subprocess.run(
+
+    def sample_runner(command, timeout):
+        return _run_nm3u8dl_external_capture_redacted(
             command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=float(NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC),
-            check=False,
+            raw_tool="ffmpeg",
+            raw_context=f"candidate bitrate sample | {timeout_identity}",
+            timeout=timeout,
+            secret_values=(decryption_key,),
         )
-    except subprocess.TimeoutExpired as error:
-        raw_external_write(
-            invocation,
-            getattr(error, "stderr", None),
-            "stderr",
-        )
-        raw_external_end(invocation, status="timeout")
-        log_timeout_exception(
-            error,
-            "ffmpeg",
-            NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC,
-            context=f"candidate bitrate sample | {timeout_identity}",
-        )
-        return 0
-    except Exception as error:
-        raw_external_end(
-            invocation,
-            status=f"exception {type(error).__name__}",
-        )
-        return 0
 
-    stderr_text = str(result.stderr or "")
-    raw_external_write(invocation, stderr_text, "stderr")
-    raw_external_end(invocation, returncode=result.returncode)
-
-    if result.returncode != 0:
+    try:
+        return source_quality.sample_stream_video_bitrate(
+            stream_url,
+            headers,
+            sample_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC,
+            timeout_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC,
+            byte_range=byte_range,
+            decryption_key=decryption_key,
+            stream_index=stream_index,
+            runner=sample_runner,
+        )
+    except Exception:
+        # Preserve mature behavior: bitrate sampling is optional evidence and
+        # must never make the candidate probe fail.
         return 0
-    return source_quality.parse_ffmpeg_bitrate_progress(stderr_text)
 
 def _parse_nm3u8dl_idet_scan_type(stderr_text: str) -> str:
     """Return progressive/interlaced only when idet evidence is conclusive."""
