@@ -908,6 +908,38 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("suppressed for this registry/session",identity_line)
         self.assertNotIn("RECORDINGS",rendered)
 
+    def test_terminal_registry_states_and_suppression_use_warning_style(self):
+        snap=snapshot([sony_candidate()])
+        identity_key=next(
+            identity
+            for policy,identity in snap.blocks
+            if policy==coord.POLICY_MANUAL
+        )
+        for terminal_state in ("ENDED","MANUALLY_STOPPED","CRASHED"):
+            with self.subTest(state=terminal_state):
+                rendered=coord.render_dashboard(
+                    snap,
+                    (),
+                    registry_entries={
+                        identity_key:{
+                            "identity":identity_key,
+                            "provider":"SONYLIV",
+                            "display_name":"ENG _ Asian Games",
+                            "state":terminal_state,
+                            "worker_pid":4321,
+                        }
+                    },
+                    use_color=True,
+                )
+                self.assertIn(
+                    f"\033[1;93m[{terminal_state}]\033[0m",
+                    rendered,
+                )
+                self.assertIn(
+                    "\033[1;93m | suppressed for this registry/session\033[0m",
+                    rendered,
+                )
+
     def test_dashboard_quality_shows_shared_quality_evidence(self):
         item=replace(
             sony_candidate(),

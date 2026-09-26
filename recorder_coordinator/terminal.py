@@ -174,6 +174,8 @@ def _runtime_state_text(
 ) -> str:
     normalized = str(state or "").strip().upper()
     text = f"[{normalized}]" if bracketed else normalized
+    if normalized in _TERMINAL_REGISTRY_STATES:
+        return _warning_text(text, use_color)
     rgb = _RUNTIME_STATE_RGB.get(normalized, _ERROR_RGB)
     return _paint_rgb(text, rgb, use_color)
 
@@ -705,7 +707,10 @@ def render_dashboard(
                 bracketed=visible_state in _TERMINAL_REGISTRY_STATES,
             )
             suppression_text = (
-                " | suppressed for this registry/session"
+                _warning_text(
+                    " | suppressed for this registry/session",
+                    color,
+                )
                 if visible_state in _TERMINAL_REGISTRY_STATES
                 else ""
             )
