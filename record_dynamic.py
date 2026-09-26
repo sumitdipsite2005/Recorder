@@ -10333,19 +10333,33 @@ def log_nm3u8dl_playlist_scan_results(
         if candidate_row.get("failover_excluded", False)
     ]
     if excluded_rows:
-        excluded_fingerprints = {
-            (
-                "route:"
-                + str(candidate_row.get("stream_route_fingerprint") or "").strip()
-                if str(candidate_row.get("stream_route_fingerprint") or "").strip()
-                else "stream:"
-                + str(candidate_row.get("stream_fingerprint") or "").strip()
-            )
-            for candidate_row in excluded_rows
+        def excluded_identity(candidate_row: dict) -> str:
+            route_fingerprint = str(
+                candidate_row.get("stream_route_fingerprint") or ""
+            ).strip()
+            stream_fingerprint = str(
+                candidate_row.get("stream_fingerprint") or ""
+            ).strip()
+            reason = str(
+                candidate_row.get("failover_exclusion_reason") or ""
+            ).strip()
+
             if (
-                str(candidate_row.get("stream_route_fingerprint") or "").strip()
-                or str(candidate_row.get("stream_fingerprint") or "").strip()
-            )
+                reason.startswith("redirecting source repeatedly failed")
+                and route_fingerprint
+            ):
+                return "route:" + route_fingerprint
+            if stream_fingerprint:
+                return "stream:" + stream_fingerprint
+            if route_fingerprint:
+                return "route:" + route_fingerprint
+            return ""
+
+        excluded_fingerprints = {
+            identity
+            for candidate_row in excluded_rows
+            for identity in (excluded_identity(candidate_row),)
+            if identity
         }
         excluded_unique = len(excluded_fingerprints)
         excluded_entries = len(excluded_rows)
