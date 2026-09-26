@@ -555,18 +555,54 @@ https://example.test/rejected.m3u8
             source["manifest_final_url"],
         )
 
-    def test_literal_ip_stream_skips_idet_probe(self):
+    def test_redirected_literal_ip_stream_skips_idet_probe(self):
+        wrapper_url = "http://mag.diamondtv.one/live/test/302025.m3u8"
+        final_url = "http://103.211.103.215:61980/live/play/token/302025"
+
+        inspection = {
+            "manifest_reachable": True,
+            "stream_type": "HLS",
+            "video_width": 1920,
+            "video_height": 1080,
+            "video_fps": 50.0,
+            "video_scan_type": "",
+            "video_bitrate_bps": 0,
+        }
+        ffprobe_quality = {
+            "quality_known": True,
+            "video_width": 1920,
+            "video_height": 1080,
+            "video_fps": 50.0,
+            "video_scan_type": "",
+            "video_bitrate_bps": 0,
+        }
+        candidate = {
+            "stream_url": wrapper_url,
+            "playlist_url": "https://example.test/pocket.m3u",
+            "headers": {},
+            "keys": [],
+        }
+
         with patch.object(
             RECORDER,
-            "_run_nm3u8dl_external_capture_redacted",
-        ) as runner:
-            scan_type = RECORDER._detect_nm3u8dl_stream_scan_type_with_idet(
-                "http://103.211.103.215:61980/live/play/token/302025",
-                {},
-            )
+            "_fetch_nm3u8dl_stream_manifest_text",
+            return_value=("#EXTM3U\n#EXT-X-TARGETDURATION:6\n", final_url),
+        ), patch.object(
+            RECORDER.source_quality,
+            "inspect_manifest_probe_evidence",
+            return_value=(inspection, {"stream_type": "HLS"}, None),
+        ), patch.object(
+            RECORDER,
+            "_ffprobe_nm3u8dl_stream_quality",
+            return_value=ffprobe_quality,
+        ), patch.object(
+            RECORDER,
+            "_detect_nm3u8dl_stream_scan_type_with_idet",
+        ) as idet:
+            quality = RECORDER._probe_nm3u8dl_candidate_quality(candidate)
 
-        self.assertEqual(scan_type, "")
-        runner.assert_not_called()
+        self.assertEqual(quality["manifest_final_url"], final_url)
+        idet.assert_not_called()
 
     def test_external_probe_text_decode_replaces_invalid_bytes(self):
         captured = {}
