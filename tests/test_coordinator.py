@@ -717,6 +717,73 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(len(found["T"]),1)
         self.assertEqual(errors,("bad: OSError: boom",))
 
+    def test_token_only_context_refresh_does_not_make_identity_disappear(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
+            {"url":"https://matching.test/list.m3u","name":"matching"},
+            {"url":"https://context.test/list.m3u","name":"context"},
+        ]}}
+        matching=(
+            '#EXTM3U\n'
+            '#EXTINF:-1 tvg-name="Asian Games",Asian Games\n'
+            'https://cdn.test/hls/live/2120305/AG_Strea2309/ENG/1080p.m3u8?token=one\n'
+        )
+        context_one=(
+            '#EXTM3U\n'
+            '#EXTINF:-1 tvg-name="Day 3 World Feed",Day 3 World Feed\n'
+            'https://cdn.test/hls/live/2120305/AG_Strea2309/ENG/1080p.m3u8?token=one\n'
+        )
+        context_two=context_one.replace("token=one","token=two")
+        registry={}
+        documents=[
+            (
+                {
+                    "https://matching.test/list.m3u":matching,
+                    "https://context.test/list.m3u":context_one,
+                },
+                (),
+                {},
+            ),
+            (
+                {
+                    "https://matching.test/list.m3u":matching,
+                    "https://context.test/list.m3u":context_two,
+                },
+                (),
+                {},
+            ),
+        ]
+        with patch.object(
+            coord_acquisition,
+            "fetch_playlist_documents",
+            side_effect=documents,
+        ), patch.object(
+            coord_acquisition,
+            "_github_file_commit_timestamp",
+            return_value=None,
+            create=True,
+        ), patch(
+            "recorder_source.discovery._github_file_commit_timestamp",
+            return_value=None,
+        ), patch.object(
+            coord_acquisition,
+            "probe_candidates",
+            side_effect=lambda items: tuple(items),
+        ):
+            first,_=coord.acquire_active_targets(
+                raw,
+                (view(),),
+                source_freshness_registry=registry,
+            )
+            second,_=coord.acquire_active_targets(
+                raw,
+                (view(),),
+                source_freshness_registry=registry,
+            )
+
+        self.assertEqual(len(first["T"]),2)
+        self.assertEqual(len(second["T"]),2)
+        self.assertEqual(sum(not item.ignored for item in second["T"]),1)
+
     def test_newer_nonmatching_metadata_rejects_stale_matching_identity(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
             {"url":"https://old.test/list.m3u","name":"old"},
