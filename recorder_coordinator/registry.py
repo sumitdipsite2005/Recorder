@@ -21,17 +21,18 @@ from typing import Callable, Dict, Iterator, Mapping, Optional, Tuple
 from recorder_runtime.paths import RecorderOutputPaths
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 
 STATE_LAUNCHING = "LAUNCHING"
-STATE_ACTIVE = "ACTIVE"
+STATE_RECORDING = "RECORDING"
 STATE_WAITING_FOR_SOURCE = "WAITING_FOR_SOURCE"
 STATE_ENDED = "ENDED"
 STATE_MANUALLY_STOPPED = "MANUALLY_STOPPED"
 STATE_CRASHED = "CRASHED"
 
 OWNERSHIP_STATES = frozenset(
-    {STATE_LAUNCHING, STATE_ACTIVE, STATE_WAITING_FOR_SOURCE}
+    {STATE_LAUNCHING, STATE_RECORDING, STATE_WAITING_FOR_SOURCE}
 )
 TERMINAL_STATES = frozenset(
     {STATE_ENDED, STATE_MANUALLY_STOPPED, STATE_CRASHED}
@@ -39,8 +40,10 @@ TERMINAL_STATES = frozenset(
 VALID_STATES = OWNERSHIP_STATES | TERMINAL_STATES
 
 _ALLOWED_TRANSITIONS = {
-    STATE_LAUNCHING: frozenset({STATE_ACTIVE, STATE_CRASHED}),
-    STATE_ACTIVE: frozenset(
+    STATE_LAUNCHING: frozenset(
+        {STATE_RECORDING, STATE_WAITING_FOR_SOURCE, STATE_CRASHED}
+    ),
+    STATE_RECORDING: frozenset(
         {
             STATE_WAITING_FOR_SOURCE,
             STATE_ENDED,
@@ -50,7 +53,7 @@ _ALLOWED_TRANSITIONS = {
     ),
     STATE_WAITING_FOR_SOURCE: frozenset(
         {
-            STATE_ACTIVE,
+            STATE_RECORDING,
             STATE_ENDED,
             STATE_MANUALLY_STOPPED,
             STATE_CRASHED,
@@ -129,9 +132,25 @@ def _new_registry(now: Optional[datetime] = None) -> Dict[str, object]:
     }
 
 
-def _validate_registry(data: object) -> Dict[str, object]:
+def _migrate_registry(data: object) -> Tuple[Dict[str, object], bool]:
     if not isinstance(data, dict):
         raise RegistryValidationError("identity registry root must be a JSON object")
+
+    migrated = False
+    if data.get("schema_version") == LEGACY_SCHEMA_VERSION:
+        entries = data.get("entries")
+        if isinstance(entries, dict):
+            for entry in entries.values():
+                if isinstance(entry, dict) and entry.get("state") == "ACTIVE":
+                    entry["state"] = STATE_RECORDING
+        data["schema_version"] = SCHEMA_VERSION
+        migrated = True
+
+    return data, migrated
+
+
+def _validate_registry(data: object) -> Dict[str, object]:
+    data, _ = _migrate_registry(data)
     if data.get("schema_version") != SCHEMA_VERSION:
         raise RegistryValidationError(
             f"unsupported identity registry schema_version {data.get('schema_version')!r}"
@@ -173,10 +192,14 @@ def _validate_registry(data: object) -> Dict[str, object]:
     return data
 
 
-def _read_unlocked(path: Path) -> Dict[str, object]:
+def _read_unlocked_with_migration(
+    path: Path,
+) -> Tuple[Dict[str, object], bool]:
     try:
         with path.open("r", encoding="utf-8") as handle:
-            return _validate_registry(json.load(handle))
+            raw = json.load(handle)
+        migrated_data, migrated = _migrate_registry(raw)
+        return _validate_registry(migrated_data), migrated
     except FileNotFoundError:
         raise
     except RegistryValidationError:
@@ -185,6 +208,11 @@ def _read_unlocked(path: Path) -> Dict[str, object]:
         raise RegistryValidationError(
             f"could not read valid identity registry {path}: {error}"
         ) from error
+
+
+def _read_unlocked(path: Path) -> Dict[str, object]:
+    registry, _ = _read_unlocked_with_migration(path)
+    return registry
 
 
 def _write_atomic(path: Path, data: Mapping[str, object]) -> None:
@@ -318,7 +346,11 @@ class IdentityRegistryStore:
                     action="CREATED",
                 )
 
-            registry = _read_unlocked(self.paths.current)
+            registry, migrated = _read_unlocked_with_migration(
+                self.paths.current
+            )
+            if migrated:
+                _write_atomic(self.paths.current, registry)
             live, unresolved = self._ownership_status(
                 registry,
                 worker_liveness,
@@ -394,6 +426,49 @@ class IdentityRegistryStore:
             _write_atomic(self.paths.current, registry)
             return dict(entry)
 
+    def bind_worker_pid(
+        self,
+        *,
+        identity_key: str,
+        worker_pid: int,
+        reason: str = "",
+        expected_session_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, object]:
+        """Attach the started worker PID while ownership remains LAUNCHING."""
+        if isinstance(worker_pid, bool) or not isinstance(worker_pid, int) or worker_pid <= 0:
+            raise ValueError("worker_pid must be a positive integer")
+
+        stamp = _utc_text(now)
+        with _registry_lock(self.paths):
+            registry = _read_unlocked(self.paths.current)
+            if (
+                expected_session_id is not None
+                and registry["session_id"] != expected_session_id
+            ):
+                raise RegistryError(
+                    "identity registry session changed before worker PID bind"
+                )
+            entries = registry["entries"]
+            assert isinstance(entries, dict)
+            entry = entries.get(identity_key)
+            if not isinstance(entry, dict):
+                raise InvalidRegistryTransition(
+                    f"{identity_key} is not claimed in the current registry session"
+                )
+            if entry.get("state") != STATE_LAUNCHING:
+                raise InvalidRegistryTransition(
+                    f"{identity_key} is not LAUNCHING"
+                )
+
+            entry["worker_pid"] = worker_pid
+            entry["updated_at"] = stamp
+            if reason:
+                entry["reason"] = reason
+            registry["updated_at"] = stamp
+            _write_atomic(self.paths.current, registry)
+            return dict(entry)
+
     def transition(
         self,
         *,
@@ -441,7 +516,7 @@ class IdentityRegistryStore:
                     f"{new_state} is not allowed"
                 )
 
-            if new_state in {STATE_ACTIVE, STATE_WAITING_FOR_SOURCE}:
+            if new_state in {STATE_RECORDING, STATE_WAITING_FOR_SOURCE}:
                 effective_pid = (
                     worker_pid
                     if worker_pid is not None
@@ -497,7 +572,7 @@ class IdentityRegistryStore:
             if live is True:
                 has_live_worker = True
             else:
-                # ACTIVE/WAITING ownership with no provably live worker is not a
+                # RECORDING/WAITING ownership with no provably live worker is not a
                 # cleanly completed session. False means definite process loss;
                 # None means liveness could not be established. Both must block
                 # rollover until a human or lifecycle handler resolves the state.
