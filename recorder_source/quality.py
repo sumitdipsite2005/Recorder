@@ -22,6 +22,7 @@ from urllib.parse import urljoin
 
 from . import transport as source_transport
 from .manifest import manifest_type_from_text
+from .identity import canonical_delivery_path, normalize_provider_name
 from .models import SourceCandidate
 from .selection import (
     comparable_motion_fps,
@@ -148,6 +149,47 @@ def quality_probe_identity(
     raw_keys = _quality_value(candidate, "keys", ())
     has_decryption_keys = bool(raw_keys or ())
     return stream_url, normalized_headers, has_decryption_keys
+
+
+def quality_persistence_identity(
+    candidate: QualityLike,
+    *,
+    resolved_url: str = "",
+) -> str:
+    """Return a stable provider-scoped media-path key for persisted quality.
+
+    Unlike the playback/session fingerprint, this deliberately ignores delivery
+    hostname, query/session parameters and fragment.  The terminal media/manifest
+    filename is retained because it can identify a distinct quality rendition.
+    """
+    if isinstance(candidate, SourceCandidate):
+        extra = candidate.extra if isinstance(candidate.extra, Mapping) else {}
+        provider = str(extra.get("provider") or "UNKNOWN")
+    else:
+        extra_value = candidate.get("extra", {})
+        extra = extra_value if isinstance(extra_value, Mapping) else {}
+        provider = str(candidate.get("provider") or extra.get("provider") or "UNKNOWN")
+
+    url = str(resolved_url or "").strip()
+    if not url:
+        for name in (
+            "final_stream_url",
+            "manifest_final_url",
+            "effective_url",
+            "stream_url",
+        ):
+            value = _quality_value(candidate, name, "")
+            url = str(value or "").strip()
+            if url:
+                break
+
+    path = canonical_delivery_path(
+        url,
+        drop_terminal_file=False,
+    )
+    if not path:
+        return ""
+    return f"{normalize_provider_name(provider)}|{path}"
 
 
 def quality_signature(candidate: QualityLike) -> Tuple[int, int, float, int, str]:
