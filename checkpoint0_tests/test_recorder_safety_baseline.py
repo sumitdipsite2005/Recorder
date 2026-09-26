@@ -392,6 +392,39 @@ https://example.test/rejected.m3u8
         )
         self.assertEqual(selected["name"], "upgrade-1080p50")
 
+    def test_jio_star_sports_stops_quality_scans_at_1080p50(self):
+        with patch.object(
+            RECORDER,
+            "NM3U8DL_PLAYLIST_GROUP",
+            "JIO_STAR_SPORTS",
+        ):
+            profile = RECORDER.get_nm3u8dl_playlist_profile()
+            self.assertTrue(profile["quality_upgrade_enabled"])
+            self.assertTrue(profile["quality_upgrade_1080p50_ceiling"])
+
+            self.assertTrue(
+                RECORDER._nm3u8dl_quality_upgrade_cutoff_reached(
+                    {
+                        "video_width": 1920,
+                        "video_height": 1080,
+                        "video_fps": 50,
+                        "video_scan_type": "progressive",
+                    },
+                    profile,
+                )
+            )
+            self.assertFalse(
+                RECORDER._nm3u8dl_quality_upgrade_cutoff_reached(
+                    {
+                        "video_width": 1280,
+                        "video_height": 720,
+                        "video_fps": 50,
+                        "video_scan_type": "progressive",
+                    },
+                    profile,
+                )
+            )
+
     def test_failover_fingerprint_changes_with_effective_session_state(self):
         base = {
             "manifest_final_url": "https://media.example.test/live/master.m3u8?token=one",
@@ -509,6 +542,31 @@ https://example.test/rejected.m3u8
             RECORDER.get_nm3u8dl_launch_stream_url(source),
             "https://wrapper.test/channel.m3u8",
         )
+
+    def test_launch_uses_validated_extensionless_final_manifest_url(self):
+        source = {
+            "stream_url": "http://wrapper.test/channel.m3u8",
+            "manifest_final_url": "http://103.211.103.215:61980/live/play/token/302025",
+            "manifest_reachable": True,
+            "stream_type": "HLS",
+        }
+        self.assertEqual(
+            RECORDER.get_nm3u8dl_launch_stream_url(source),
+            source["manifest_final_url"],
+        )
+
+    def test_literal_ip_stream_skips_idet_probe(self):
+        with patch.object(
+            RECORDER,
+            "_run_nm3u8dl_external_capture_redacted",
+        ) as runner:
+            scan_type = RECORDER._detect_nm3u8dl_stream_scan_type_with_idet(
+                "http://103.211.103.215:61980/live/play/token/302025",
+                {},
+            )
+
+        self.assertEqual(scan_type, "")
+        runner.assert_not_called()
 
     def test_external_probe_text_decode_replaces_invalid_bytes(self):
         captured = {}
