@@ -74,6 +74,33 @@ def snapshot(candidates, *, policy=coord.POLICY_MANUAL, target_name="T", now=Non
     return coord.build_snapshot((view(t, now=now),), {target_name: tuple(candidates)}, now=now or datetime(2026,9,24,10,0,0))
 
 
+def runtime_candidate(
+    candidate,
+    *,
+    selected=False,
+    status="WORKING",
+    reason="",
+    classification="",
+    quality="1920x1080 | 50p | 5000 Kbps",
+):
+    return {
+        "playlist_url": candidate.playlist_url,
+        "matching_entry_index": candidate.matching_entry_index,
+        "stream_url": candidate.stream_url,
+        "entry_title": candidate.entry_title,
+        "tvg_name": candidate.tvg_name,
+        "group_title": candidate.group_title,
+        "status": status,
+        "classification": classification,
+        "selected": selected,
+        "selection_reason": reason,
+        "quality": quality,
+        "expiry": candidate.expiry,
+        "expiry_source": candidate.expiry_source,
+        "launchable": candidate.launchable,
+    }
+
+
 class OutputPathTests(unittest.TestCase):
     def test_coordinator_log_path_uses_configured_output_root(self):
         with tempfile.TemporaryDirectory() as td:
@@ -623,61 +650,93 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("[ON] Asian Games",rendered)
         self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps",rendered)
         self.assertIn("Identity: lane:2120305/AG_Strea2309/ENG",rendered)
-        self.assertIn("src1 [S1]", rendered)
+        self.assertIn("| [S1] | expires unknown |", rendered)
+        self.assertNotIn("src1 [S1]", rendered)
         self.assertIn("SOURCE REFERENCES", rendered)
         self.assertIn("[S1] https://src1.test/list.m3u", rendered)
 
-    def test_dashboard_overlays_registry_state_and_active_recordings(self):
-        snap=snapshot([sony_candidate()])
+    def test_dashboard_overlays_recording_state_and_rich_recordings_summary(self):
+        item=replace(
+            sony_candidate(),
+            video_resolution_source="manifest",
+            video_fps_source="manifest",
+            video_scan_type_source="event-policy",
+            video_bitrate_source="manifest",
+        )
+        snap=snapshot([item])
         identity_key=next(
             identity
             for policy,identity in snap.blocks
             if policy==coord.POLICY_MANUAL
         )
+        runtime_row=runtime_candidate(
+            item,
+            selected=True,
+            status="SELECTED",
+            quality="1920x1080 | 50p [manifest, event-policy] | 5000 Kbps",
+        )
+        registry_entries={
+            identity_key:{
+                "identity":identity_key,
+                "provider":"SONYLIV",
+                "display_name":"ENG _ Asian Games",
+                "state":"RECORDING",
+                "worker_pid":4321,
+            }
+        }
+        runtime_statuses={
+            identity_key:{
+                "worker_state":"RECORDING",
+                "current_candidate":runtime_row,
+                "candidates":[runtime_row],
+                "target_names":["T"],
+                "source_count":1,
+            }
+        }
         rendered=coord.render_dashboard(
             snap,
             (),
-            registry_entries={
-                identity_key:{
-                    "identity":identity_key,
-                    "provider":"SONYLIV",
-                    "display_name":"ENG _ Asian Games",
-                    "state":"ACTIVE",
-                    "worker_pid":4321,
-                }
-            },
+            registry_entries=registry_entries,
+            runtime_statuses=runtime_statuses,
         )
         identity_line=next(
-            line for line in rendered.splitlines() if "Identity:" in line
+            line for line in rendered.splitlines()
+            if line.startswith("[1]")
         )
-        self.assertIn("[1] ACTIVE SONYLIV",identity_line)
-        self.assertIn("ACTIVE RECORDINGS",rendered)
-        self.assertIn("[ACTIVE] ENG _ Asian Games | SONYLIV | PID 4321",rendered)
+        self.assertIn("[1] RECORDING SONYLIV",identity_line)
+        self.assertIn("RECORDINGS",rendered)
+        recording_line=next(
+            line for line in rendered.splitlines()
+            if "[RECORDING]" in line and "PID 4321" in line
+        )
+        self.assertIn("Asian Games | Asian Games | Sports | SONYLIV | [S1]",recording_line)
+        self.assertIn(
+            "1920x1080 | 50p [manifest, event-policy] | 5000 Kbps",
+            recording_line,
+        )
+        self.assertIn("Identity: lane:2120305/AG_Strea2309/ENG",recording_line)
+        self.assertIn("Targets: T | Sources: 1 | PID 4321",recording_line)
+        self.assertNotIn("expires",recording_line)
+        self.assertNotIn("Last Updated",recording_line)
+        self.assertNotIn("Source Updated",recording_line)
 
         colored=coord.render_dashboard(
             snap,
             (),
             use_color=True,
-            registry_entries={
-                identity_key:{
-                    "identity":identity_key,
-                    "provider":"SONYLIV",
-                    "display_name":"ENG _ Asian Games",
-                    "state":"ACTIVE",
-                    "worker_pid":4321,
-                }
-            },
+            registry_entries=registry_entries,
+            runtime_statuses=runtime_statuses,
         )
         self.assertIn(
-            "\033[38;2;41;159;214mACTIVE RECORDINGS\033[0m",
+            "\033[38;2;41;159;214mRECORDINGS\033[0m",
             colored,
         )
         self.assertIn(
-            "\033[38;2;255;215;0m[ACTIVE]\033[0m",
+            "\033[38;2;255;215;0m[RECORDING]\033[0m",
             colored,
         )
         self.assertIn(
-            "\033[38;2;255;215;0mACTIVE\033[0m",
+            "\033[38;2;255;215;0mRECORDING\033[0m",
             colored,
         )
 
@@ -755,8 +814,9 @@ class SnapshotAndChangeTests(unittest.TestCase):
         identity_line=next(
             line for line in rendered.splitlines() if "Identity:" in line
         )
-        self.assertIn("[1] MANUALLY_STOPPED SONYLIV",identity_line)
-        self.assertNotIn("ACTIVE RECORDINGS",rendered)
+        self.assertIn("[1] [MANUALLY_STOPPED] SONYLIV",identity_line)
+        self.assertIn("suppressed for this registry/session",identity_line)
+        self.assertNotIn("RECORDINGS",rendered)
 
     def test_dashboard_quality_shows_shared_quality_evidence(self):
         item=replace(
@@ -961,15 +1021,13 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("\033[38;2;41;159;214mHockey\033[0m",rendered)
         self.assertIn("\033[38;2;255;135;3m[NEW]\033[0m",rendered)
 
-    def test_source_name_reference_and_footer_share_muted_treatment(self):
+    def test_source_reference_and_footer_share_muted_treatment_without_row_source_name(self):
         snap=snapshot([sony_candidate()])
         rendered=coord.render_dashboard(snap,(),use_color=True)
         muted="\033[38;2;118;118;118m"
         reset="\033[0m"
-        self.assertIn(
-            f"{muted}src1{reset} {muted}[S1]{reset}",
-            rendered,
-        )
+        self.assertIn(f"{muted}[S1]{reset}",rendered)
+        self.assertNotIn(f"{muted}src1{reset}",rendered)
         self.assertIn(
             f"{muted}  [S1] https://src1.test/list.m3u{reset}",
             rendered,
@@ -1007,7 +1065,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         rendered=coord.render_dashboard(snap,())
         self.assertLess(rendered.index("[ON] Newer"),rendered.index("[ON] Older"))
 
-    def test_dashboard_marks_selected_source_and_explains_working_loser(self):
+    def test_plain_watch_does_not_show_selection_decisions(self):
         selected=sony_candidate(
             playlist="https://selected.test/list",
             source_name="selected-source",
@@ -1021,16 +1079,85 @@ class SnapshotAndChangeTests(unittest.TestCase):
             fps=25.0,
         )
         rendered=coord.render_dashboard(snapshot([lower,selected]),())
+        self.assertNotIn("[SELECTED]",rendered)
+        self.assertNotIn("[RECORDING]",rendered)
+        self.assertNotIn("not selected:",rendered)
+
+    def test_runtime_selected_source_and_working_loser_use_worker_decision(self):
+        selected=sony_candidate(
+            playlist="https://selected.test/list",
+            source_name="selected-source",
+            title="Selected Event",
+            fps=50.0,
+        )
+        lower=sony_candidate(
+            playlist="https://lower.test/list",
+            source_name="lower-source",
+            title="Lower Event",
+            fps=25.0,
+        )
+        snap=snapshot([lower,selected])
+        identity_key=next(
+            identity for policy,identity in snap.blocks
+            if policy==coord.POLICY_MANUAL
+        )
+        selected_row=runtime_candidate(
+            selected,
+            selected=True,
+            status="SELECTED",
+        )
+        lower_row=runtime_candidate(
+            lower,
+            reason="not selected: lower quality",
+        )
+        rendered=coord.render_dashboard(
+            snap,
+            (),
+            use_color=True,
+            registry_entries={
+                identity_key:{
+                    "state":"LAUNCHING",
+                    "provider":"SONYLIV",
+                    "worker_pid":4321,
+                }
+            },
+            runtime_statuses={
+                identity_key:{
+                    "worker_state":"SELECTED",
+                    "current_candidate":selected_row,
+                    "candidates":[selected_row,lower_row],
+                    "target_names":["T"],
+                    "source_count":2,
+                }
+            },
+        )
         selected_line=next(
             line for line in rendered.splitlines()
-            if "selected-source" in line
+            if "Selected Event" in line
         )
         lower_line=next(
             line for line in rendered.splitlines()
-            if "lower-source" in line
+            if "Lower Event" in line
         )
-        self.assertIn("[SELECTED]",selected_line)
+        self.assertIn("\033[1;97;42m[SELECTED]\033[0m",selected_line)
+        self.assertIn("\033[1;92m[ON]\033[0m",selected_line)
+        self.assertLess(selected_line.index("[SELECTED]"),selected_line.index("[ON]"))
         self.assertIn("not selected: lower quality",lower_line)
+
+    def test_unavailable_expiry_classification_is_front_loaded(self):
+        expiry=datetime(2026,9,24,9,30,0).timestamp()
+        item=replace(
+            sony_candidate(launchable=False,status="expired"),
+            expiry=expiry,
+            expiry_source="manifest + URL/header",
+        )
+        rendered=coord.render_dashboard(snapshot([item]),())
+        row=next(line for line in rendered.splitlines() if "[OFF]" in line)
+        self.assertIn("[OFF] EXPIRED — Asian Games",row)
+        self.assertIn(
+            "expired 2026-09-24 09:30:00 [manifest + URL/header]",
+            row,
+        )
 
     def test_dashboard_shows_source_freshness_time_and_evidence(self):
         item=sony_candidate()
