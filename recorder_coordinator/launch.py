@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from recorder_runtime.identity_launch import FrozenTargetIntent
-from recorder_source.identity import CanonicalFeedIdentity, derive_feed_identity
+from recorder_source.identity import CanonicalFeedIdentity, derive_feed_identity, filename_sub_id
 from recorder_source.models import SourceCandidate
 from recorder_source.policy import selection_policy_for_provider
 from recorder_source.selection import candidate_quality_rank, select_join_candidate
@@ -65,7 +65,11 @@ def _combined_duration(targets: Tuple[IdentityTarget, ...]) -> Optional[float]:
     return max(float(value) for value in durations if value is not None)
 
 
-def _safe_base_name(candidate: SourceCandidate, fallback: str) -> str:
+def _safe_base_name(
+    candidate: SourceCandidate,
+    fallback: str,
+    identity_lane_key: str = "",
+) -> str:
     event_name = (
         str(candidate.entry_title or "").strip()
         or str(candidate.tvg_name or "").strip()
@@ -77,6 +81,10 @@ def _safe_base_name(candidate: SourceCandidate, fallback: str) -> str:
         raw = f"{group_name} - {event_name}"
     else:
         raw = event_name or group_name or "Recording"
+
+    sub_id = filename_sub_id(identity_lane_key)
+    if sub_id:
+        raw = f"{raw} - {sub_id}"
 
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw)
     cleaned = cleaned.rstrip(" .")
@@ -194,7 +202,11 @@ def build_identity_launch_plan(
         selected_source_group=source_group,
         target_intents=tuple(_target_intent(target) for target in targets_tuple),
         recording_duration_min=_combined_duration(targets_tuple),
-        base_name=_safe_base_name(selected_candidate, selected_target.name),
+        base_name=_safe_base_name(
+            selected_candidate,
+            selected_target.name,
+            block.identity.lane_key,
+        ),
     )
 
 
