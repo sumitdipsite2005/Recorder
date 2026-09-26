@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - Windows is the production terminal
 
 from recorder_runtime import sound as runtime_sound
 from recorder_runtime.identity_launch import IdentityLaunchRequest
+from recorder_runtime.identity_status import IdentityRuntimeStatusStore
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_runtime.sound import SoundSnoozeState
 
@@ -1326,6 +1327,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
         write_log(log_path, warning)
 
     registry_entries = _registry_entries_snapshot(registry_store)
+    runtime_status_store = IdentityRuntimeStatusStore(
+        output_paths,
+        registry_status.session_id,
+    )
+    runtime_statuses = runtime_status_store.read_all()
     next_registry_refresh_monotonic = (
         time.monotonic() + REGISTRY_REFRESH_INTERVAL_SEC
     )
@@ -1376,6 +1382,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     fresh_registry_entries = _registry_entries_snapshot(
                         registry_store
                     )
+                    fresh_runtime_statuses = runtime_status_store.read_all()
                 except Exception as error:
                     signature = f"{type(error).__name__}: {error}"
                     if signature != registry_read_error_signature:
@@ -1390,7 +1397,9 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     registry_read_error_signature = signature
                 else:
                     registry_read_error_signature = ""
-                    if fresh_registry_entries != registry_entries:
+                    registry_changed = fresh_registry_entries != registry_entries
+                    runtime_status_changed = fresh_runtime_statuses != runtime_statuses
+                    if registry_changed:
                         for (
                             identity_key,
                             previous_state,
@@ -1408,8 +1417,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
                                 reason,
                             )
                         registry_entries = fresh_registry_entries
-                        if (
-                            previous is not None
+                    if runtime_status_changed:
+                        runtime_statuses = fresh_runtime_statuses
+                    if (
+                            (registry_changed or runtime_status_changed)
+                            and previous is not None
                             and not force_refresh
                             and not record_menu_open
                             and not sound_menu_open
@@ -1423,6 +1435,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                                 refresh_interval_sec=state.refresh_interval_sec,
                                 use_color=True,
                                 registry_entries=registry_entries,
+                                runtime_statuses=runtime_statuses,
                                 source_references=source_reference_registry,
                             )
                             clear_dashboard_terminal()
@@ -1520,7 +1533,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 )
                 clear_transient_only = (not meaningful) and dashboard_has_transient
 
-                display_order = update_display_order(display_order, snapshot)
+                display_order = update_display_order(
+                    display_order,
+                    snapshot,
+                    registry_entries=registry_entries,
+                )
                 source_reference_registry = update_source_reference_registry(
                     source_reference_registry,
                     snapshot,
@@ -1536,6 +1553,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         refresh_interval_sec=state.refresh_interval_sec,
                         use_color=True,
                         registry_entries=registry_entries,
+                        runtime_statuses=runtime_statuses,
                         source_references=source_reference_registry,
                     )
                     clear_dashboard_terminal()
@@ -1550,6 +1568,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             refresh_interval_sec=state.refresh_interval_sec,
                             use_color=False,
                             registry_entries=registry_entries,
+                            runtime_statuses=runtime_statuses,
                             source_references=source_reference_registry,
                         )
                         write_log(log_path, log_text)
