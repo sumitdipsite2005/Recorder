@@ -514,17 +514,14 @@ class AcquisitionTests(unittest.TestCase):
                 "source":"commit",
                 "content_hash":url,
             }
-        with patch.object(
-            coord,"fetch_playlist_documents",
+        with patch.object(coord_acquisition,"fetch_playlist_documents",
             return_value=(
                 {"https://old.test/list.m3u":matching,"https://new.test/list.m3u":moved},
                 (),
                 {},
             ),
-        ), patch.object(
-            coord,"resolve_playlist_source_freshness",side_effect=freshness
-        ), patch.object(
-            coord,"probe_candidates",side_effect=lambda items: tuple(items)
+        ), patch.object(coord_acquisition,"resolve_playlist_source_freshness",side_effect=freshness
+        ), patch.object(coord_acquisition,"probe_candidates",side_effect=lambda items: tuple(items)
         ):
             found,_=coord.acquire_active_targets(raw,(view(),))
         self.assertEqual(found["T"],())
@@ -553,17 +550,14 @@ class AcquisitionTests(unittest.TestCase):
                 "source":"commit",
                 "content_hash":url,
             }
-        with patch.object(
-            coord,"fetch_playlist_documents",
+        with patch.object(coord_acquisition,"fetch_playlist_documents",
             return_value=(
                 {"https://old.test/list.m3u":matching,"https://new.test/list.m3u":shorter},
                 (),
                 {},
             ),
-        ), patch.object(
-            coord,"resolve_playlist_source_freshness",side_effect=freshness
-        ), patch.object(
-            coord,"probe_candidates",side_effect=lambda items: tuple(items)
+        ), patch.object(coord_acquisition,"resolve_playlist_source_freshness",side_effect=freshness
+        ), patch.object(coord_acquisition,"probe_candidates",side_effect=lambda items: tuple(items)
         ):
             found,_=coord.acquire_active_targets(
                 raw,
@@ -590,17 +584,14 @@ class AcquisitionTests(unittest.TestCase):
                 "source":"commit",
                 "content_hash":url,
             }
-        with patch.object(
-            coord,"fetch_playlist_documents",
+        with patch.object(coord_acquisition,"fetch_playlist_documents",
             return_value=(
                 {"https://old.test/list.m3u":old,"https://new.test/list.m3u":matching},
                 (),
                 {},
             ),
-        ), patch.object(
-            coord,"resolve_playlist_source_freshness",side_effect=freshness
-        ), patch.object(
-            coord,"probe_candidates",side_effect=lambda items: tuple(items)
+        ), patch.object(coord_acquisition,"resolve_playlist_source_freshness",side_effect=freshness
+        ), patch.object(coord_acquisition,"probe_candidates",side_effect=lambda items: tuple(items)
         ):
             found,_=coord.acquire_active_targets(raw,(view(),))
         self.assertEqual(len(found["T"]),2)
@@ -613,19 +604,15 @@ class AcquisitionTests(unittest.TestCase):
         ]}}
         matching='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games",Asian Games\nhttps://a.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
         moved='#EXTM3U\n#EXTINF:-1 tvg-name="Swimming",Swimming\nhttps://b.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
-        with patch.object(
-            coord,"fetch_playlist_documents",
+        with patch.object(coord_acquisition,"fetch_playlist_documents",
             return_value=(
                 {"https://one.test/list.m3u":matching,"https://two.test/list.m3u":moved},
                 (),
                 {},
             ),
-        ), patch.object(
-            coord,
-            "resolve_playlist_source_freshness",
+        ), patch.object(coord_acquisition,"resolve_playlist_source_freshness",
             return_value={"timestamp":2000.0,"source":"commit","content_hash":"x"},
-        ), patch.object(
-            coord,"probe_candidates",side_effect=lambda items: tuple(items)
+        ), patch.object(coord_acquisition,"probe_candidates",side_effect=lambda items: tuple(items)
         ):
             found,_=coord.acquire_active_targets(raw,(view(),))
         self.assertEqual(len(found["T"]),2)
