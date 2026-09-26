@@ -19,6 +19,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPCookieProcessor, urlopen
 
+from .policy import is_vpn_route_suspected_403
+
 
 QUALITY_HTTP_TIMEOUT_SEC = 8.0
 QUALITY_HTTP_MAX_ATTEMPTS = 2
@@ -614,9 +616,6 @@ def classify_http_access_error(
         if headers is not None
         else ""
     )
-    group = str(source_group or "").strip().upper()
-    provider_name = str(provider or "").strip().upper()
-
     if status == 403 and error_type.casefold() == "geo-blocked":
         country = (
             str(headers.get("Country") or "").strip()
@@ -630,9 +629,9 @@ def classify_http_access_error(
             "geo_country": country or None,
         }
 
-    if status == 403 and (
-        group in ("FANCODE", "JIO_STAR_SPORTS")
-        or provider_name in ("FANCODE", "JIO")
+    if status == 403 and is_vpn_route_suspected_403(
+        source_group=source_group,
+        provider=provider,
     ):
         return {
             "blocked": True,
