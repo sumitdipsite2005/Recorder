@@ -7351,18 +7351,8 @@ def _fetch_nm3u8dl_hls_child_with_master_cookie_session(
 
 
 def _get_nm3u8dl_stream_type_from_url(stream_url: str) -> str:
-    try:
-        path = str(urlparse(str(stream_url or "")).path or "").lower()
-    except Exception:
-        path = str(stream_url or "").lower()
-
-    if path.endswith(".mpd"):
-        return "DASH"
-
-    if path.endswith(".m3u8"):
-        return "HLS"
-
-    return ""
+    """Compatibility wrapper around the shared transport classification rule."""
+    return source_transport.stream_type_from_url(stream_url)
 
 
 def _normalize_nm3u8dl_probe_failure_text(value: str) -> str:

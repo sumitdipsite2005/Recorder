@@ -396,15 +396,6 @@ def _playlist_license_metadata(
     return license_type, tuple(keys), unsupported_drm
 
 
-def _stream_type_from_url(value: str) -> str:
-    path = urljoin(str(value or ""), urlsplit(str(value or "")).path).casefold() if value else ""
-    if ".mpd" in path:
-        return "DASH"
-    if ".m3u8" in path:
-        return "HLS"
-    return ""
-
-
 def _candidate_decryption_key(candidate: SourceCandidate) -> str:
     """Return a directly usable ClearKey value for FFprobe/FFmpeg when present."""
     for raw_value in candidate.keys:
@@ -474,7 +465,7 @@ def parse_playlist_text(
                 keys=keys,
                 license_type=license_type,
                 unsupported_drm=unsupported_drm,
-                stream_type=_stream_type_from_url(stream_url),
+                stream_type=source_transport.stream_type_from_url(stream_url),
                 extra={
                     "source_name": source_name or playlist_url,
                     "source_group": source_group,

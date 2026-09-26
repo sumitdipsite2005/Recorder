@@ -341,6 +341,26 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(c.extra["source_group"], "SONYLIV_EVENTS")
         self.assertEqual(c.extra["provider"], "SONYLIV")
 
+    def test_shared_stream_type_from_url_uses_manifest_path_suffix(self):
+        self.assertEqual(
+            source_transport.stream_type_from_url(
+                "https://cdn.test/live/master.m3u8?token=one"
+            ),
+            "HLS",
+        )
+        self.assertEqual(
+            source_transport.stream_type_from_url(
+                "https://cdn.test/live/manifest.mpd?token=one"
+            ),
+            "DASH",
+        )
+        self.assertEqual(
+            source_transport.stream_type_from_url(
+                "https://cdn.test/live/master.m3u8/segment.ts"
+            ),
+            "",
+        )
+
     def test_shared_manifest_content_classifier(self):
         self.assertEqual(
             manifest_type_from_text("  #EXTM3U\\n#EXT-X-VERSION:3"),

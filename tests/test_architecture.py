@@ -150,6 +150,22 @@ class ArchitectureGuardTests(unittest.TestCase):
         for path in ROOT.glob("*.bat"):
             self.assertEqual(path.name, path.name.lower(), path.name)
 
+    def test_stream_type_from_url_has_one_shared_owner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        transport=(ROOT/"recorder_source"/"transport.py").read_text(encoding="utf-8")
+
+        self.assertIn("def stream_type_from_url(", transport)
+        self.assertIn(
+            "return source_transport.stream_type_from_url(stream_url)",
+            recorder,
+        )
+        self.assertIn(
+            "source_transport.stream_type_from_url(stream_url)",
+            discovery,
+        )
+        self.assertNotIn("def _stream_type_from_url(", discovery)
+
     def test_manifest_content_classification_has_one_shared_owner(self):
         manifest=(ROOT/"recorder_source"/"manifest.py").read_text(encoding="utf-8")
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
