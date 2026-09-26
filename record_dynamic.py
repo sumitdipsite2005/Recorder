@@ -550,6 +550,7 @@ class RecorderState:
     identity_launch_request: Optional[IdentityLaunchRequest] = None
     identity_initial_source: Optional[dict] = None
     identity_feed_key: Optional[str] = None
+    identity_status_callback: Optional[Callable[[dict], None]] = None
 
     # Dynamic playlist renewal / access-block state
     nm3u8dl_running_source: Optional[dict] = None
@@ -10163,6 +10164,170 @@ def _format_nm3u8dl_candidate_display_details(
     return text
 
 
+def _identity_runtime_candidates(
+    *,
+    selected_candidate: Optional[dict],
+    candidates: Optional[List[dict]] = None,
+    history_scan: Optional[dict] = None,
+    source_results: Optional[List[dict]] = None,
+) -> List[dict]:
+    """Build sanitized worker-owned candidate decisions for Coordinator display."""
+    raw_candidates: List[dict] = []
+
+    if candidates:
+        raw_candidates.extend(dict(item) for item in candidates if isinstance(item, dict))
+
+    if not raw_candidates and isinstance(history_scan, dict):
+        raw_candidates.extend(
+            dict(item)
+            for item in (history_scan.get("candidates") or [])
+            if isinstance(item, dict)
+        )
+
+    if not raw_candidates:
+        for result in source_results or []:
+            if not isinstance(result, dict):
+                continue
+            raw_candidates.extend(
+                dict(item)
+                for item in (result.get("candidate_rows") or [])
+                if isinstance(item, dict)
+            )
+
+    if not raw_candidates and selected_candidate:
+        raw_candidates.append(dict(selected_candidate))
+
+    now_ts = time.time()
+    result_rows: List[dict] = []
+    seen = set()
+
+    for candidate in raw_candidates:
+        row_key = (
+            str(candidate.get("playlist_url") or ""),
+            int(candidate.get("matching_entry_index") or 0),
+            str(candidate.get("stream_url") or ""),
+            str(candidate.get("entry_title") or ""),
+            str(candidate.get("tvg_name") or ""),
+            str(candidate.get("group_title") or ""),
+        )
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+
+        status = _nm3u8dl_candidate_status(
+            candidate,
+            selected_candidate=selected_candidate,
+            now_ts=now_ts,
+        )
+        classification = _nm3u8dl_candidate_display_classification(
+            candidate,
+            status=status,
+        )
+        selection_reason = ""
+        if status == "WORKING":
+            selection_reason = _nm3u8dl_nonselection_reason(
+                candidate,
+                selected_candidate,
+                now_ts=now_ts,
+            )
+        elif status not in ("SELECTED",):
+            selection_reason = _format_nm3u8dl_candidate_display_details(
+                candidate,
+                status=status,
+                selected_candidate=selected_candidate,
+                now_ts=now_ts,
+                include_classification=False,
+            )
+
+        result_rows.append({
+            "playlist_url": str(candidate.get("playlist_url") or ""),
+            "matching_entry_index": int(candidate.get("matching_entry_index") or 0),
+            "stream_url": str(candidate.get("stream_url") or ""),
+            "entry_title": str(candidate.get("entry_title") or ""),
+            "tvg_name": str(candidate.get("tvg_name") or ""),
+            "group_title": str(candidate.get("group_title") or ""),
+            "status": status,
+            "classification": classification,
+            "selected": bool(
+                selected_candidate
+                and _nm3u8dl_same_candidate(candidate, selected_candidate)
+            ),
+            "selection_reason": selection_reason,
+            "quality": (
+                format_nm3u8dl_candidate_quality(candidate)
+                if _nm3u8dl_has_quality_evidence(candidate)
+                else "unknown"
+            ),
+            "video_width": int(candidate.get("video_width") or 0),
+            "video_height": int(candidate.get("video_height") or 0),
+            "video_fps": float(candidate.get("video_fps") or 0.0),
+            "video_scan_type": str(candidate.get("video_scan_type") or ""),
+            "video_resolution_source": str(candidate.get("video_resolution_source") or ""),
+            "video_fps_source": str(candidate.get("video_fps_source") or ""),
+            "video_scan_type_source": str(candidate.get("video_scan_type_source") or ""),
+            "video_bitrate_bps": int(candidate.get("video_bitrate_bps") or 0),
+            "video_bitrate_source": str(candidate.get("video_bitrate_source") or ""),
+            "expiry": candidate.get("expiry"),
+            "expiry_source": str(candidate.get("expiry_source") or ""),
+            "launchable": bool(candidate.get("launchable", False)),
+        })
+
+    return result_rows
+
+
+def _publish_identity_runtime_status(
+    state: RecorderState,
+    worker_state: str,
+    *,
+    selected_candidate: Optional[dict] = None,
+    candidates: Optional[List[dict]] = None,
+    history_scan: Optional[dict] = None,
+    source_results: Optional[List[dict]] = None,
+    reason: str = "",
+) -> None:
+    callback = getattr(state, "identity_status_callback", None)
+    request = getattr(state, "identity_launch_request", None)
+    if callback is None or request is None:
+        return
+
+    rows = _identity_runtime_candidates(
+        selected_candidate=selected_candidate,
+        candidates=candidates,
+        history_scan=history_scan,
+        source_results=source_results,
+    )
+    selected_row = next(
+        (dict(row) for row in rows if row.get("selected")),
+        None,
+    )
+    source_count = len({
+        str(row.get("playlist_url") or "")
+        for row in rows
+        if str(row.get("playlist_url") or "")
+    })
+
+    try:
+        callback({
+            "worker_state": str(worker_state or "").strip().upper(),
+            "current_candidate": (
+                selected_row
+                if str(worker_state or "").strip().upper()
+                in {"SELECTED", "RECORDING"}
+                else None
+            ),
+            "candidates": rows,
+            "target_names": [target.name for target in request.target_intents],
+            "source_count": source_count,
+            "reason": str(reason or ""),
+        })
+    except Exception as error:
+        log(
+            "Identity runtime status publish failed; recording continues "
+            f"({type(error).__name__}: {error})",
+            level="WARN",
+        )
+
+
 def get_nm3u8dl_access_block_playlist_urls(
     source_results: List[dict]
 ) -> List[str]:
@@ -13684,6 +13849,14 @@ def resolve_nm3u8dl_launch_source(
                     "source_results",
                     [],
                 )
+                _publish_identity_runtime_status(
+                    state,
+                    "WAITING_FOR_SOURCE",
+                    selected_candidate=None,
+                    history_scan=getattr(error, "history_scan", None),
+                    source_results=source_results,
+                    reason=str(error),
+                )
                 source_errors = getattr(
                     error,
                     "source_errors",
@@ -14445,6 +14618,16 @@ def get_nm3u8dl_part_a(
 
     if source is None:
         return None
+
+    _publish_identity_runtime_status(
+        state,
+        "SELECTED",
+        selected_candidate=source,
+        candidates=source.get("_candidate_pool"),
+        history_scan=source.get("_history_scan"),
+        source_results=source.get("source_results"),
+        reason="source selected for recorder launch",
+    )
 
     headers = get_nm3u8dl_effective_headers(
         source["headers"],
@@ -17330,6 +17513,28 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
             )
 
 
+        _publish_identity_runtime_status(
+            state,
+            "RECORDING",
+            selected_candidate=state.nm3u8dl_running_source,
+            candidates=(
+                state.nm3u8dl_running_source.get("_candidate_pool")
+                if state.nm3u8dl_running_source
+                else None
+            ),
+            history_scan=(
+                state.nm3u8dl_running_source.get("_history_scan")
+                if state.nm3u8dl_running_source
+                else None
+            ),
+            source_results=(
+                state.nm3u8dl_running_source.get("source_results")
+                if state.nm3u8dl_running_source
+                else None
+            ),
+            reason="recorder output file appeared",
+        )
+
         # Start nm3u8dl file growth monitoring thread (events only)
         state.nm3u8dl_event_queue = queue.SimpleQueue()
         state.nm3u8dl_last_health_log_t = time.monotonic()
@@ -18870,6 +19075,10 @@ def _apply_identity_launch_request(
     NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = first_intent.preferred
 
     source = candidate.to_mapping()
+    source["_candidate_pool"] = [
+        candidate_item.to_mapping()
+        for candidate_item in request.initial_candidate_pool
+    ]
     source.setdefault("source_results", [])
     source.setdefault("source_errors", [])
     source.setdefault("playlist_group", group_name)
@@ -18885,6 +19094,7 @@ def _apply_identity_launch_request(
 def run_recorder_process(
     *,
     identity_launch_request: Optional[IdentityLaunchRequest] = None,
+    identity_status_callback: Optional[Callable[[dict], None]] = None,
 ) -> RecorderProcessOutcome:
     global FINAL_FILE
     global CHUNKS_DIR
@@ -18910,6 +19120,7 @@ def run_recorder_process(
                 if identity_launch_request is not None
                 else None
             ),
+            identity_status_callback=identity_status_callback,
         )
         signal.signal(signal.SIGINT, make_signal_handler(state))
 
