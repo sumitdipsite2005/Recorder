@@ -147,7 +147,10 @@ def run_once(
     context_callback: Optional[Callable[[DashboardSnapshot], None]] = None,
     row_update_registry: Optional[Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]]] = None,
     source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[DashboardSnapshot, Tuple[ChangeEvent, ...]]:
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Coordinator scan cancelled by stop request")
     now = datetime.now()
     config_messages, _ = config_state.reload(now)
     window = config_state.coordinator_window(now)
@@ -171,9 +174,13 @@ def run_once(
             target_views,
             progress_callback=progress_callback,
             source_freshness_registry=source_freshness_registry,
+            stop_requested=stop_requested,
         )
     else:
         candidates_by_target, source_errors = {}, ()
+
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Coordinator scan cancelled by stop request")
 
     if progress_callback is not None:
         progress_callback("Building identities...")
@@ -469,13 +476,17 @@ def _command_reader(
             elif key == "\x1b":
                 command_queue.put("__ESC__")
             elif key == "\x03":
+                stop_event.set()
                 command_queue.put("__CTRL_C__")
         return
 
     while not stop_event.is_set():
         try:
             value = input().strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            return
+        except KeyboardInterrupt:
+            stop_event.set()
             return
         command_queue.put(value)
 
@@ -700,10 +711,15 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         ),
                         row_update_registry=row_update_registry,
                         source_freshness_registry=source_freshness_registry,
+                        stop_requested=stop_event.is_set,
                     )
                 except KeyboardInterrupt:
                     raise
                 except Exception as error:
+                    if stop_event.is_set():
+                        clear_live_status_line()
+                        print("\nIdentity Coordinator stopped by user.")
+                        return 0
                     clear_live_status_line()
                     message = (
                         f"Identity Coordinator scan failed: "
@@ -725,6 +741,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         watch_status_text(last_scan_wall_time, next_refresh_monotonic)
                     )
                     continue
+
+                if stop_event.is_set():
+                    clear_live_status_line()
+                    print("\nIdentity Coordinator stopped by user.")
+                    return 0
 
                 errors_changed = (
                     previous is None

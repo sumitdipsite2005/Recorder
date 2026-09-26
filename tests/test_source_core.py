@@ -531,6 +531,34 @@ https://edge.drmlive.net/live.mpd
         filtered = discover_playlist_text(text, SourceAcquisitionRequest(match=definition))
         self.assertEqual(len(filtered.candidates), 0)
 
+    def test_playlist_fetch_honors_cooperative_stop_before_network(self):
+        source = PlaylistSourceSpec("https://example.test/list.m3u", name="one")
+        with patch("recorder_source.discovery.urlopen") as opened:
+            with self.assertRaisesRegex(RuntimeError, "cancelled by stop request"):
+                fetch_playlist_documents(
+                    (source,),
+                    stop_requested=lambda: True,
+                )
+        opened.assert_not_called()
+
+    def test_candidate_probe_batch_honors_cooperative_stop_before_probe(self):
+        item = SourceCandidate(
+            playlist_url="https://source.test/list.m3u",
+            matching_entry_index=1,
+            tvg_name="A",
+            group_title="G",
+            entry_title="A",
+            raw_stream_url="https://cdn.test/live.m3u8",
+            stream_url="https://cdn.test/live.m3u8",
+        )
+        with patch("recorder_source.discovery.probe_candidate_hls") as probe:
+            with self.assertRaisesRegex(RuntimeError, "cancelled by stop request"):
+                probe_candidates(
+                    (item,),
+                    stop_requested=lambda: True,
+                )
+        probe.assert_not_called()
+
     def test_fetch_playlist_documents_keeps_success_when_other_source_fails(self):
         class Headers:
             def get_content_charset(self):

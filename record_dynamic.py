@@ -8159,6 +8159,7 @@ def _probe_nm3u8dl_candidate_quality(
                 child_error_describer=_describe_nm3u8dl_probe_exception,
                 child_error_callback=on_child_error,
                 resolve_dash_resource=resolve_dash_resource,
+                stop_requested=stop_requested,
             )
         )
         quality.update(inspection)

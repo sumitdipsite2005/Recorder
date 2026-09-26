@@ -494,7 +494,10 @@ def _github_file_commit_timestamp(
     timeout_sec: float = 5.0,
     max_attempts: int = 3,
     retry_base_sec: float = 0.35,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Optional[float]:
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Playlist scan cancelled by stop request")
     parts = _github_raw_file_parts(playlist_url)
     if parts is None:
         return None
@@ -513,11 +516,15 @@ def _github_file_commit_timestamp(
     payload = None
     attempts = max(1, int(max_attempts))
     for attempt in range(attempts):
+        if stop_requested is not None and stop_requested():
+            raise RuntimeError("Playlist scan cancelled by stop request")
         try:
             with urlopen(request, timeout=float(timeout_sec)) as response:
                 payload = json.loads(
                     response.read().decode("utf-8", errors="replace")
                 )
+            if stop_requested is not None and stop_requested():
+                raise RuntimeError("Playlist scan cancelled by stop request")
             break
         except HTTPError as error:
             # Retry only transient HTTP failures. Permanent/rate-limit responses
@@ -529,6 +536,8 @@ def _github_file_commit_timestamp(
         except Exception:
             return None
 
+        if stop_requested is not None and stop_requested():
+            raise RuntimeError("Playlist scan cancelled by stop request")
         if attempt + 1 < attempts:
             time.sleep(float(retry_base_sec) * (2 ** attempt))
 
@@ -555,6 +564,7 @@ def resolve_playlist_source_freshness(
     *,
     previous: Optional[Mapping[str, object]] = None,
     now_ts: Optional[float] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Mapping[str, object]:
     """Resolve best-known document freshness and preserve witnessed ordering.
 
@@ -564,6 +574,8 @@ def resolve_playlist_source_freshness(
     witnessed the newer version ourselves, so its observation time becomes the
     freshness timestamp without another external lookup.
     """
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Playlist scan cancelled by stop request")
     payload = str(text or "")
     content_hash = hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
     previous_hash = str((previous or {}).get("content_hash") or "")
@@ -579,7 +591,10 @@ def resolve_playlist_source_freshness(
                 _github_raw_file_parts(playlist_url) is not None
                 and previous_source not in ("commit", "observed")
             ):
-                commit_ts = _github_file_commit_timestamp(playlist_url)
+                commit_ts = _github_file_commit_timestamp(
+                    playlist_url,
+                    stop_requested=stop_requested,
+                )
                 if commit_ts is not None:
                     return {
                         "timestamp": commit_ts,
@@ -593,7 +608,10 @@ def resolve_playlist_source_freshness(
             "content_hash": content_hash,
         }
 
-    commit_ts = _github_file_commit_timestamp(playlist_url)
+    commit_ts = _github_file_commit_timestamp(
+        playlist_url,
+        stop_requested=stop_requested,
+    )
     if commit_ts is not None:
         return {
             "timestamp": commit_ts,
@@ -635,8 +653,12 @@ def fetch_playlist_documents(
     timeout_sec: float = 20.0,
     max_workers: int = 8,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Mapping[str, str], Tuple[str, ...], Mapping[str, Mapping[str, object]]]:
     """Fetch all sources concurrently while preserving per-source diagnostics."""
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Playlist scan cancelled by stop request")
+
     unique_sources: List[PlaylistSourceSpec] = []
     seen = set()
     for source in sources:
@@ -649,12 +671,30 @@ def fetch_playlist_documents(
     diagnostics: Dict[str, Mapping[str, object]] = {}
 
     def fetch_one(source: PlaylistSourceSpec):
+        if stop_requested is not None and stop_requested():
+            raise RuntimeError("Playlist scan cancelled by stop request")
         headers = {"User-Agent": DEFAULT_HTTP_USER_AGENT}
         headers.update(dict(source.request_headers or {}))
         started = time.monotonic()
         request = Request(source.url, headers=headers)
         with urlopen(request, timeout=float(timeout_sec)) as response:
-            payload = response.read()
+            read_chunk = getattr(response, "read1", None)
+            if callable(read_chunk):
+                chunks = []
+                while True:
+                    if stop_requested is not None and stop_requested():
+                        raise RuntimeError("Playlist scan cancelled by stop request")
+                    chunk = read_chunk(64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                payload = b"".join(chunks)
+            else:
+                if stop_requested is not None and stop_requested():
+                    raise RuntimeError("Playlist scan cancelled by stop request")
+                payload = response.read()
+                if stop_requested is not None and stop_requested():
+                    raise RuntimeError("Playlist scan cancelled by stop request")
             final_url = response.geturl()
             charset = response.headers.get_content_charset() or "utf-8"
             header_get = getattr(response.headers, "get", None)
@@ -684,6 +724,10 @@ def fetch_playlist_documents(
         completed: Dict[str, object] = {}
         completed_count = 0
         for future in as_completed(future_map):
+            if stop_requested is not None and stop_requested():
+                for pending in future_map:
+                    pending.cancel()
+                raise RuntimeError("Playlist scan cancelled by stop request")
             source = future_map[future]
             try:
                 completed[source.url] = future.result()
@@ -693,6 +737,9 @@ def fetch_playlist_documents(
                 completed_count += 1
                 if progress_callback is not None:
                     progress_callback(completed_count, len(unique_sources))
+
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Playlist scan cancelled by stop request")
 
     # Interpret in configured order so concurrency never changes visible ordering.
     for source in unique_sources:
@@ -757,8 +804,11 @@ def probe_candidate_hls(
     candidate: SourceCandidate,
     *,
     timeout_sec: Optional[float] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> SourceCandidate:
     """Inspect one normalized candidate and return shared quality/probe facts."""
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Quality probe cancelled by stop request")
     if not candidate.stream_url:
         return replace(
             candidate,
@@ -789,6 +839,7 @@ def probe_candidate_hls(
             candidate.stream_url,
             headers,
             default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
+            stop_requested=stop_requested,
             urlopen_fn=urlopen,
         )
         manifest_expiry = _extract_expiry(final_url, text)
@@ -798,6 +849,7 @@ def probe_candidate_hls(
                 variant_url,
                 headers,
                 default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
+                stop_requested=stop_requested,
                 urlopen_fn=urlopen,
             )
             return child_text
@@ -811,6 +863,7 @@ def probe_candidate_hls(
                 variant_url,
                 headers,
                 timeout_sec=timeout_value,
+                stop_requested=stop_requested,
             )
 
         def resolve_dash_resource(quality: Mapping[str, object]):
@@ -819,6 +872,7 @@ def probe_candidate_hls(
                 headers,
                 default_user_agent=PLAYLIST_USER_AGENTS["DEFAULT"],
                 expiry_parser=_extract_expiry,
+                stop_requested=stop_requested,
                 urlopen_fn=urlopen,
             )
 
@@ -833,6 +887,7 @@ def probe_candidate_hls(
                 fetch_child=fetch_child_text,
                 fetch_child_with_master_session=fetch_child_with_master_session,
                 resolve_dash_resource=resolve_dash_resource,
+                stop_requested=stop_requested,
             )
         )
 
@@ -911,6 +966,8 @@ def probe_candidate_hls(
         if probe_transport_launchable and (
             not manifest_complete or hls_needs_scan_type
         ):
+            if stop_requested is not None and stop_requested():
+                raise RuntimeError("Quality probe cancelled by stop request")
             try:
                 probe_stream_url = (
                     str(hls_quality.get("manifest_variant_url") or "").strip()
@@ -930,6 +987,8 @@ def probe_candidate_hls(
                     decryption_key=decryption_key,
                     sample_missing_bitrate=(bitrate <= 0),
                 )
+                if stop_requested is not None and stop_requested():
+                    raise RuntimeError("Quality probe cancelled by stop request")
                 if ffprobe_quality:
                     bitrate_sample_failure = str(
                         ffprobe_quality.get("_bitrate_sample_failure") or ""
@@ -1060,6 +1119,8 @@ def probe_candidate_hls(
             },
         )
     except HTTPError as error:
+        if stop_requested is not None and stop_requested():
+            raise
         access = source_transport.classify_http_access_error(
             error,
             source_group=str(candidate.extra.get("source_group") or ""),
@@ -1083,6 +1144,8 @@ def probe_candidate_hls(
             },
         )
     except (URLError, TimeoutError, OSError, ValueError) as error:
+        if stop_requested is not None and stop_requested():
+            raise
         return replace(
             candidate,
             expiry=url_header_expiry,
@@ -1179,8 +1242,11 @@ def probe_candidates(
     timeout_sec: Optional[float] = None,
     max_workers: int = QUALITY_PROBE_WORKERS,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[SourceCandidate, ...]:
     """Probe each effective stream once and reuse that result across observations."""
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Quality probe cancelled by stop request")
     if not candidates:
         return ()
 
@@ -1207,6 +1273,7 @@ def probe_candidates(
         return probe_candidate_hls(
             representative_candidate,
             timeout_sec=timeout_sec,
+            stop_requested=stop_requested,
         )
 
     def failure_result(
@@ -1221,7 +1288,7 @@ def probe_candidates(
             reason="probe failed",
         )
 
-    return tuple(run_grouped_quality_probes(
+    probed = tuple(run_grouped_quality_probes(
         candidates,
         group_key=group_key,
         representative=representative,
@@ -1230,5 +1297,9 @@ def probe_candidates(
         failure_result=failure_result,
         max_workers=max_workers,
         progress_callback=progress_callback,
+        stop_requested=stop_requested,
         thread_name_prefix="candidate_probe",
     ))
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Quality probe cancelled by stop request")
+    return probed

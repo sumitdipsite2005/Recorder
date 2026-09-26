@@ -217,7 +217,13 @@ def acquire_active_targets(
     *,
     progress_callback: Optional[Callable[[str], None]] = None,
     source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Dict[str, Tuple[SourceCandidate, ...]], Tuple[str, ...]]:
+    def raise_if_cancelled() -> None:
+        if stop_requested is not None and stop_requested():
+            raise RuntimeError("Coordinator scan cancelled by stop request")
+
+    raise_if_cancelled()
     active = [view for view in target_views if view.status == "ACTIVE"]
     if not active:
         return {}, ()
@@ -245,11 +251,15 @@ def acquire_active_targets(
         url_source_specs.setdefault(spec.url, spec)
     source_specs = tuple(url_source_specs.values())
     if progress_callback is None:
-        documents, fetch_errors, fetch_diagnostics = fetch_playlist_documents(source_specs)
+        documents, fetch_errors, fetch_diagnostics = fetch_playlist_documents(
+            source_specs,
+            stop_requested=stop_requested,
+        )
     else:
         progress_callback(f"Scanning playlists 0/{len(source_specs)}")
         documents, fetch_errors, fetch_diagnostics = fetch_playlist_documents(
             source_specs,
+            stop_requested=stop_requested,
             progress_callback=(
                 lambda done, total: progress_callback(
                     f"Scanning playlists {done}/{total}"
@@ -257,10 +267,13 @@ def acquire_active_targets(
             ),
         )
 
+    raise_if_cancelled()
+
     freshness_by_url: Dict[str, Mapping[str, object]] = {}
     freshness_now = time.time()
 
     def resolve_freshness(spec: PlaylistSourceSpec):
+        raise_if_cancelled()
         text = documents.get(spec.url)
         if text is None:
             return spec.url, None
@@ -277,6 +290,7 @@ def acquire_active_targets(
                 fetch_diagnostics.get(spec.url),
                 previous=previous_freshness,
                 now_ts=freshness_now,
+                stop_requested=stop_requested,
             ),
         )
 
@@ -289,6 +303,7 @@ def acquire_active_targets(
     ) as executor:
         futures = [executor.submit(resolve_freshness, spec) for spec in source_specs]
         for future in as_completed(futures):
+            raise_if_cancelled()
             source_url, freshness = future.result()
             if freshness is None:
                 continue
@@ -296,9 +311,12 @@ def acquire_active_targets(
             if source_freshness_registry is not None:
                 source_freshness_registry[source_url] = freshness
 
+    raise_if_cancelled()
+
     parsed_by_key: Dict[Tuple[str, str, str], Tuple[SourceCandidate, ...]] = {}
     errors: List[str] = list(fetch_errors)
     for key, spec in source_specs_by_key.items():
+        raise_if_cancelled()
         text = documents.get(spec.url)
         if text is None:
             continue
@@ -341,6 +359,7 @@ def acquire_active_targets(
 
     # First establish which identities genuinely qualify for each target.
     for view in active:
+        raise_if_cancelled()
         target = view.target
         matched_observation_keys: Set[Tuple[object, ...]] = set()
         for group in target.source_groups:
@@ -409,6 +428,7 @@ def acquire_active_targets(
     # credible metadata for that same identity has moved to another event.
     # Ambiguous ties and identities with no usable freshness remain visible.
     for target_name, candidates in raw_candidates_by_target.items():
+        raise_if_cancelled()
         eligible_identity_keys = _freshness_eligible_identity_keys(candidates)
         raw_candidates_by_target[target_name] = [
             candidate
@@ -424,18 +444,24 @@ def acquire_active_targets(
         for candidate in candidates:
             unique_by_key.setdefault(_observation_key(candidate), candidate)
     probe_pool = tuple(unique_by_key.values())
+    raise_if_cancelled()
     if progress_callback is None:
-        probed = probe_candidates(probe_pool)
+        probed = probe_candidates(
+            probe_pool,
+            stop_requested=stop_requested,
+        )
     else:
         progress_callback(f"Checking candidates 0/{len(probe_pool)}")
         probed = probe_candidates(
             probe_pool,
+            stop_requested=stop_requested,
             progress_callback=(
                 lambda done, total: progress_callback(
                     f"Checking candidates {done}/{total}"
                 )
             ),
         )
+    raise_if_cancelled()
     probed_by_key = {_observation_key(candidate): candidate for candidate in probed}
 
     final: Dict[str, Tuple[SourceCandidate, ...]] = {}

@@ -1209,6 +1209,7 @@ def inspect_manifest_probe_evidence(
     child_error_describer: Optional[Callable[[BaseException], str]] = None,
     child_error_callback: Optional[Callable[[BaseException, str], None]] = None,
     resolve_dash_resource: Optional[Callable[[Mapping[str, object]], Mapping[str, object]]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[dict, Optional[dict], dict]:
     """Inspect common HLS/DASH manifest evidence for all recorder paths.
 
@@ -1217,6 +1218,9 @@ def inspect_manifest_probe_evidence(
     routing. Callers retain transport logging/error policy and any recorder-
     specific FFprobe/SPS/idet completion that follows this shared phase.
     """
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Quality probe cancelled by stop request")
+
     evidence = {
         "quality_known": False,
         "quality_source": "",
@@ -1310,6 +1314,8 @@ def inspect_manifest_probe_evidence(
             try:
                 child_text = str(fetch_child(variant_url) or "")
             except HTTPError as error:
+                if stop_requested is not None and stop_requested():
+                    raise
                 child_error = error
                 if (
                     int(getattr(error, "code", 0) or 0) == 403
@@ -1325,8 +1331,12 @@ def inspect_manifest_probe_evidence(
                         )
                         child_error = None
                     except Exception as retry_error:
+                        if stop_requested is not None and stop_requested():
+                            raise
                         child_error = retry_error
             except Exception as error:
+                if stop_requested is not None and stop_requested():
+                    raise
                 child_error = error
                 if child_error_callback is not None:
                     child_error_callback(error, variant_url)
@@ -1388,6 +1398,8 @@ def inspect_manifest_probe_evidence(
         and manifest_quality
         and resolve_dash_resource is not None
     ):
+        if stop_requested is not None and stop_requested():
+            raise RuntimeError("Quality probe cancelled by stop request")
         resource_route = dict(
             resolve_dash_resource(manifest_quality) or {}
         )

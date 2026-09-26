@@ -214,6 +214,23 @@ class ArchitectureGuardTests(unittest.TestCase):
         )
         self.assertIn("def sample_stream_video_bitrate(", quality)
 
+    def test_coordinator_scan_uses_shared_cooperative_cancellation_contract(self):
+        coordinator=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
+        acquisition=(ROOT/"recorder_coordinator"/"acquisition.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+
+        self.assertIn('stop_event.set()', coordinator)
+        self.assertIn('command_queue.put("__CTRL_C__")', coordinator)
+        self.assertIn("stop_requested=stop_event.is_set", coordinator)
+        self.assertIn("stop_requested=stop_requested", acquisition)
+        self.assertIn("def fetch_playlist_documents(", discovery)
+        self.assertIn("def probe_candidates(", discovery)
+        self.assertIn("stop_requested=stop_requested", discovery)
+        self.assertIn("def inspect_manifest_probe_evidence(", quality)
+        self.assertIn("stop_requested=stop_requested", recorder)
+
     def test_lifecycle_scan_type_policy_has_one_shared_owner(self):
         policy=(ROOT/"recorder_source"/"policy.py").read_text(encoding="utf-8")
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
