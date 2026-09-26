@@ -61,7 +61,7 @@ from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 from recorder_runtime import sound as runtime_sound
 from recorder_runtime.identity_launch import (
     IdentityLaunchRequest,
-    target_intents_for_recovery_playlist,
+    target_match_contexts_for_recovery_playlist,
 )
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_source import discovery as source_discovery
@@ -12373,25 +12373,21 @@ def _identity_worker_match_definitions(
     if request is None:
         return None
 
-    intents = (
-        target_intents_for_recovery_playlist(
-            request.target_intents,
-            playlist_url,
-        )
-        if playlist_url is not None
-        else request.target_intents
+    contexts = target_match_contexts_for_recovery_playlist(
+        request.target_intents,
+        playlist_url or "",
     )
-    mode = get_nm3u8dl_playlist_match_mode()
+    default_mode = get_nm3u8dl_playlist_match_mode()
     return tuple(
         source_matching.make_match_definition(
-            mode=mode,
+            mode=match_mode or default_mode,
             primary=intent.primary,
             required=intent.required,
             rejected=intent.rejected,
             preferred=intent.preferred,
             match_all=intent.match_all,
         )
-        for intent in intents
+        for intent, match_mode in contexts
     )
 
 

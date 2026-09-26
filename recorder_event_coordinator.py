@@ -31,7 +31,11 @@ except ImportError:  # pragma: no cover - Windows is the production terminal
     msvcrt = None
 
 from recorder_runtime import sound as runtime_sound
-from recorder_runtime.identity_launch import FrozenTargetIntent, IdentityLaunchRequest
+from recorder_runtime.identity_launch import (
+    FrozenRecoveryScope,
+    FrozenTargetIntent,
+    IdentityLaunchRequest,
+)
 from recorder_runtime.identity_status import IdentityRuntimeStatusStore
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_runtime.sound import SoundSnoozeState
@@ -1181,6 +1185,7 @@ def _freeze_manual_recovery_scope(
 
         intent_urls: List[str] = []
         intent_seen: Set[str] = set()
+        intent_scopes: List[FrozenRecoveryScope] = []
         for group in intent.source_groups:
             context_group = _source_context_group_for_target(target, group)
             provider = str(
@@ -1188,17 +1193,35 @@ def _freeze_manual_recovery_scope(
             ).strip().upper()
             if provider != plan.identity.provider:
                 continue
+
+            group_urls: List[str] = []
+            group_seen: Set[str] = set()
             for spec in sources_for_group(
                 raw_config,
                 group,
                 context_group=context_group,
             ):
+                if spec.url not in group_seen:
+                    group_seen.add(spec.url)
+                    group_urls.append(spec.url)
                 if spec.url not in intent_seen:
                     intent_seen.add(spec.url)
                     intent_urls.append(spec.url)
                 if spec.url not in all_seen:
                     all_seen.add(spec.url)
                     all_urls.append(spec.url)
+
+            if group_urls:
+                intent_scopes.append(
+                    FrozenRecoveryScope(
+                        source_group=str(group).strip().upper(),
+                        playlist_urls=tuple(group_urls),
+                        match_mode=GROUP_MATCH_MODE.get(
+                            context_group,
+                            "EVENT_PHRASE",
+                        ),
+                    )
+                )
 
         if not intent_urls:
             raise RuntimeError(
@@ -1210,6 +1233,7 @@ def _freeze_manual_recovery_scope(
             replace(
                 intent,
                 recovery_playlist_urls=tuple(intent_urls),
+                recovery_scopes=tuple(intent_scopes),
             )
         )
 

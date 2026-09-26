@@ -5,10 +5,12 @@ import unittest
 from pathlib import Path
 
 from recorder_runtime.identity_launch import (
+    FrozenRecoveryScope,
     FrozenTargetIntent,
     IdentityLaunchRequest,
     read_launch_request,
     target_intents_for_recovery_playlist,
+    target_match_contexts_for_recovery_playlist,
     write_launch_request_temp,
 )
 from recorder_source.models import SourceCandidate
@@ -36,6 +38,13 @@ class IdentityLaunchRequestTests(unittest.TestCase):
             name="Example",
             source_groups=("SONYLIV_EVENTS",),
             recovery_playlist_urls=("https://example.test/list.m3u",),
+            recovery_scopes=(
+                FrozenRecoveryScope(
+                    source_group="SONYLIV_EVENTS",
+                    playlist_urls=("https://example.test/list.m3u",),
+                    match_mode="EVENT_PHRASE",
+                ),
+            ),
             primary=(("example", "event"),),
             required=("english",),
             worker_recording_duration_min=120.0,
@@ -81,6 +90,10 @@ class IdentityLaunchRequestTests(unittest.TestCase):
             ("https://example.test/list.m3u",),
         )
         self.assertEqual(
+            loaded.target_intents[0].recovery_scopes[0].match_mode,
+            "EVENT_PHRASE",
+        )
+        self.assertEqual(
             loaded.recovery_playlist_urls,
             ("https://example.test/list.m3u",),
         )
@@ -119,6 +132,50 @@ class IdentityLaunchRequestTests(unittest.TestCase):
                 )
             ),
             ("B",),
+        )
+
+    def test_recovery_playlist_preserves_match_mode_per_source_scope(self):
+        target = FrozenTargetIntent(
+            name="Mixed",
+            source_groups=("SONYLIV_EVENTS", "SONY_TV"),
+            recovery_playlist_urls=(
+                "https://events.test/list.m3u",
+                "https://tv.test/list.m3u",
+            ),
+            recovery_scopes=(
+                FrozenRecoveryScope(
+                    source_group="SONYLIV_EVENTS",
+                    playlist_urls=("https://events.test/list.m3u",),
+                    match_mode="EVENT_PHRASE",
+                ),
+                FrozenRecoveryScope(
+                    source_group="SONY_TV",
+                    playlist_urls=("https://tv.test/list.m3u",),
+                    match_mode="EXACT_CHANNEL",
+                ),
+            ),
+            primary=("sony sports ten 1",),
+        )
+
+        self.assertEqual(
+            [
+                (intent.name, mode)
+                for intent, mode in target_match_contexts_for_recovery_playlist(
+                    (target,),
+                    "https://events.test/list.m3u",
+                )
+            ],
+            [("Mixed", "EVENT_PHRASE")],
+        )
+        self.assertEqual(
+            [
+                (intent.name, mode)
+                for intent, mode in target_match_contexts_for_recovery_playlist(
+                    (target,),
+                    "https://tv.test/list.m3u",
+                )
+            ],
+            [("Mixed", "EXACT_CHANNEL")],
         )
 
     def test_temp_handoff_can_be_consumed_and_deleted(self):

@@ -42,12 +42,41 @@ def _json_value(value: object) -> object:
 
 
 @dataclass(frozen=True)
+class FrozenRecoveryScope:
+    """One launch-time source scope and the matching behavior used within it."""
+
+    source_group: str
+    playlist_urls: Tuple[str, ...]
+    match_mode: str
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "FrozenRecoveryScope":
+        return cls(
+            source_group=str(value.get("source_group") or "").strip().upper(),
+            playlist_urls=tuple(
+                str(item).strip()
+                for item in (value.get("playlist_urls") or ())
+                if str(item).strip()
+            ),
+            match_mode=str(value.get("match_mode") or "").strip().upper(),
+        )
+
+    def to_mapping(self) -> dict:
+        return {
+            "source_group": self.source_group,
+            "playlist_urls": list(self.playlist_urls),
+            "match_mode": self.match_mode,
+        }
+
+
+@dataclass(frozen=True)
 class FrozenTargetIntent:
     """One launch-time target/search definition retained for worker recovery."""
 
     name: str
     source_groups: Tuple[str, ...]
     recovery_playlist_urls: Tuple[str, ...] = ()
+    recovery_scopes: Tuple[FrozenRecoveryScope, ...] = ()
     primary: Tuple[object, ...] = ()
     required: Tuple[object, ...] = ()
     rejected: Tuple[object, ...] = ()
@@ -69,6 +98,11 @@ class FrozenTargetIntent:
                 for item in (value.get("recovery_playlist_urls") or ())
                 if str(item).strip()
             ),
+            recovery_scopes=tuple(
+                FrozenRecoveryScope.from_mapping(item)
+                for item in (value.get("recovery_scopes") or ())
+                if isinstance(item, Mapping)
+            ),
             primary=tuple(_freeze(item) for item in (value.get("primary") or ())),
             required=tuple(_freeze(item) for item in (value.get("required") or ())),
             rejected=tuple(_freeze(item) for item in (value.get("rejected") or ())),
@@ -86,6 +120,10 @@ class FrozenTargetIntent:
             "name": self.name,
             "source_groups": list(self.source_groups),
             "recovery_playlist_urls": list(self.recovery_playlist_urls),
+            "recovery_scopes": [
+                scope.to_mapping()
+                for scope in self.recovery_scopes
+            ],
             "primary": _json_value(self.primary),
             "required": _json_value(self.required),
             "rejected": _json_value(self.rejected),
@@ -111,6 +149,38 @@ def target_intents_for_recovery_playlist(
             or url in intent.recovery_playlist_urls
         )
     )
+
+
+def target_match_contexts_for_recovery_playlist(
+    target_intents: Sequence[FrozenTargetIntent],
+    playlist_url: str,
+) -> Tuple[Tuple[FrozenTargetIntent, str], ...]:
+    """Return frozen search + match-mode pairs valid for one recovery playlist."""
+    url = str(playlist_url or "").strip()
+    contexts = []
+
+    for intent in target_intents:
+        if intent.recovery_scopes:
+            seen_modes = set()
+            for scope in intent.recovery_scopes:
+                if url and url not in scope.playlist_urls:
+                    continue
+                if scope.match_mode in seen_modes:
+                    continue
+                seen_modes.add(scope.match_mode)
+                contexts.append((intent, scope.match_mode))
+            continue
+
+        if (
+            not url
+            or not intent.recovery_playlist_urls
+            or url in intent.recovery_playlist_urls
+        ):
+            # Compatibility for launch handoffs created before frozen
+            # per-source matching behavior was recorded.
+            contexts.append((intent, ""))
+
+    return tuple(contexts)
 
 
 @dataclass(frozen=True)

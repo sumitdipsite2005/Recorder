@@ -358,6 +358,19 @@ class ManualRecordLaunchTests(unittest.TestCase):
                 "https://tv.test/list.m3u",
             ),
         )
+        self.assertEqual(
+            {
+                intent.name: tuple(
+                    (scope.source_group, scope.match_mode)
+                    for scope in intent.recovery_scopes
+                )
+                for intent in intents
+            },
+            {
+                "Target A": (("SONYLIV_EVENTS", "EVENT_PHRASE"),),
+                "Target B": (("SONY_TV", "EXACT_CHANNEL"),),
+            },
+        )
 
 
 class TargetConfigTests(unittest.TestCase):
