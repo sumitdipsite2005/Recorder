@@ -218,6 +218,17 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertNotIn("metadata_text.split(\"&\")", recorder)
         self.assertNotIn('lower.startswith("#extvlcopt:', discovery)
 
+    def test_quality_signature_has_one_shared_owner(self):
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+        snapshot=(ROOT/"recorder_coordinator"/"snapshot.py").read_text(encoding="utf-8")
+        terminal=(ROOT/"recorder_coordinator"/"terminal.py").read_text(encoding="utf-8")
+
+        self.assertIn("def quality_signature(", quality)
+        self.assertIn("return quality_signature(candidate)", snapshot)
+        self.assertIn("return quality_signature(candidate)", terminal)
+        self.assertNotIn("round(float(candidate.video_fps", snapshot)
+        self.assertNotIn("round(float(candidate.video_fps", terminal)
+
     def test_quality_probe_identity_and_formatter_are_shared(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")

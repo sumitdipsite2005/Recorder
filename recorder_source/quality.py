@@ -76,6 +76,17 @@ def quality_probe_identity(
     return stream_url, normalized_headers, has_decryption_keys
 
 
+def quality_signature(candidate: QualityLike) -> Tuple[int, int, float, int, str]:
+    """Return the stable video-quality tuple used for grouping and change checks."""
+    return (
+        int(_quality_value(candidate, "video_width", 0) or 0),
+        int(_quality_value(candidate, "video_height", 0) or 0),
+        round(float(_quality_value(candidate, "video_fps", 0.0) or 0.0), 3),
+        int(_quality_value(candidate, "video_bitrate_bps", 0) or 0),
+        str(_quality_value(candidate, "video_scan_type", "") or ""),
+    )
+
+
 def merge_ffprobe_quality_evidence(
     current: Mapping[str, object],
     ffprobe_quality: Mapping[str, object],

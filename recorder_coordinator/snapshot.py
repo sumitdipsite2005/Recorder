@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from recorder_source.identity import derive_feed_identity
 from recorder_source.models import SourceCandidate
 from recorder_source.policy import selection_policy_for_provider
-from recorder_source.quality import format_candidate_quality
+from recorder_source.quality import format_candidate_quality, quality_signature
 from recorder_source.selection import select_join_candidate, video_quality_rank
 
 from .models import (
@@ -130,13 +130,7 @@ def candidate_state(candidate: SourceCandidate) -> str:
 def _quality_signature(candidate: Optional[SourceCandidate]) -> Tuple[object, ...]:
     if candidate is None:
         return ()
-    return (
-        int(candidate.video_width or 0),
-        int(candidate.video_height or 0),
-        round(float(candidate.video_fps or 0.0), 3),
-        int(candidate.video_bitrate_bps or 0),
-        str(candidate.video_scan_type or ""),
-    )
+    return quality_signature(candidate)
 
 
 def quality_text(

@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - non-Windows development/test hosts
 
 from recorder_runtime import sound as runtime_sound
 from recorder_runtime.sound import SoundSnoozeState
+from recorder_source.quality import quality_signature
 
 from .models import (
     ChangeEvent,
@@ -320,13 +321,7 @@ def render_header(
 def _quality_key(candidate) -> Tuple[int, int, float, int, str]:
     if candidate is None or not candidate.quality_known:
         return (0, 0, 0.0, 0, "")
-    return (
-        int(candidate.video_width or 0),
-        int(candidate.video_height or 0),
-        round(float(candidate.video_fps or 0.0), 3),
-        int(candidate.video_bitrate_bps or 0),
-        str(candidate.video_scan_type or ""),
-    )
+    return quality_signature(candidate)
 
 
 def _event_maps(events: Sequence[ChangeEvent]):

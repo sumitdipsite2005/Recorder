@@ -40,6 +40,7 @@ from recorder_source.quality import (
     parse_ffprobe_quality_output,
     probe_stream_quality_ffprobe,
     quality_probe_identity,
+    quality_signature,
 )
 from recorder_source.matching import (
     build_match_groups,
@@ -1000,6 +1001,19 @@ https://edge.drmlive.net/live.mpd
         )
         self.assertEqual(out.video_bitrate_bps, 3_456_000)
         self.assertEqual(out.video_bitrate_source, "sample")
+
+    def test_shared_quality_signature_is_stable_and_rounded(self):
+        item = candidate(
+            video_width=1920,
+            video_height=1080,
+            video_fps=25.00049,
+            video_bitrate_bps=3_523_000,
+            video_scan_type="progressive",
+        )
+        self.assertEqual(
+            quality_signature(item),
+            (1920, 1080, 25.0, 3_523_000, "progressive"),
+        )
 
     def test_shared_ffprobe_evidence_merge_fills_only_missing_facts(self):
         current = {
