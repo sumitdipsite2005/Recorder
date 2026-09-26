@@ -707,18 +707,28 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("RECORDINGS",rendered)
         recording_line=next(
             line for line in rendered.splitlines()
-            if "[RECORDING]" in line and "PID 4321" in line
+            if "[RECORDING]" in line
+            and "Asian Games | Asian Games | Sports" in line
+        )
+        identity_detail_line=next(
+            line for line in rendered.splitlines()
+            if "Identity: lane:2120305/AG_Strea2309/ENG" in line
+            and "PID 4321" in line
         )
         self.assertIn("Asian Games | Asian Games | Sports | SONYLIV | [S1]",recording_line)
         self.assertIn(
             "1920x1080 | 50p [manifest, event-policy] | 5000 Kbps",
             recording_line,
         )
-        self.assertIn("Identity: lane:2120305/AG_Strea2309/ENG",recording_line)
-        self.assertIn("Targets: T | Sources: 1 | PID 4321",recording_line)
-        self.assertNotIn("expires",recording_line)
-        self.assertNotIn("Last Updated",recording_line)
-        self.assertNotIn("Source Updated",recording_line)
+        self.assertIn("Targets: T | Sources: 1 | PID 4321",identity_detail_line)
+        self.assertEqual(
+            recording_line.index("Asian Games"),
+            identity_detail_line.index("Identity:"),
+        )
+        combined_recording = recording_line + identity_detail_line
+        self.assertNotIn("expires",combined_recording)
+        self.assertNotIn("Last Updated",combined_recording)
+        self.assertNotIn("Source Updated",combined_recording)
 
         colored=coord.render_dashboard(
             snap,
@@ -1019,7 +1029,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         )
         self.assertIn("\033[38;2;41;159;214mAsian Games\033[0m",rendered)
         self.assertIn("\033[38;2;41;159;214mHockey\033[0m",rendered)
-        self.assertIn("\033[38;2;255;135;3m[NEW]\033[0m",rendered)
+        self.assertIn("\033[1;93m[NEW]\033[0m",rendered)
 
     def test_source_reference_and_footer_share_muted_treatment_without_row_source_name(self):
         snap=snapshot([sony_candidate()])
@@ -1145,6 +1155,24 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("\033[1;92m[ON]\033[0m",selected_line)
         self.assertLess(selected_line.index("[SELECTED]"),selected_line.index("[ON]"))
         self.assertIn("not selected: lower quality",lower_line)
+
+    def test_context_only_same_feed_row_is_off_and_ignored(self):
+        context=sony_candidate(
+            playlist="https://context.test/list",
+            source_name="context-source",
+            title="Men's Marathon - Athletics - 26 Sep 2026 [ENG]",
+            tvg="",
+            ignored=True,
+            reason=(
+                "same feed identity context; source metadata is compatible "
+                "but less specific than a matching observation"
+            ),
+        )
+        rendered=coord.render_dashboard(snapshot([context]),())
+        row=next(line for line in rendered.splitlines() if "Men's Marathon" in line)
+        self.assertIn("[OFF] IGNORED —",row)
+        self.assertIn("same feed identity context",row)
+        self.assertNotIn("[ON]",row)
 
     def test_unavailable_expiry_classification_is_front_loaded(self):
         expiry=datetime(2026,9,24,9,30,0).timestamp()
