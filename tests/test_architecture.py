@@ -176,6 +176,16 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("parse_dash_manifest_quality(", discovery)
         self.assertNotIn("def _parse_dash_quality(", discovery)
 
+    def test_playlist_header_parsing_algorithm_has_one_shared_owner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        shared=(ROOT/"recorder_source"/"playlist_headers.py").read_text(encoding="utf-8")
+        self.assertIn("def parse_stream_url_and_headers(", shared)
+        self.assertIn("source_playlist_headers.parse_stream_url_and_headers(", recorder)
+        self.assertIn("parse_stream_url_and_headers(", discovery)
+        self.assertNotIn("metadata_text.split(\"&\")", recorder)
+        self.assertNotIn('lower.startswith("#extvlcopt:', discovery)
+
     def test_quality_probe_identity_and_formatter_are_shared(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
