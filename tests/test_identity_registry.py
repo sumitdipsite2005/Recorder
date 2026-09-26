@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 import tempfile
 import unittest
 
@@ -10,9 +11,10 @@ from recorder_coordinator.registry import (
     IdentityRegistryStore,
     InvalidRegistryTransition,
     RegistryError,
-    STATE_ACTIVE,
+    STATE_RECORDING,
     STATE_CRASHED,
     STATE_LAUNCHING,
+    STATE_RECORDING,
 )
 from recorder_runtime.paths import build_recorder_output_paths
 
@@ -81,7 +83,7 @@ class IdentityRegistryTests(unittest.TestCase):
             )
             store.transition(
                 identity_key="sony|lane-a|english",
-                new_state=STATE_ACTIVE,
+                new_state=STATE_RECORDING,
                 worker_pid=12345,
                 now=FIXED_TIME,
             )
@@ -128,7 +130,7 @@ class IdentityRegistryTests(unittest.TestCase):
             )
             store.transition(
                 identity_key="sony|lane-a|english",
-                new_state=STATE_ACTIVE,
+                new_state=STATE_RECORDING,
                 worker_pid=12345,
                 now=FIXED_TIME,
             )
@@ -184,7 +186,7 @@ class IdentityRegistryTests(unittest.TestCase):
             with self.assertRaises(RegistryError):
                 store.transition(
                     identity_key="sony|lane-a|english",
-                    new_state=STATE_ACTIVE,
+                    new_state=STATE_RECORDING,
                     worker_pid=12345,
                     expected_session_id="stale-session",
                     now=FIXED_TIME,
@@ -209,11 +211,77 @@ class IdentityRegistryTests(unittest.TestCase):
             with self.assertRaises(InvalidRegistryTransition):
                 store.transition(
                     identity_key="sony|lane-a|english",
-                    new_state=STATE_ACTIVE,
+                    new_state=STATE_RECORDING,
                     worker_pid=12345,
                     now=FIXED_TIME,
                 )
 
+
+    def test_legacy_active_registry_migrates_to_recording(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self.make_store(td)
+            status = store.prepare_session(now=FIXED_TIME)
+            store.claim(
+                identity_key="sony|lane-a|english",
+                provider="SONY",
+                display_name="Lane A",
+                expected_session_id=status.session_id,
+                now=FIXED_TIME,
+            )
+            store.bind_worker_pid(
+                identity_key="sony|lane-a|english",
+                worker_pid=12345,
+                expected_session_id=status.session_id,
+                now=FIXED_TIME,
+            )
+            store.transition(
+                identity_key="sony|lane-a|english",
+                new_state=STATE_RECORDING,
+                worker_pid=12345,
+                expected_session_id=status.session_id,
+                now=FIXED_TIME,
+            )
+
+            data = store.read()
+            data["schema_version"] = 1
+            data["entries"]["sony|lane-a|english"]["state"] = "ACTIVE"
+            store.paths.current.write_text(
+                json.dumps(data),
+                encoding="utf-8",
+            )
+
+            continued = store.prepare_session(
+                worker_liveness=lambda pid: pid == 12345,
+                now=FIXED_TIME,
+            )
+
+            self.assertEqual(continued.action, "CONTINUED")
+            migrated = json.loads(store.paths.current.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["schema_version"], 2)
+            self.assertEqual(
+                migrated["entries"]["sony|lane-a|english"]["state"],
+                STATE_RECORDING,
+            )
+
+    def test_bind_worker_pid_keeps_launching_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self.make_store(td)
+            status = store.prepare_session(now=FIXED_TIME)
+            store.claim(
+                identity_key="sony|lane-a|english",
+                provider="SONY",
+                display_name="Lane A",
+                expected_session_id=status.session_id,
+                now=FIXED_TIME,
+            )
+            entry = store.bind_worker_pid(
+                identity_key="sony|lane-a|english",
+                worker_pid=12345,
+                expected_session_id=status.session_id,
+                now=FIXED_TIME,
+            )
+            self.assertEqual(entry["state"], STATE_LAUNCHING)
+            self.assertEqual(entry["worker_pid"], 12345)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
