@@ -4,10 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from recorder_coordinator.registry import (
-    IdentityRegistryStore,
-    STATE_ACTIVE,
-)
+from recorder_coordinator.registry import IdentityRegistryStore
 from recorder_coordinator.worker import launch_identity_worker
 from recorder_runtime.identity_launch import (
     FrozenTargetIntent,
@@ -70,9 +67,8 @@ class WorkerLaunchTests(unittest.TestCase):
                 captured["title"] = title
                 captured["cwd"] = cwd
                 captured["post_exit_cwd"] = post_exit_cwd
-                store.transition(
+                store.bind_worker_pid(
                     identity_key=request.identity_key,
-                    new_state=STATE_ACTIVE,
                     worker_pid=4321,
                     reason="test worker started",
                     expected_session_id=request.registry_session_id,
