@@ -91,6 +91,30 @@ PROVIDER_ADDED_HEADERS = {
     },
 }
 
+VPN_ROUTE_SUSPECTED_403_GROUPS = frozenset({
+    "FANCODE",
+    "JIO_STAR_SPORTS",
+})
+VPN_ROUTE_SUSPECTED_403_PROVIDERS = frozenset({
+    "FANCODE",
+    "JIO",
+})
+
+
+def is_vpn_route_suspected_403(
+    *,
+    source_group: object = "",
+    provider: object = "",
+) -> bool:
+    """Return whether HTTP 403 is an actionable route/VPN signal for this lane."""
+    group = str(source_group or "").strip().upper()
+    provider_name = str(provider or "").strip().upper()
+    return (
+        group in VPN_ROUTE_SUSPECTED_403_GROUPS
+        or provider_name in VPN_ROUTE_SUSPECTED_403_PROVIDERS
+    )
+
+
 DEFAULT_SELECTION_POLICY = SelectionPolicy(
     mandatory_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
     upgrade_min_remaining_sec=DEFAULT_MANDATORY_MIN_REMAINING_SEC,
