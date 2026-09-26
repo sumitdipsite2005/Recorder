@@ -785,8 +785,16 @@ def render_dashboard(
                     reverse=True,
                 )
                 representative = rows[0][1]
-                quality_label = quality_text(
-                    representative if representative.quality_known else None
+                has_working_candidate = any(
+                    candidate_state(candidate) == "WORKING"
+                    for _, candidate in rows
+                )
+                quality_label = (
+                    quality_text(representative)
+                    if representative.quality_known
+                    else "unknown"
+                    if has_working_candidate
+                    else "no working candidate"
                 )
                 suffix: List[str] = []
                 if block.best_candidate is not None and quality_key == best_key:

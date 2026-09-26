@@ -30,9 +30,10 @@ from .quality import (
     inspect_hls_manifest_drm,
     parse_dash_manifest_quality,
     parse_hls_manifest_quality,
+    QUALITY_FFPROBE_TIMEOUT_SEC,
+    QUALITY_PROBE_WORKERS,
     probe_stream_quality_ffprobe,
     quality_probe_identity,
-    sample_stream_video_bitrate,
 )
 from .policy import (
     PLAYLIST_GROUP_LIFECYCLES,
@@ -1197,6 +1198,7 @@ def probe_candidate_hls(
             video_scan_type_source = "event-policy"
 
         ffprobe_failure = ""
+        bitrate_sample_failure = ""
         manifest_complete = bool(
             fps > 0
             and width > 0
@@ -1216,7 +1218,7 @@ def probe_candidate_hls(
                 ffprobe_quality = probe_stream_quality_ffprobe(
                     probe_stream_url,
                     headers,
-                    timeout_sec=min(20.0, max(1.0, float(timeout_value))),
+                    timeout_sec=QUALITY_FFPROBE_TIMEOUT_SEC,
                     target_quality={
                         "video_width": width,
                         "video_height": height,
@@ -1224,8 +1226,12 @@ def probe_candidate_hls(
                     },
                     motion_cap_fps=50.0,
                     decryption_key=decryption_key,
+                    sample_missing_bitrate=(bitrate <= 0),
                 )
                 if ffprobe_quality:
+                    bitrate_sample_failure = str(
+                        ffprobe_quality.get("_bitrate_sample_failure") or ""
+                    )
                     ffprobe_fps = float(ffprobe_quality.get("video_fps") or 0.0)
                     if fps <= 0 and ffprobe_fps > 0:
                         fps = ffprobe_fps
@@ -1268,38 +1274,19 @@ def probe_candidate_hls(
                         or (width > 0 and height > 0)
                         or bitrate > 0
                     )
+                    ffprobe_quality_source = (
+                        "ffprobe+sample"
+                        if str(ffprobe_quality.get("video_bitrate_source") or "")
+                        == "sample"
+                        else "ffprobe"
+                    )
                     quality_source = (
-                        "manifest+ffprobe" if quality_source else "ffprobe"
+                        f"{quality_source}+{ffprobe_quality_source}"
+                        if quality_source
+                        else ffprobe_quality_source
                     )
             except Exception as error:
                 ffprobe_failure = f"{type(error).__name__}: {error}"
-
-        bitrate_sample_failure = ""
-        if probe_transport_launchable and bitrate <= 0:
-            try:
-                sample_url = (
-                    str(hls_quality.get("manifest_variant_url") or "").strip()
-                    if is_hls and hls_quality
-                    else ""
-                ) or final_url or candidate.stream_url
-                sampled_bitrate = sample_stream_video_bitrate(
-                    sample_url,
-                    headers,
-                    sample_sec=4.0,
-                    timeout_sec=12.0,
-                    decryption_key=decryption_key,
-                )
-                if sampled_bitrate > 0:
-                    bitrate = sampled_bitrate
-                    video_bitrate_source = "sample"
-                    quality_known = True
-                    quality_source = (
-                        quality_source + "+sample"
-                        if quality_source
-                        else "sample"
-                    )
-            except Exception as error:
-                bitrate_sample_failure = f"{type(error).__name__}: {error}"
 
         probe_status = (
             "expired"
@@ -1503,7 +1490,7 @@ def probe_candidates(
     candidates: Sequence[SourceCandidate],
     *,
     timeout_sec: Optional[float] = None,
-    max_workers: int = 8,
+    max_workers: int = QUALITY_PROBE_WORKERS,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[SourceCandidate, ...]:
     """Probe each effective stream once and reuse that result across observations."""

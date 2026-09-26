@@ -389,7 +389,7 @@ NM3U8DL_PLAYLIST_ACCESS_CHECK_INTERVAL_SEC = 30
 NM3U8DL_PLAYLIST_FETCH_WORKERS = 8
 
 # Dynamic source quality inspection
-NM3U8DL_QUALITY_PROBE_WORKERS = 6
+NM3U8DL_QUALITY_PROBE_WORKERS = source_quality.QUALITY_PROBE_WORKERS
 NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC = source_transport.QUALITY_HTTP_TIMEOUT_SEC
 NM3U8DL_QUALITY_HTTP_MAX_ATTEMPTS = source_transport.QUALITY_HTTP_MAX_ATTEMPTS
 NM3U8DL_QUALITY_HTTP_RETRY_BASE_SEC = source_transport.QUALITY_HTTP_RETRY_BASE_SEC
@@ -397,9 +397,9 @@ NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC = source_transport.QUALITY_HTTP_RETRY_MAX_SEC
 NM3U8DL_QUALITY_HTTP_RETRYABLE_STATUS_CODES = (
     source_transport.QUALITY_HTTP_RETRYABLE_STATUS_CODES
 )
-NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC = 20
-NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC = 4
-NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC = 12
+NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC = source_quality.QUALITY_FFPROBE_TIMEOUT_SEC
+NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC = source_quality.QUALITY_BITRATE_SAMPLE_SEC
+NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC = source_quality.QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC
 
 # DASH P/I detection follows: MPD scanType -> H.264 SPS -> H.264 picture/field
 # structure -> idet. FFprobe is deliberately not part of P/I detection.
@@ -8684,12 +8684,6 @@ def _ffprobe_nm3u8dl_stream_quality(
     decryption_key: str = "",
     target_quality: Optional[dict] = None,
 ) -> Optional[dict]:
-    command = source_quality.build_ffprobe_quality_command(
-        stream_url,
-        headers,
-        decryption_key=decryption_key,
-    )
-
     parsed_url = urlparse(stream_url)
     probe_identity = (
         parsed_url.netloc + parsed_url.path
@@ -8697,49 +8691,40 @@ def _ffprobe_nm3u8dl_stream_quality(
         else "candidate stream"
     )
     timeout_identity = str(timeout_route or probe_identity).strip()
-    result = _run_nm3u8dl_external_capture_redacted(
-        command,
-        raw_tool="ffprobe",
-        raw_context=f"candidate quality probe | {timeout_identity}",
-        timeout=NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC,
-        secret_values=(decryption_key,),
-    )
 
-    stdout = (result.stdout or "").strip()
-    if not stdout:
-        raise RuntimeError(_summarize_nm3u8dl_ffprobe_failure(result))
-
-    try:
-        best_quality = source_quality.parse_ffprobe_quality_output(
-            stdout,
-            target_quality=target_quality,
-            motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+    def ffprobe_runner(command, timeout):
+        return _run_nm3u8dl_external_capture_redacted(
+            command,
+            raw_tool="ffprobe",
+            raw_context=f"candidate quality probe | {timeout_identity}",
+            timeout=timeout,
+            secret_values=(decryption_key,),
         )
-    except Exception as error:
-        raise RuntimeError(
-            f"ffprobe quality output could not be parsed ({type(error).__name__}: {error})"
-        ) from error
 
-    if not best_quality:
-        raise RuntimeError(_summarize_nm3u8dl_ffprobe_failure(result))
-
-    if (
-        sample_missing_bitrate
-        and int(best_quality.get("video_bitrate_bps") or 0) <= 0
-    ):
-        sampled_bitrate = _sample_nm3u8dl_stream_video_bitrate(
+    def bitrate_sample(stream_index: int) -> int:
+        return _sample_nm3u8dl_stream_video_bitrate(
             stream_url,
             headers,
             timeout_route=timeout_identity,
             decryption_key=decryption_key,
-            stream_index=int(best_quality.get("_ffprobe_stream_index") or 0),
+            stream_index=stream_index,
         )
-        if sampled_bitrate > 0:
-            best_quality["video_bitrate_bps"] = sampled_bitrate
-            best_quality["video_bitrate_source"] = "sample"
-            best_quality["quality_known"] = True
 
-    return best_quality
+    return source_quality.probe_stream_quality_ffprobe(
+        stream_url,
+        headers,
+        timeout_sec=NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC,
+        target_quality=target_quality,
+        motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+        decryption_key=decryption_key,
+        sample_missing_bitrate=sample_missing_bitrate,
+        bitrate_sample_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC,
+        bitrate_sample_timeout_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC,
+        bitrate_sample_callback=(bitrate_sample if sample_missing_bitrate else None),
+        failure_describer=_summarize_nm3u8dl_ffprobe_failure,
+        runner=ffprobe_runner,
+    )
+
 
 def _probe_nm3u8dl_candidate_quality(
     candidate: dict,

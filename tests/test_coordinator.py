@@ -757,6 +757,27 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("SOURCE REFERENCES", rendered)
         self.assertIn("[S1] https://src1.test/list.m3u", rendered)
 
+    def test_dashboard_does_not_call_working_unknown_quality_no_working_candidate(self):
+        item = replace(
+            sony_candidate(),
+            quality_known=False,
+            video_width=0,
+            video_height=0,
+            video_fps=0.0,
+            video_bitrate_bps=0,
+            video_scan_type="",
+            extra={
+                "provider": "FANCODE",
+                "source_name": "fancode",
+                "source_group": "FANCODE",
+            },
+        )
+        rendered = coord.render_dashboard(snapshot([item]), ())
+        self.assertIn("AVAILABLE FANCODE", rendered)
+        self.assertIn("Quality : unknown", rendered)
+        self.assertIn("[ON] Asian Games", rendered)
+        self.assertNotIn("Quality : no working candidate", rendered)
+
     def test_dashboard_overlays_recording_state_and_rich_recordings_summary(self):
         item=replace(
             sony_candidate(),

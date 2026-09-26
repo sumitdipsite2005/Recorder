@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError
 
@@ -26,7 +27,9 @@ from recorder_source.quality import (
     format_candidate_quality,
     inspect_dash_manifest_drm,
     parse_dash_manifest_quality,
+    QUALITY_FFPROBE_TIMEOUT_SEC,
     parse_ffprobe_quality_output,
+    probe_stream_quality_ffprobe,
     quality_probe_identity,
 )
 from recorder_source.matching import (
@@ -821,7 +824,78 @@ https://edge.drmlive.net/live.mpd
             "https://final.test/video.m3u8",
         )
 
-    def test_probe_hls_samples_bitrate_when_manifest_and_ffprobe_lack_it(self):
+    def test_shared_ffprobe_completion_samples_selected_stream_when_bitrate_missing(self):
+        stdout = json.dumps({
+            "streams": [{
+                "index": 3,
+                "codec_name": "h264",
+                "width": 1920,
+                "height": 1080,
+                "avg_frame_rate": "25/1",
+                "r_frame_rate": "25/1",
+                "bit_rate": "0",
+                "field_order": "progressive",
+            }],
+            "format": {"bit_rate": "0"},
+        })
+        sampled_streams = []
+
+        def runner(args, timeout):
+            return SimpleNamespace(returncode=1, stdout=stdout, stderr="late warning")
+
+        def sample_bitrate(stream_index):
+            sampled_streams.append(stream_index)
+            return 3_456_000
+
+        quality = probe_stream_quality_ffprobe(
+            "https://final.test/video.m3u8",
+            {"Referer": "https://example.test/"},
+            sample_missing_bitrate=True,
+            bitrate_sample_callback=sample_bitrate,
+            runner=runner,
+        )
+
+        self.assertEqual(sampled_streams, [3])
+        self.assertEqual(quality["video_bitrate_bps"], 3_456_000)
+        self.assertEqual(quality["video_bitrate_source"], "sample")
+        self.assertTrue(quality["quality_known"])
+
+    def test_shared_ffprobe_completion_keeps_ffprobe_quality_if_bitrate_sample_fails(self):
+        stdout = json.dumps({
+            "streams": [{
+                "index": 1,
+                "codec_name": "h264",
+                "width": 1920,
+                "height": 1080,
+                "avg_frame_rate": "25/1",
+                "r_frame_rate": "25/1",
+                "bit_rate": "0",
+                "field_order": "progressive",
+            }],
+            "format": {"bit_rate": "0"},
+        })
+
+        def fail_sample(stream_index):
+            raise TimeoutError("sample timeout")
+
+        quality = probe_stream_quality_ffprobe(
+            "https://final.test/video.m3u8",
+            {},
+            sample_missing_bitrate=True,
+            bitrate_sample_callback=fail_sample,
+            runner=lambda args, timeout: SimpleNamespace(
+                returncode=0,
+                stdout=stdout,
+                stderr="",
+            ),
+        )
+
+        self.assertEqual((quality["video_width"], quality["video_height"]), (1920, 1080))
+        self.assertEqual(quality["video_fps"], 25.0)
+        self.assertEqual(quality["video_bitrate_bps"], 0)
+        self.assertIn("sample timeout", quality["_bitrate_sample_failure"])
+
+    def test_probe_hls_uses_shared_ffprobe_completion_when_bitrate_missing(self):
         body = b'''#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1920x1080,FRAME-RATE=25\nvideo.m3u8\n'''
         class Headers:
             def get(self, name, default=None):
@@ -843,25 +917,27 @@ https://edge.drmlive.net/live.mpd
             "video_width": 1920,
             "video_height": 1080,
             "video_fps": 25.0,
-            "video_bitrate_bps": 0,
+            "video_bitrate_bps": 3_456_000,
+            "video_bitrate_source": "sample",
             "video_scan_type": "progressive",
         }
         with patch("recorder_source.discovery.urlopen", return_value=Response()), patch(
             "recorder_source.discovery.probe_stream_quality_ffprobe",
             return_value=ffprobe,
-        ), patch(
-            "recorder_source.discovery.sample_stream_video_bitrate",
-            return_value=3_456_000,
-        ) as sampler:
+        ) as probe:
             out = probe_candidate_hls(
                 candidate(
                     stream_url="https://src.test/master.m3u8",
                     extra={"provider":"FANCODE"},
                 )
             )
-        sampler.assert_called_once()
-        self.assertEqual(out.video_bitrate_bps,3_456_000)
-        self.assertEqual(out.video_bitrate_source,"sample")
+        self.assertTrue(probe.call_args.kwargs["sample_missing_bitrate"])
+        self.assertEqual(
+            probe.call_args.kwargs["timeout_sec"],
+            QUALITY_FFPROBE_TIMEOUT_SEC,
+        )
+        self.assertEqual(out.video_bitrate_bps, 3_456_000)
+        self.assertEqual(out.video_bitrate_source, "sample")
 
     def test_shared_quality_formatter_preserves_value_evidence(self):
         item = candidate(

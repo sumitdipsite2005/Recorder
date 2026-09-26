@@ -130,6 +130,29 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("source_quality.format_candidate_quality(",recorder)
         self.assertIn("format_candidate_quality(",snapshot)
 
+    def test_quality_probe_completion_and_concurrency_have_one_shared_owner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+
+        self.assertIn("source_quality.probe_stream_quality_ffprobe(", recorder)
+        self.assertIn("probe_stream_quality_ffprobe(", discovery)
+        self.assertIn("sample_missing_bitrate=(bitrate <= 0)", discovery)
+        self.assertIn("timeout_sec=QUALITY_FFPROBE_TIMEOUT_SEC", discovery)
+        self.assertNotIn("sample_stream_video_bitrate(", discovery)
+        self.assertNotIn("source_quality.parse_ffprobe_quality_output(", recorder)
+        self.assertIn(
+            "NM3U8DL_QUALITY_PROBE_WORKERS = source_quality.QUALITY_PROBE_WORKERS",
+            recorder,
+        )
+        self.assertIn(
+            "NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC = source_quality.QUALITY_FFPROBE_TIMEOUT_SEC",
+            recorder,
+        )
+        self.assertIn("max_workers: int = QUALITY_PROBE_WORKERS", discovery)
+        self.assertIn("QUALITY_PROBE_WORKERS = 6", quality)
+        self.assertIn("QUALITY_FFPROBE_TIMEOUT_SEC = 20.0", quality)
+
     def test_mature_recorder_consumes_shared_policy(self):
         text=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         self.assertIn("from recorder_source.policy import",text)

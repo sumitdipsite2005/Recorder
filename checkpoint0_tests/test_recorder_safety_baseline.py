@@ -490,6 +490,68 @@ https://example.test/rejected.m3u8
         )
         self.assertEqual(mature, shared)
 
+    def test_mature_and_shared_ffprobe_bitrate_completion_are_identical(self):
+        stdout = json.dumps({
+            "streams": [{
+                "index": 2,
+                "codec_name": "h264",
+                "width": 1920,
+                "height": 1080,
+                "avg_frame_rate": "25/1",
+                "r_frame_rate": "25/1",
+                "bit_rate": "0",
+                "field_order": "progressive",
+            }],
+            "format": {"bit_rate": "0"},
+        })
+        result = SimpleNamespace(returncode=1, stdout=stdout, stderr="late warning")
+        shared_sampled_streams = []
+
+        shared = shared_quality.probe_stream_quality_ffprobe(
+            "https://cdn.test/live/video.m3u8",
+            {"Referer": "https://www.fancode.com/"},
+            sample_missing_bitrate=True,
+            bitrate_sample_callback=lambda stream_index: (
+                shared_sampled_streams.append(stream_index) or 3_523_000
+            ),
+            runner=lambda args, timeout: result,
+        )
+
+        with patch.object(
+            RECORDER,
+            "_run_nm3u8dl_external_capture_redacted",
+            return_value=result,
+        ), patch.object(
+            RECORDER,
+            "_sample_nm3u8dl_stream_video_bitrate",
+            return_value=3_523_000,
+        ) as mature_sampler:
+            mature = RECORDER._ffprobe_nm3u8dl_stream_quality(
+                "https://cdn.test/live/video.m3u8",
+                {"Referer": "https://www.fancode.com/"},
+                sample_missing_bitrate=True,
+            )
+
+        keys = (
+            "quality_known",
+            "video_width",
+            "video_height",
+            "video_fps",
+            "video_scan_type",
+            "video_bitrate_bps",
+            "video_bitrate_source",
+            "_ffprobe_stream_index",
+        )
+        self.assertEqual(
+            {key: mature.get(key) for key in keys},
+            {key: shared.get(key) for key in keys},
+        )
+        self.assertEqual(shared_sampled_streams, [2])
+        self.assertEqual(
+            mature_sampler.call_args.kwargs["stream_index"],
+            2,
+        )
+
     def test_mature_access_classification_uses_shared_rule(self):
         RECORDER.NM3U8DL_PLAYLIST_GROUP = "FANCODE"
         error = HTTPError("https://x", 403, "Forbidden", {}, None)

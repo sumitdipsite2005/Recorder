@@ -29,6 +29,11 @@ from .selection import (
 
 QualityLike = Union[Mapping[str, object], SourceCandidate]
 
+QUALITY_PROBE_WORKERS = 6
+QUALITY_FFPROBE_TIMEOUT_SEC = 20.0
+QUALITY_BITRATE_SAMPLE_SEC = 4.0
+QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC = 12.0
+
 
 def _quality_value(candidate: QualityLike, name: str, default: object = "") -> object:
     if isinstance(candidate, SourceCandidate):
@@ -1135,12 +1140,18 @@ def probe_stream_quality_ffprobe(
     stream_url: str,
     headers: Mapping[str, str],
     *,
-    timeout_sec: float = 20.0,
+    timeout_sec: float = QUALITY_FFPROBE_TIMEOUT_SEC,
     target_quality: Optional[Mapping[str, object]] = None,
     motion_cap_fps: float = 50.0,
     decryption_key: str = "",
+    sample_missing_bitrate: bool = False,
+    bitrate_sample_sec: float = QUALITY_BITRATE_SAMPLE_SEC,
+    bitrate_sample_timeout_sec: float = QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC,
+    bitrate_sample_callback: Optional[Callable[[int], int]] = None,
+    failure_describer: Optional[Callable[[object], str]] = None,
     runner: Optional[Callable[[Sequence[str], float], object]] = None,
 ) -> Optional[dict]:
+    """Probe video quality and complete a missing bitrate through one shared rule."""
     command = build_ffprobe_quality_command(
         stream_url,
         headers,
@@ -1163,20 +1174,69 @@ def probe_stream_quality_ffprobe(
     result = runner(command, float(timeout_sec))
     stdout = str(getattr(result, "stdout", "") or "").strip()
     returncode = int(getattr(result, "returncode", 0) or 0)
-    if returncode != 0 or not stdout:
-        stderr = str(getattr(result, "stderr", "") or "").strip()
-        detail = stderr or (
-            f"ffprobe exited with code {returncode}"
-            if returncode
-            else "ffprobe returned no video stream information"
+    # Preserve mature behavior: usable video facts in stdout remain usable even
+    # if ffprobe exits non-zero after emitting them.
+    if not stdout:
+        detail = (
+            str(failure_describer(result) or "").strip()
+            if failure_describer is not None
+            else str(getattr(result, "stderr", "") or "").strip()
         )
+        if not detail:
+            detail = (
+                f"ffprobe exited with code {returncode}"
+                if returncode
+                else "ffprobe returned no video stream information"
+            )
         raise RuntimeError(detail)
 
-    return parse_ffprobe_quality_output(
-        stdout,
-        target_quality=target_quality,
-        motion_cap_fps=motion_cap_fps,
-    )
+    try:
+        best_quality = parse_ffprobe_quality_output(
+            stdout,
+            target_quality=target_quality,
+            motion_cap_fps=motion_cap_fps,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"ffprobe quality output could not be parsed ({type(error).__name__}: {error})"
+        ) from error
+
+    if not best_quality:
+        detail = (
+            str(failure_describer(result) or "").strip()
+            if failure_describer is not None
+            else ""
+        )
+        raise RuntimeError(detail or "ffprobe returned no video stream information")
+
+    if (
+        sample_missing_bitrate
+        and int(best_quality.get("video_bitrate_bps") or 0) <= 0
+    ):
+        stream_index = int(best_quality.get("_ffprobe_stream_index") or 0)
+        try:
+            if bitrate_sample_callback is not None:
+                sampled_bitrate = int(bitrate_sample_callback(stream_index) or 0)
+            else:
+                sampled_bitrate = sample_stream_video_bitrate(
+                    stream_url,
+                    headers,
+                    sample_sec=bitrate_sample_sec,
+                    timeout_sec=bitrate_sample_timeout_sec,
+                    decryption_key=decryption_key,
+                    stream_index=stream_index,
+                )
+        except Exception as error:
+            best_quality["_bitrate_sample_failure"] = (
+                f"{type(error).__name__}: {error}"
+            )
+        else:
+            if sampled_bitrate > 0:
+                best_quality["video_bitrate_bps"] = sampled_bitrate
+                best_quality["video_bitrate_source"] = "sample"
+                best_quality["quality_known"] = True
+
+    return best_quality
 
 
 def build_ffmpeg_bitrate_sample_command(
