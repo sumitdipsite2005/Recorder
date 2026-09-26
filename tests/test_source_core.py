@@ -959,7 +959,7 @@ https://edge.drmlive.net/live.mpd
             "https://final.test/video.m3u8",
         )
 
-    def test_persisted_quality_same_fingerprint_skips_repeat_deep_probe(self):
+    def test_persisted_quality_same_media_path_skips_repeat_deep_probe_across_session_refresh(self):
         master = b'''#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=3322000,RESOLUTION=1920x1080
 video.m3u8
@@ -976,26 +976,38 @@ seg.ts
 
         class Response:
             headers = Headers()
+
             def __init__(self, body, final_url):
                 self.body = body
                 self.final_url = final_url
                 self.done = False
-            def __enter__(self): return self
-            def __exit__(self, *args): return False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
             def read(self, n=-1):
                 if self.done:
                     return b""
                 self.done = True
                 return self.body
+
             def geturl(self):
                 return self.final_url
 
-        final_master = {"url": "https://final.test/master.m3u8"}
+        final_master = {
+            "url": "https://final-a.test/live/master.m3u8?token=one"
+        }
 
         def fake_urlopen(request, timeout=0):
             url = request.full_url
-            if url.endswith("/video.m3u8"):
-                return Response(child, "https://final.test/video.m3u8")
+            if "/video.m3u8" in url:
+                return Response(
+                    child,
+                    "https://final-a.test/live/video.m3u8?token=child",
+                )
             return Response(master, final_master["url"])
 
         ffprobe = {
@@ -1009,8 +1021,8 @@ seg.ts
         }
         registry = {}
         item = candidate(
-            stream_url="https://src.test/master.m3u8",
-            extra={"provider": "FANCODE", "source_group": "FANCODE"},
+            stream_url="https://source.test/live/master.m3u8?token=source",
+            extra={"provider": "CUSTOM", "source_group": "COMMON"},
         )
 
         with patch(
@@ -1034,20 +1046,21 @@ seg.ts
             self.assertEqual(second.video_fps_source, "ffprobe")
             self.assertEqual(second.video_bitrate_bps, 3322000)
             self.assertEqual(len(registry), 1)
-            self.assertIn(first.playback_fingerprint, registry)
 
-            final_master["url"] = "https://final.test/new-session.m3u8"
+            final_master["url"] = (
+                "https://final-b.test/live/master.m3u8?token=two"
+            )
             third = probe_candidate_hls(
                 item,
                 quality_evidence_registry=registry,
             )
 
-        self.assertEqual(deep_probe.call_count, 2)
+        self.assertEqual(deep_probe.call_count, 1)
         self.assertNotEqual(
             first.playback_fingerprint,
             third.playback_fingerprint,
         )
-        self.assertEqual(len(registry), 2)
+        self.assertEqual(len(registry), 1)
 
     def test_persisted_quality_merge_never_overwrites_fresh_known_values(self):
         persisted = {
