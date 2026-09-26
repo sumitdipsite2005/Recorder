@@ -527,6 +527,143 @@ https://example.test/rejected.m3u8
         )
         self.assertFalse(unrelated.get("failover_excluded", False))
 
+    def test_literal_ip_failure_excludes_all_same_ip_candidates(self):
+        state = RECORDER.RecorderState()
+        failed_ip = "103.211.103.215"
+        headers = {"User-Agent": "test"}
+
+        failed_source = {
+            "stream_url": "http://mag.diamondtv.one/live/a/302025.m3u8",
+            "manifest_final_url": (
+                f"http://{failed_ip}:61980/live/play/token-a/302025"
+            ),
+            "manifest_reachable": True,
+            "headers": dict(headers),
+            "effective_headers": dict(headers),
+            "stream_type": "HLS",
+        }
+
+        with patch.object(RECORDER, "log"):
+            RECORDER._nm3u8dl_set_running_stream_identity(
+                state,
+                failed_source,
+            )
+            self.assertEqual(
+                RECORDER._nm3u8dl_handle_playlist_stream_failure(
+                    state,
+                    "NO_FILE_APPEAR",
+                ),
+                "retry",
+            )
+            self.assertEqual(
+                RECORDER._nm3u8dl_handle_playlist_stream_failure(
+                    state,
+                    "NO_FILE_APPEAR",
+                ),
+                "rescan",
+            )
+
+        self.assertIn(failed_ip, state.nm3u8dl_bad_stream_ips)
+
+        same_ip_candidates = [
+            {
+                "stream_url": "http://wrapper-one.test/live/channel.m3u8",
+                "manifest_final_url": (
+                    f"http://{failed_ip}:61980/live/play/token-b/302025"
+                ),
+                "headers": {},
+                "effective_headers": {},
+            },
+            {
+                "stream_url": "http://wrapper-two.test/live/channel.m3u8",
+                "selected_media_final_url": (
+                    f"http://{failed_ip}:61980/live/play/token-c/302025"
+                ),
+                "manifest_final_url": "http://wrapper-two.test/final.m3u8",
+                "headers": {},
+                "effective_headers": {},
+            },
+            {
+                "stream_url": (
+                    f"http://{failed_ip}:61980/live/play/token-d/302025"
+                ),
+                "headers": {},
+                "effective_headers": {},
+            },
+        ]
+        other_ip = {
+            "stream_url": "http://wrapper-three.test/live/channel.m3u8",
+            "manifest_final_url": (
+                "http://103.211.103.216:61980/live/play/token-e/302025"
+            ),
+            "headers": {},
+            "effective_headers": {},
+        }
+
+        RECORDER._nm3u8dl_mark_bad_fingerprint_candidates(
+            state,
+            same_ip_candidates + [other_ip],
+        )
+
+        for candidate in same_ip_candidates:
+            self.assertTrue(candidate["failover_excluded"])
+            self.assertIn(
+                failed_ip,
+                candidate["failover_exclusion_reason"],
+            )
+        self.assertFalse(other_ip.get("failover_excluded", False))
+
+        fresh_wrapper = {
+            "stream_url": "http://new-wrapper.test/live/channel.m3u8",
+            "playlist_url": "https://example.test/pocket.m3u",
+            "headers": {},
+            "keys": [],
+        }
+        redirected_final = (
+            f"http://{failed_ip}:61980/live/play/token-f/302025"
+        )
+
+        with patch.object(
+            RECORDER,
+            "_fetch_nm3u8dl_stream_manifest_text",
+            return_value=(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:6\n",
+                redirected_final,
+            ),
+        ), patch.object(
+            RECORDER.source_quality,
+            "inspect_manifest_probe_evidence",
+        ) as manifest_inspector, patch.object(
+            RECORDER,
+            "_ffprobe_nm3u8dl_stream_quality",
+        ) as ffprobe, patch.object(
+            RECORDER,
+            "_sample_nm3u8dl_stream_video_bitrate",
+        ) as bitrate_sampler, patch.object(
+            RECORDER,
+            "_detect_nm3u8dl_stream_scan_type_with_idet",
+        ) as idet:
+            quality = RECORDER._probe_nm3u8dl_candidate_quality(
+                fresh_wrapper,
+                excluded_literal_ips=set(
+                    state.nm3u8dl_bad_stream_ips
+                ),
+            )
+
+        self.assertEqual(
+            quality["manifest_final_url"],
+            redirected_final,
+        )
+        self.assertTrue(quality["failover_excluded"])
+        self.assertIn(
+            failed_ip,
+            quality["failover_exclusion_reason"],
+        )
+        manifest_inspector.assert_not_called()
+        ffprobe.assert_not_called()
+        bitrate_sampler.assert_not_called()
+        idet.assert_not_called()
+
     def test_launch_uses_validated_final_manifest_url(self):
         source = {
             "stream_url": "https://wrapper.test/channel.m3u8",
