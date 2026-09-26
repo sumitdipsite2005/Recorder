@@ -65,6 +65,18 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("from recorder_runtime import sound as runtime_sound", recorder)
         self.assertIn("from recorder_runtime import sound as runtime_sound", coordinator)
 
+    def test_coordinator_config_and_acquisition_have_single_module_owners(self):
+        entry=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
+        config=(ROOT/"recorder_coordinator"/"configuration.py").read_text(encoding="utf-8")
+        acquisition=(ROOT/"recorder_coordinator"/"acquisition.py").read_text(encoding="utf-8")
+
+        self.assertIn("class CoordinatorConfigState:", config)
+        self.assertIn("def acquire_active_targets(", acquisition)
+        self.assertNotIn("class CoordinatorConfigState:", entry)
+        self.assertNotIn("def acquire_active_targets(", entry)
+        self.assertIn("from recorder_coordinator.acquisition import acquire_active_targets", entry)
+        self.assertIn("from recorder_coordinator.configuration import (", entry)
+
     def test_identity_registry_lives_in_shared_runtime_layer(self):
         self.assertTrue((ROOT/"recorder_runtime"/"registry.py").is_file())
         self.assertFalse((ROOT/"recorder_coordinator"/"registry.py").exists())
