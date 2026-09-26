@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 from .headers import canonicalize_header_name
+from .manifest import manifest_type_from_text
 from .matching import evaluate_match
 from .playback import playback_fingerprint
 from .playlist_headers import (
@@ -932,16 +933,9 @@ def probe_candidate_hls(
         manifest_expiry = _extract_expiry(final_url, text)
         expiry = _merge_expiries(url_header_expiry, manifest_expiry)
 
-        stripped_manifest = text.lstrip()
-        is_hls = stripped_manifest.startswith("#EXTM3U")
-        is_dash = (
-            re.search(
-                r'<(?:[A-Za-z_][\w.-]*:)?MPD\b',
-                stripped_manifest,
-                re.IGNORECASE,
-            )
-            is not None
-        )
+        manifest_type = manifest_type_from_text(text)
+        is_hls = manifest_type == "HLS"
+        is_dash = manifest_type == "DASH"
         hls_quality = None
         dash_quality = None
         if is_dash:

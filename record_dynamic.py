@@ -68,6 +68,7 @@ from recorder_source import discovery as source_discovery
 from recorder_source import headers as source_headers
 from recorder_source import playback as source_playback
 from recorder_source import playlist_headers as source_playlist_headers
+from recorder_source import manifest as source_manifest
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
 from recorder_source import quality as source_quality
@@ -8616,9 +8617,11 @@ def _probe_nm3u8dl_candidate_quality(
         if redirected_expiry is not None:
             quality["manifest_expiry"] = redirected_expiry
 
-        stripped_manifest = manifest_text.lstrip()
+        manifest_type = source_manifest.manifest_type_from_text(
+            manifest_text
+        )
 
-        if stripped_manifest.startswith("#EXTM3U"):
+        if manifest_type == "HLS":
             quality["manifest_reachable"] = True
             quality["stream_type"] = "HLS"
             manifest_quality = _parse_nm3u8dl_hls_manifest_quality(
@@ -8747,11 +8750,7 @@ def _probe_nm3u8dl_candidate_quality(
                             child_failure.get("reason") or ""
                         )
 
-        elif re.search(
-            r'<(?:[A-Za-z_][\w.-]*:)?MPD\b',
-            stripped_manifest,
-            re.IGNORECASE,
-        ):
+        elif manifest_type == "DASH":
             quality["manifest_reachable"] = True
             quality["stream_type"] = "DASH"
             manifest_quality = _parse_nm3u8dl_dash_manifest_quality(

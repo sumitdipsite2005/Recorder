@@ -10,6 +10,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from recorder_source.headers import canonicalize_header_name
+from recorder_source.manifest import manifest_type_from_text, is_manifest_text
 from recorder_source.playback import playback_fingerprint
 from recorder_source.playlist_headers import (
     MATURE_PLAYLIST_HEADER_POLICY,
@@ -339,6 +340,19 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(c.extra["source_name"], "Source A")
         self.assertEqual(c.extra["source_group"], "SONYLIV_EVENTS")
         self.assertEqual(c.extra["provider"], "SONYLIV")
+
+    def test_shared_manifest_content_classifier(self):
+        self.assertEqual(
+            manifest_type_from_text("  #EXTM3U\\n#EXT-X-VERSION:3"),
+            "HLS",
+        )
+        self.assertEqual(
+            manifest_type_from_text(
+                '<?xml version="1.0"?><dash:MPD xmlns:dash="urn:mpeg:dash:schema:mpd:2011"></dash:MPD>'
+            ),
+            "DASH",
+        )
+        self.assertFalse(is_manifest_text("<html>not a manifest</html>"))
 
     def test_shared_playlist_header_parser_preserves_both_existing_compatibility_profiles(self):
         raw = "https://cdn.test/live.mpd?|Cookie=b%3D2"

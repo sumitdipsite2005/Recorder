@@ -150,6 +150,22 @@ class ArchitectureGuardTests(unittest.TestCase):
         for path in ROOT.glob("*.bat"):
             self.assertEqual(path.name, path.name.lower(), path.name)
 
+    def test_manifest_content_classification_has_one_shared_owner(self):
+        manifest=(ROOT/"recorder_source"/"manifest.py").read_text(encoding="utf-8")
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        transport=(ROOT/"recorder_source"/"transport.py").read_text(encoding="utf-8")
+
+        self.assertIn("def manifest_type_from_text(", manifest)
+        self.assertIn("source_manifest.manifest_type_from_text(", recorder)
+        self.assertIn("manifest_type_from_text(", discovery)
+        self.assertIn("is_manifest_text(", transport)
+        mpd_pattern = r'<(?:[A-Za-z_][\\w.-]*:)?MPD\\b'
+        self.assertIn(mpd_pattern, manifest)
+        self.assertNotIn(mpd_pattern, recorder)
+        self.assertNotIn(mpd_pattern, discovery)
+        self.assertNotIn(mpd_pattern, transport)
+
     def test_recorder_and_coordinator_share_hls_quality_parser(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")

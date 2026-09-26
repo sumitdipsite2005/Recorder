@@ -19,6 +19,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPCookieProcessor, urlopen
 
+from .manifest import is_manifest_text
 from .policy import is_vpn_route_suspected_403
 
 
@@ -278,15 +279,7 @@ def fetch_stream_manifest_text(
                 raise RuntimeError("Quality probe cancelled by stop request")
             first_bytes = read_chunk(64 * 1024)
             first_text = first_bytes.decode("utf-8-sig", errors="replace")
-            stripped = first_text.lstrip()
-            looks_like_manifest = (
-                stripped.startswith("#EXTM3U")
-                or re.search(
-                    r'<(?:[A-Za-z_][\w.-]*:)?MPD\b',
-                    stripped,
-                    re.IGNORECASE,
-                ) is not None
-            )
+            looks_like_manifest = is_manifest_text(first_text)
             chunks = [first_bytes]
             if looks_like_manifest:
                 while True:
