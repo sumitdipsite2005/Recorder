@@ -65,6 +65,8 @@ from recorder_runtime.identity_launch import (
 )
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_source import discovery as source_discovery
+from recorder_source import headers as source_headers
+from recorder_source import playback as source_playback
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
 from recorder_source import quality as source_quality
@@ -6266,25 +6268,7 @@ def get_nm3u8dl_auth_expiry(
 
 
 def canonicalize_nm3u8dl_header_name(name: str) -> str:
-    raw_name = str(name).strip()
-
-    normalized = (
-        raw_name
-        .lower()
-        .replace("_", "-")
-    )
-
-    aliases = {
-        "cookie": "Cookie",
-        "referer": "Referer",
-        "referrer": "Referer",
-        "origin": "Origin",
-        "user-agent": "User-Agent",
-        "useragent": "User-Agent",
-        "authorization": "Authorization",
-    }
-
-    return aliases.get(normalized, raw_name)
+    return source_headers.canonicalize_header_name(name)
 
 
 def split_nm3u8dl_stream_url_metadata(
@@ -6909,34 +6893,12 @@ def get_nm3u8dl_ascii_safe_request_headers(
     return safe_headers
 
 
-_NM3U8DL_FAILOVER_FINGERPRINT_HEADERS = (
-    "Cookie",
-    "Authorization",
-    "Referer",
-    "Origin",
-)
-
-
-def _nm3u8dl_fingerprint_header_value(headers: dict, wanted_name: str) -> str:
-    wanted = str(wanted_name or "").strip().casefold()
-    for name, value in (headers or {}).items():
-        if str(name).strip().casefold() == wanted:
-            return str(value or "").strip()
-    return ""
-
-
 def get_nm3u8dl_stream_fingerprint(candidate: Optional[dict]) -> str:
-    """Return the draft-one effective-stream identity used only for failover."""
+    """Return the shared effective playback/session fingerprint used by failover."""
     if not candidate:
         return ""
 
-    # Fingerprint contract: the URL reached by the normal manifest probe, not
-    # the exposed playlist URL. If the probe did not establish a final manifest
-    # URL, do not silently substitute another identity component.
-    final_manifest_url = str(
-        candidate.get("manifest_final_url") or ""
-    ).strip()
-
+    final_manifest_url = str(candidate.get("manifest_final_url") or "").strip()
     if not final_manifest_url:
         return ""
 
@@ -6950,24 +6912,10 @@ def get_nm3u8dl_stream_fingerprint(candidate: Optional[dict]) -> str:
         except Exception:
             effective_headers = dict(candidate.get("headers") or {})
 
-    payload = {
-        "final_manifest_url": final_manifest_url,
-        "headers": {
-            header_name.casefold(): _nm3u8dl_fingerprint_header_value(
-                effective_headers,
-                header_name,
-            )
-            for header_name in _NM3U8DL_FAILOVER_FINGERPRINT_HEADERS
-        },
-    }
-
-    serialized = json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
+    return source_playback.playback_fingerprint(
+        final_manifest_url,
+        effective_headers,
     )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def get_nm3u8dl_manual_feed_signature(candidate: Optional[dict]) -> Optional[dict]:
