@@ -534,6 +534,8 @@ def _github_file_commit_timestamp(
         except (URLError, TimeoutError, OSError):
             pass
         except Exception:
+            if stop_requested is not None and stop_requested():
+                raise RuntimeError("Playlist scan cancelled by stop request")
             return None
 
         if stop_requested is not None and stop_requested():
