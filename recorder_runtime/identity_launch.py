@@ -97,6 +97,7 @@ class IdentityLaunchRequest:
     provider: str
     selected_source_group: str
     selected_candidate: SourceCandidate
+    initial_candidate_pool: Tuple[SourceCandidate, ...]
     target_intents: Tuple[FrozenTargetIntent, ...]
     recovery_playlist_urls: Tuple[str, ...]
     recording_duration_min: Optional[float]
@@ -154,6 +155,11 @@ class IdentityLaunchRequest:
                 value.get("selected_source_group") or ""
             ).strip().upper(),
             selected_candidate=SourceCandidate.from_mapping(candidate_value),
+            initial_candidate_pool=tuple(
+                SourceCandidate.from_mapping(item)
+                for item in (value.get("initial_candidate_pool") or ())
+                if isinstance(item, Mapping)
+            ),
             target_intents=tuple(
                 FrozenTargetIntent.from_mapping(item)
                 for item in target_values
@@ -180,6 +186,10 @@ class IdentityLaunchRequest:
             "provider": self.provider,
             "selected_source_group": self.selected_source_group,
             "selected_candidate": self.selected_candidate.to_mapping(),
+            "initial_candidate_pool": [
+                candidate.to_mapping()
+                for candidate in self.initial_candidate_pool
+            ],
             "target_intents": [
                 target.to_mapping()
                 for target in self.target_intents
