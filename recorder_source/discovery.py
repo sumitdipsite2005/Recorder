@@ -26,6 +26,10 @@ import xml.etree.ElementTree as ET
 from .headers import canonicalize_header_name
 from .matching import evaluate_match
 from .playback import playback_fingerprint
+from .playlist_headers import (
+    NORMALIZED_PLAYLIST_HEADER_POLICY,
+    parse_stream_url_and_headers,
+)
 from .quality import (
     extract_auth_expiry,
     merge_auth_expiries,
@@ -291,57 +295,12 @@ def _parse_stream_url_and_headers(
     raw_url: str,
     option_lines: Sequence[str],
 ) -> Tuple[str, Dict[str, str]]:
-    """Normalize playlist playback headers using mature precedence direction.
-
-    Lowest -> highest precedence is EXTVLCOPT, EXTHTTP, then URL pipe metadata.
-    """
-    raw = str(raw_url or "").strip()
-    clean_url = raw
-    pipe_headers: Dict[str, str] = {}
-    if "|" in raw:
-        clean_url, suffix = raw.split("|", 1)
-        for item in suffix.split("&"):
-            if "=" not in item:
-                continue
-            name, value = item.split("=", 1)
-            name = unquote(name).strip()
-            value = unquote(value).strip()
-            if name and value:
-                pipe_headers[name] = value
-
-    extvlc_headers: Dict[str, str] = {}
-    exthttp_headers: Dict[str, str] = {}
-    for line in option_lines:
-        text = str(line or "").strip()
-        lower = text.casefold()
-        if lower.startswith("#extvlcopt:http-cookie="):
-            extvlc_headers["Cookie"] = text.split("=", 1)[1].strip()
-        elif lower.startswith("#extvlcopt:http-referrer="):
-            extvlc_headers["Referer"] = text.split("=", 1)[1].strip()
-        elif lower.startswith("#extvlcopt:http-origin="):
-            extvlc_headers["Origin"] = text.split("=", 1)[1].strip()
-        elif lower.startswith("#extvlcopt:http-user-agent="):
-            extvlc_headers["User-Agent"] = text.split("=", 1)[1].strip()
-        elif lower.startswith("#extvlcopt:http-extra-headers="):
-            raw_header = text.split("=", 1)[1]
-            name, separator, value = raw_header.partition(":")
-            if separator:
-                extvlc_headers[name.strip()] = value.strip()
-        elif lower.startswith("#exthttp:"):
-            payload = text.split(":", 1)[1].strip()
-            try:
-                parsed = json.loads(payload)
-            except (json.JSONDecodeError, TypeError):
-                parsed = None
-            if isinstance(parsed, dict):
-                _apply_headers(exthttp_headers, parsed)
-
-    headers: Dict[str, str] = {}
-    _apply_headers(headers, extvlc_headers)
-    _apply_headers(headers, exthttp_headers)
-    _apply_headers(headers, pipe_headers)
-    return clean_url.strip(), headers
-
+    """Normalize playlist playback metadata through the shared parser."""
+    return parse_stream_url_and_headers(
+        raw_url,
+        option_lines,
+        policy=NORMALIZED_PLAYLIST_HEADER_POLICY,
+    )
 
 def _b64url_decode(value: str) -> bytes:
     text = str(value or "").strip()
