@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import recorder_event_coordinator as coord
+from recorder_coordinator import acquisition as coord_acquisition
 from recorder_coordinator import terminal as coordinator_terminal
 from recorder_coordinator.snapshot import candidate_row_key, candidate_state
 from recorder_source.models import SourceCandidate
@@ -495,7 +496,7 @@ class AcquisitionTests(unittest.TestCase):
         playlist='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games" group-title="Sports",Asian Games\nhttps://cdn.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
         def fake_probe(items):
             return tuple(replace(c, launchable=True, probe_status="working", quality_known=True, video_width=1920, video_height=1080, video_fps=50, video_bitrate_bps=5_000_000, final_stream_url=c.stream_url) for c in items)
-        with patch.object(coord,"fetch_playlist_documents",return_value=({"https://good.test/list.m3u":playlist},("bad: OSError: boom",),{})), patch.object(coord,"probe_candidates",side_effect=fake_probe):
+        with patch.object(coord_acquisition,"fetch_playlist_documents",return_value=({"https://good.test/list.m3u":playlist},("bad: OSError: boom",),{})), patch.object(coord_acquisition,"probe_candidates",side_effect=fake_probe):
             found,errors=coord.acquire_active_targets(self._raw(),(view(),))
         self.assertEqual(len(found["T"]),1)
         self.assertEqual(errors,("bad: OSError: boom",))
@@ -632,7 +633,7 @@ class AcquisitionTests(unittest.TestCase):
     def test_metadata_only_matching_entry_remains_visible_unusable(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[{"url":"https://good.test/list.m3u","name":"good"}]}}
         playlist='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games" group-title="Sports",Asian Games\n'
-        with patch.object(coord,"fetch_playlist_documents",return_value=({"https://good.test/list.m3u":playlist},(),{})):
+        with patch.object(coord_acquisition,"fetch_playlist_documents",return_value=({"https://good.test/list.m3u":playlist},(),{})):
             found,errors=coord.acquire_active_targets(raw,(view(),))
         self.assertEqual(errors,())
         self.assertEqual(len(found["T"]),1)
@@ -648,7 +649,7 @@ class AcquisitionTests(unittest.TestCase):
         two='#EXTM3U\n#EXTINF:-1 tvg-name="Athletics" group-title="Sports",Athletics\nhttps://b.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
         def fake_probe(items):
             return tuple(replace(c, launchable=not c.ignored, probe_status="working" if not c.ignored else "no_playable_source", quality_known=not c.ignored, video_width=1920 if not c.ignored else 0, video_height=1080 if not c.ignored else 0, video_fps=50 if not c.ignored else 0, final_stream_url=c.stream_url) for c in items)
-        with patch.object(coord,"fetch_playlist_documents",return_value=({"https://one.test/list.m3u":one,"https://two.test/list.m3u":two},(),{})), patch.object(coord,"probe_candidates",side_effect=fake_probe):
+        with patch.object(coord_acquisition,"fetch_playlist_documents",return_value=({"https://one.test/list.m3u":one,"https://two.test/list.m3u":two},(),{})), patch.object(coord_acquisition,"probe_candidates",side_effect=fake_probe):
             found,_=coord.acquire_active_targets(raw,(view(),))
         self.assertEqual(len(found["T"]),2)
         context=[c for c in found["T"] if c.ignored]
