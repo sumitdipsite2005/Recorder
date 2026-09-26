@@ -8642,7 +8642,7 @@ def _probe_nm3u8dl_candidate_quality(
                 ),
             )
 
-        def resolve_dash_resource(quality_evidence: Mapping[str, object]):
+        def resolve_dash_resource(quality_evidence: dict):
             return _resolve_nm3u8dl_selected_dash_resource_route(
                 quality_evidence,
                 effective_headers,
@@ -8668,101 +8668,6 @@ def _probe_nm3u8dl_candidate_quality(
             )
         )
         quality.update(inspection)
-
-    except Exception as error:
-                        child_timeout_route = _format_candidate_timeout_route(
-                            playlist_urls_for_timeout,
-                            variant_url,
-                        )
-                        log_timeout_exception(
-                            error,
-                            "HTTP",
-                            (
-                                NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC + 5
-                                if _is_nm3u8dl_drmlive_host(variant_url)
-                                else NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC
-                            ),
-                            context=(
-                                "HLS variant check | "
-                                f"{child_timeout_route}"
-                            ),
-                        )
-                        child_error = error
-
-                    if variant_text:
-                        if not variant_text.lstrip().startswith("#EXTM3U"):
-                            child_failure = (
-                                source_transport.classify_hls_variant_probe_failure(
-                                    non_hls_response=True,
-                                )
-                            )
-                            quality["hls_variant_probe_status"] = str(
-                                child_failure.get("status") or ""
-                            )
-                            quality["hls_variant_probe_failure"] = str(
-                                child_failure.get("reason") or ""
-                            )
-                        else:
-                            try:
-                                variant_drm = (
-                                    _inspect_nm3u8dl_hls_manifest_drm(
-                                        variant_text
-                                    )
-                                )
-                            except Exception as error:
-                                quality["drm_inspection_failure"] = (
-                                    "HLS DRM inspection failed — "
-                                    + _describe_nm3u8dl_probe_exception(error)
-                                )
-                            else:
-                                quality["drm_protected"] = bool(
-                                    quality.get("drm_protected")
-                                    or variant_drm.get("drm_protected")
-                                )
-
-                                if variant_drm.get("drm_key_required"):
-                                    quality["drm_key_required"] = True
-                                    quality["drm_detail"] = str(
-                                        variant_drm.get("drm_detail")
-                                        or ""
-                                    )
-                    elif child_error is not None:
-                        child_failure = (
-                            source_transport.classify_hls_variant_probe_failure(
-                                child_error,
-                            )
-                        )
-                        quality["hls_variant_probe_status"] = str(
-                            child_failure.get("status") or ""
-                        )
-                        quality["hls_variant_probe_failure"] = str(
-                            child_failure.get("reason") or ""
-                        )
-
-        elif manifest_type == "DASH":
-            quality["manifest_reachable"] = True
-            quality["stream_type"] = "DASH"
-            manifest_quality = _parse_nm3u8dl_dash_manifest_quality(
-                manifest_text,
-                final_manifest_url,
-            )
-            quality.update(
-                _inspect_nm3u8dl_dash_manifest_drm(
-                    manifest_text
-                )
-            )
-        else:
-            quality["manifest_probe_failure"] = (
-                "response was not a recognizable HLS/DASH manifest"
-            )
-
-        if manifest_quality:
-            manifest_quality["manifest_expiry"] = (
-                _merge_nm3u8dl_auth_expiries(
-                    manifest_quality.get("manifest_expiry"),
-                    redirected_expiry,
-                )
-            )
 
     except Exception as error:
         log_timeout_exception(
