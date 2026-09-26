@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 from .headers import canonicalize_header_name
+from . import json_playlist as source_json_playlist
 from .manifest import manifest_type_from_text
 from .matching import evaluate_match
 from .playback import playback_fingerprint
@@ -63,24 +64,7 @@ from .models import (
 
 
 
-JSON_RECORD_LIST_ALIASES = ("channels", "streams", "items", "entries", "data")
-JSON_FIELD_ALIASES = {
-    "name": ("name", "channel_name", "channel", "title"),
-    "stream_url": ("stream_url", "stream", "url", "link"),
-    "id": ("id", "channel_id", "tvg_id", "tvg-id"),
-    "group_title": ("group_title", "group", "category"),
-    "key_id": ("key_id", "kid"),
-    "key": ("key",),
-    "license_key": ("license_key", "drm_key", "clearkey"),
-}
-JSON_HEADER_FIELD_ALIASES = {
-    "Cookie": ("cookie", "cookies"),
-    "User-Agent": ("user_agent", "user-agent", "useragent"),
-    "Origin": ("origin",),
-    "Referer": ("referer", "referrer"),
-    "Authorization": ("authorization", "auth_header"),
-}
-JSON_HEADER_OBJECT_ALIASES = ("headers", "http_headers", "request_headers")
+
 
 # Playlist-document and GitHub metadata fetches use the mature default UA.
 DEFAULT_HTTP_USER_AGENT = PLAYLIST_USER_AGENTS["DEFAULT"]
@@ -118,129 +102,12 @@ def build_effective_probe_headers(
         headers["User-Agent"] = fallback
     return headers
 
-def _normalize_json_field_name(value: str) -> str:
-    return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
-
-
-def _json_alias_value(record: Mapping[str, object], aliases: Sequence[str]):
-    normalized = {_normalize_json_field_name(key): value for key, value in record.items()}
-    for alias in aliases:
-        key = _normalize_json_field_name(alias)
-        if key in normalized:
-            return normalized[key]
-    return None
-
-
-def _json_text(record: Mapping[str, object], aliases: Sequence[str]) -> str:
-    value = _json_alias_value(record, aliases)
-    if value is None or isinstance(value, (dict, list, tuple, set)):
-        return ""
-    return str(value).replace("\r", " ").replace("\n", " ").strip()
-
-
 def adapt_json_playlist_text(playlist_text: str) -> Tuple[str, Mapping[str, object]]:
-    """Convert recognized JSON playlist records into the common M3U parser input."""
-    text = str(playlist_text or "")
-    stripped = text.lstrip()
-    if not stripped.startswith(("{", "[")):
-        return text, {"adapted": False, "source_format": "m3u"}
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(
-            "playlist response looks like JSON but is invalid at "
-            f"line {error.lineno}, column {error.colno}"
-        ) from error
-
-    if isinstance(data, list):
-        records = data
-        container = "$"
-    elif isinstance(data, dict):
-        records = None
-        container = ""
-        normalized = {_normalize_json_field_name(key): (key, value) for key, value in data.items()}
-        for alias in JSON_RECORD_LIST_ALIASES:
-            item = normalized.get(_normalize_json_field_name(alias))
-            if item is not None and isinstance(item[1], list):
-                container, records = str(item[0]), item[1]
-                break
-        if records is None:
-            raise RuntimeError("JSON playlist contains no recognized record list")
-    else:
-        raise RuntimeError("JSON playlist root must be an object or array")
-
-    output = ["#EXTM3U"]
-    observed = 0
-    playable = 0
-    metadata_only = 0
-    skipped = 0
-    for record in records:
-        if not isinstance(record, dict):
-            skipped += 1
-            continue
-        name = _json_text(record, JSON_FIELD_ALIASES["name"])
-        stream_url = _json_text(record, JSON_FIELD_ALIASES["stream_url"])
-        if not name:
-            skipped += 1
-            continue
-        tvg_id = _json_text(record, JSON_FIELD_ALIASES["id"])
-        group_title = _json_text(record, JSON_FIELD_ALIASES["group_title"])
-        safe = lambda value: str(value or "").replace('"', "'").strip()
-        attrs = []
-        if tvg_id:
-            attrs.append(f'tvg-id="{safe(tvg_id)}"')
-        attrs.append(f'tvg-name="{safe(name)}"')
-        if group_title:
-            attrs.append(f'group-title="{safe(group_title)}"')
-        output.append("#EXTINF:-1 " + " ".join(attrs) + f",{name}")
-
-        license_key = _json_text(record, JSON_FIELD_ALIASES["license_key"])
-        if not license_key:
-            key_id = _json_text(record, JSON_FIELD_ALIASES["key_id"])
-            key_value = _json_text(record, JSON_FIELD_ALIASES["key"])
-            if key_id and key_value:
-                license_key = f"{key_id}:{key_value}"
-        if license_key:
-            output.append("#KODIPROP:inputstream.adaptive.license_type=clearkey")
-            output.append("#KODIPROP:inputstream.adaptive.license_key=" + license_key)
-
-        headers: Dict[str, str] = {}
-        for header_name, aliases in JSON_HEADER_FIELD_ALIASES.items():
-            value = _json_text(record, aliases)
-            if value:
-                headers[header_name] = value
-        header_object = _json_alias_value(record, JSON_HEADER_OBJECT_ALIASES)
-        if isinstance(header_object, dict):
-            for name_key, value in header_object.items():
-                if value is not None and not isinstance(value, (dict, list, tuple, set)):
-                    headers[str(name_key)] = (
-                        str(value).replace("\r", " ").replace("\n", " ").strip()
-                    )
-        if headers:
-            output.append(
-                "#EXTHTTP:"
-                + json.dumps(headers, ensure_ascii=False, separators=(",", ":"))
-            )
-        if stream_url:
-            output.append(stream_url)
-            playable += 1
-        else:
-            metadata_only += 1
-        observed += 1
-
-    if observed == 0:
-        raise RuntimeError("JSON playlist contained no recognized named records")
-    return "\n".join(output) + "\n", {
-        "adapted": True,
-        "source_format": "json",
-        "record_container": container,
-        "record_count": len(records),
-        "observed_record_count": observed,
-        "usable_record_count": playable,
-        "playable_record_count": playable,
-        "metadata_only_record_count": metadata_only,
-        "skipped_record_count": skipped,
-    }
+    """Keep metadata-only JSON observations visible to Inspect/Watch."""
+    return source_json_playlist.adapt_json_playlist_text(
+        playlist_text,
+        policy=source_json_playlist.NORMALIZED_JSON_PLAYLIST_POLICY,
+    )
 
 
 def parse_extinf_metadata(extinf: str) -> Dict[str, str]:

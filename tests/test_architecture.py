@@ -246,6 +246,43 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("inspect_manifest_probe_evidence(", discovery)
         self.assertNotIn("def _parse_dash_quality(", discovery)
 
+    def test_json_playlist_adaptation_has_one_shared_owner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        shared=(ROOT/"recorder_source"/"json_playlist.py").read_text(encoding="utf-8")
+
+        self.assertIn("def adapt_json_playlist_text(", shared)
+        self.assertIn("MATURE_JSON_PLAYLIST_POLICY =", shared)
+        self.assertIn("NORMALIZED_JSON_PLAYLIST_POLICY =", shared)
+
+        mature_start = recorder.index("def adapt_nm3u8dl_json_playlist_text(")
+        mature_end = recorder.index(
+            "def fetch_nm3u8dl_playlist_text(",
+            mature_start,
+        )
+        mature_adapter = recorder[mature_start:mature_end]
+        self.assertIn(
+            "source_json_playlist.adapt_json_playlist_text(",
+            mature_adapter,
+        )
+        self.assertIn("MATURE_JSON_PLAYLIST_POLICY", mature_adapter)
+        self.assertNotIn("json.loads(", mature_adapter)
+        self.assertNotIn("_find_nm3u8dl_json_records", recorder)
+
+        normalized_start = discovery.index("def adapt_json_playlist_text(")
+        normalized_end = discovery.index(
+            "def parse_extinf_metadata(",
+            normalized_start,
+        )
+        normalized_adapter = discovery[normalized_start:normalized_end]
+        self.assertIn(
+            "source_json_playlist.adapt_json_playlist_text(",
+            normalized_adapter,
+        )
+        self.assertIn("NORMALIZED_JSON_PLAYLIST_POLICY", normalized_adapter)
+        self.assertNotIn("json.loads(", normalized_adapter)
+        self.assertNotIn("def _normalize_json_field_name(", discovery)
+
     def test_playlist_header_parsing_algorithm_has_one_shared_owner(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")

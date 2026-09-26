@@ -11,6 +11,10 @@ from urllib.error import HTTPError
 
 from recorder_source.headers import canonicalize_header_name
 from recorder_source.manifest import manifest_type_from_text, is_manifest_text
+from recorder_source.json_playlist import (
+    MATURE_JSON_PLAYLIST_POLICY,
+    adapt_json_playlist_text as adapt_shared_json_playlist_text,
+)
 from recorder_source.playback import playback_fingerprint
 from recorder_source.playlist_headers import (
     MATURE_PLAYLIST_HEADER_POLICY,
@@ -474,6 +478,31 @@ https://edge.drmlive.net/live.mpd
 
         hotstar = build_effective_probe_headers("HOTSTAR", {})
         self.assertIn("Chrome/141.0.0.0", hotstar["User-Agent"])
+
+    def test_json_adapter_mature_policy_rejects_metadata_only_record(self):
+        payload = json.dumps({"channels": [{"name": "A", "group": "Sports"}]})
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "no usable records with recognized name and stream URL fields",
+        ):
+            adapt_shared_json_playlist_text(
+                payload,
+                policy=MATURE_JSON_PLAYLIST_POLICY,
+            )
+
+    def test_json_adapter_mature_policy_keeps_legacy_diagnostics_shape(self):
+        payload = json.dumps({"items": [{
+            "name": "A",
+            "url": "https://cdn.test/a.m3u8",
+        }]})
+        _, diag = adapt_shared_json_playlist_text(
+            payload,
+            policy=MATURE_JSON_PLAYLIST_POLICY,
+        )
+        self.assertEqual(diag["usable_record_count"], 1)
+        self.assertEqual(diag["skipped_record_count"], 0)
+        self.assertIn("synthetic_m3u_sha256", diag)
+        self.assertNotIn("metadata_only_record_count", diag)
 
     def test_json_adapter_keeps_metadata_only_record(self):
         payload = json.dumps({"channels": [{"name": "A", "group": "Sports"}]})
