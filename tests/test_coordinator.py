@@ -303,7 +303,7 @@ class ManualRecordLaunchTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "\033[38;2;145;153;160mlane:2120305/AG_Strea2309/ENG\033[0m",
+            "\033[38;2;145;153;160m/hls/live/2120305/AG_Strea2309/ENG\033[0m",
             rendered,
         )
 
@@ -955,7 +955,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         rendered=coord.render_dashboard(snap,())
         self.assertIn("[ON] Asian Games",rendered)
         self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps",rendered)
-        self.assertIn("Identity: lane:2120305/AG_Strea2309/ENG",rendered)
+        self.assertIn("Identity: /hls/live/2120305/AG_Strea2309/ENG",rendered)
         self.assertIn("| [S1] | expires unknown |", rendered)
         self.assertNotIn("src1 [S1]", rendered)
         self.assertIn("SOURCE REFERENCES", rendered)
@@ -1041,7 +1041,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         )
         identity_detail_line=next(
             line for line in rendered.splitlines()
-            if "Identity: lane:2120305/AG_Strea2309/ENG" in line
+            if "Identity: /hls/live/2120305/AG_Strea2309/ENG" in line
             and "PID 4321" in line
         )
         self.assertIn("Asian Games | Asian Games | Sports | SONYLIV | [S1]",recording_line)
@@ -1835,8 +1835,8 @@ class SnapshotAndChangeTests(unittest.TestCase):
         second=snapshot([a,b])
         order2=coord.update_display_order(order,second)
         ids=[block.identity.serialized for block in second.blocks.values()]
-        a_id=next(x for x in ids if "lane:1/A/ENG" in x)
-        b_id=next(x for x in ids if "lane:2/B/ENG" in x)
+        a_id=next(x for x in ids if "/hls/live/1/A/ENG" in x)
+        b_id=next(x for x in ids if "/hls/live/2/B/ENG" in x)
         self.assertEqual(order2[coord.POLICY_MANUAL],[b_id,a_id])
 
     def test_display_order_ranks_identities_by_unusable_observation_count(self):
@@ -1915,22 +1915,22 @@ class SnapshotAndChangeTests(unittest.TestCase):
                 next(
                     identity
                     for identity in order[coord.POLICY_MANUAL]
-                    if "lane:1/Clean/ENG" in identity
+                    if "/hls/live/1/Clean/ENG" in identity
                 ),
                 next(
                     identity
                     for identity in order[coord.POLICY_MANUAL]
-                    if "lane:2/PartialOne/ENG" in identity
+                    if "/hls/live/2/PartialOne/ENG" in identity
                 ),
                 next(
                     identity
                     for identity in order[coord.POLICY_MANUAL]
-                    if "lane:3/PartialTwo/ENG" in identity
+                    if "/hls/live/3/PartialTwo/ENG" in identity
                 ),
                 next(
                     identity
                     for identity in order[coord.POLICY_MANUAL]
-                    if "lane:4/AllOff/ENG" in identity
+                    if "/hls/live/4/AllOff/ENG" in identity
                 ),
             ],
         )
