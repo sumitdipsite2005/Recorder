@@ -1,7 +1,7 @@
 """Identity-bound worker process.
 
 The Coordinator owns discovery/launch authority. This process consumes one
-explicit launch request, marks its claimed identity ACTIVE, and then enters the
+explicit launch request, binds the claimed worker PID, and then enters the
 same mature dynamic recorder execution path used by direct ONE BEST runs.
 """
 
@@ -14,11 +14,14 @@ from typing import Optional, Sequence
 
 from recorder_coordinator.registry import (
     IdentityRegistryStore,
-    STATE_ACTIVE,
     STATE_CRASHED,
     STATE_ENDED,
+    STATE_LAUNCHING,
     STATE_MANUALLY_STOPPED,
+    STATE_RECORDING,
+    STATE_WAITING_FOR_SOURCE,
 )
+from recorder_runtime.identity_status import IdentityRuntimeStatusStore
 from recorder_runtime.identity_launch import read_launch_request
 
 
@@ -55,20 +58,72 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import record_dynamic
 
     registry_store = IdentityRegistryStore(record_dynamic.OUTPUT_PATHS)
-    registry_store.transition(
+    registry_store.bind_worker_pid(
         identity_key=request.identity_key,
-        new_state=STATE_ACTIVE,
         worker_pid=os.getpid(),
         reason="identity worker process started",
         expected_session_id=request.registry_session_id,
     )
+    status_store = IdentityRuntimeStatusStore(
+        record_dynamic.OUTPUT_PATHS,
+        request.registry_session_id,
+    )
+    status_sequence = 0
+
+    def publish_runtime_status(payload):
+        nonlocal status_sequence
+        data = dict(payload or {})
+        worker_state = str(data.pop("worker_state", "") or "").strip().upper()
+        if not worker_state:
+            return
+
+        registry = registry_store.read()
+        entry = registry["entries"].get(request.identity_key)
+        current_state = (
+            str(entry.get("state") or "").strip().upper()
+            if isinstance(entry, dict)
+            else ""
+        )
+        desired_state = {
+            "RECORDING": STATE_RECORDING,
+            "WAITING_FOR_SOURCE": STATE_WAITING_FOR_SOURCE,
+        }.get(worker_state)
+
+        if desired_state and current_state != desired_state:
+            registry_store.transition(
+                identity_key=request.identity_key,
+                new_state=desired_state,
+                worker_pid=os.getpid(),
+                reason=str(data.get("reason") or ""),
+                expected_session_id=request.registry_session_id,
+            )
+
+        status_sequence += 1
+        status_store.write(
+            identity_key=request.identity_key,
+            provider=request.provider,
+            worker_pid=os.getpid(),
+            worker_state=worker_state,
+            payload=data,
+            sequence=status_sequence,
+        )
 
     try:
         outcome = record_dynamic.run_recorder_process(
             identity_launch_request=request,
+            identity_status_callback=publish_runtime_status,
         )
 
         if outcome.status == "manual_stopped":
+            status_sequence += 1
+            status_store.write(
+                identity_key=request.identity_key,
+                provider=request.provider,
+                worker_pid=os.getpid(),
+                worker_state=STATE_MANUALLY_STOPPED,
+                payload={"current_candidate": None, "reason": outcome.reason},
+                sequence=status_sequence,
+            )
             registry_store.transition(
                 identity_key=request.identity_key,
                 new_state=STATE_MANUALLY_STOPPED,
@@ -79,6 +134,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
 
         if outcome.status == "ended":
+            status_sequence += 1
+            status_store.write(
+                identity_key=request.identity_key,
+                provider=request.provider,
+                worker_pid=os.getpid(),
+                worker_state=STATE_ENDED,
+                payload={"current_candidate": None, "reason": outcome.reason},
+                sequence=status_sequence,
+            )
             registry_store.transition(
                 identity_key=request.identity_key,
                 new_state=STATE_ENDED,
@@ -99,8 +163,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             entry = registry["entries"].get(request.identity_key)
             if (
                 isinstance(entry, dict)
-                and entry.get("state") == STATE_ACTIVE
+                and entry.get("state") in {
+                    STATE_LAUNCHING,
+                    STATE_RECORDING,
+                    STATE_WAITING_FOR_SOURCE,
+                }
             ):
+                status_sequence += 1
+                status_store.write(
+                    identity_key=request.identity_key,
+                    provider=request.provider,
+                    worker_pid=os.getpid(),
+                    worker_state=STATE_CRASHED,
+                    payload={
+                        "current_candidate": None,
+                        "reason": f"worker failed: {type(error).__name__}: {error}",
+                    },
+                    sequence=status_sequence,
+                )
                 registry_store.transition(
                     identity_key=request.identity_key,
                     new_state=STATE_CRASHED,
