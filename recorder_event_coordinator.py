@@ -151,7 +151,7 @@ def _coordinator_log_path(
     )
 
 
-ef _observation_key(candidate: SourceCandidate) -> Tuple[object, ...]:
+def _observation_key(candidate: SourceCandidate) -> Tuple[object, ...]:
     return (
         candidate.playlist_url,
         str(candidate.extra.get("provider") or "UNKNOWN"),
