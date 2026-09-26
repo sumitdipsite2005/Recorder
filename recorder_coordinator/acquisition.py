@@ -217,6 +217,7 @@ def acquire_active_targets(
     *,
     progress_callback: Optional[Callable[[str], None]] = None,
     source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
+    quality_evidence_registry: Optional[Dict[str, Mapping[str, object]]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Dict[str, Tuple[SourceCandidate, ...]], Tuple[str, ...]]:
     def raise_if_cancelled() -> None:
@@ -226,6 +227,11 @@ def acquire_active_targets(
     cancellation_kwargs = (
         {"stop_requested": stop_requested}
         if stop_requested is not None
+        else {}
+    )
+    quality_registry_kwargs = (
+        {"quality_evidence_registry": quality_evidence_registry}
+        if quality_evidence_registry is not None
         else {}
     )
 
@@ -455,6 +461,7 @@ def acquire_active_targets(
         probed = probe_candidates(
             probe_pool,
             **cancellation_kwargs,
+            **quality_registry_kwargs,
         )
     else:
         progress_callback(f"Checking candidates 0/{len(probe_pool)}")
@@ -466,6 +473,7 @@ def acquire_active_targets(
                 )
             ),
             **cancellation_kwargs,
+            **quality_registry_kwargs,
         )
     raise_if_cancelled()
     probed_by_key = {_observation_key(candidate): candidate for candidate in probed}

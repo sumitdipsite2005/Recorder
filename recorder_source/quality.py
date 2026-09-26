@@ -161,6 +161,129 @@ def quality_signature(candidate: QualityLike) -> Tuple[int, int, float, int, str
     )
 
 
+def _merge_quality_source_labels(*values: object) -> str:
+    labels = []
+    for value in values:
+        for label in str(value or "").split("+"):
+            clean = label.strip()
+            if clean and clean not in labels:
+                labels.append(clean)
+    return "+".join(labels)
+
+
+def quality_evidence_snapshot(quality: QualityLike) -> dict:
+    """Return only reusable video-quality evidence and its provenance."""
+    snapshot = {
+        "quality_known": bool(_quality_value(quality, "quality_known", False)),
+        "quality_source": str(_quality_value(quality, "quality_source", "") or ""),
+        "video_fps": float(_quality_value(quality, "video_fps", 0.0) or 0.0),
+        "video_fps_source": str(_quality_value(quality, "video_fps_source", "") or ""),
+        "video_width": int(_quality_value(quality, "video_width", 0) or 0),
+        "video_height": int(_quality_value(quality, "video_height", 0) or 0),
+        "video_resolution_source": str(
+            _quality_value(quality, "video_resolution_source", "") or ""
+        ),
+        "video_bitrate_bps": int(
+            _quality_value(quality, "video_bitrate_bps", 0) or 0
+        ),
+        "video_bitrate_source": str(
+            _quality_value(quality, "video_bitrate_source", "") or ""
+        ),
+        "video_scan_type": normalize_video_scan_type(
+            _quality_value(quality, "video_scan_type", "")
+        ),
+        "video_scan_type_source": str(
+            _quality_value(quality, "video_scan_type_source", "") or ""
+        ),
+    }
+    if not has_quality_evidence(snapshot):
+        return {}
+    snapshot["quality_known"] = True
+    return snapshot
+
+
+def merge_persisted_quality_evidence(
+    current: Mapping[str, object],
+    persisted: Mapping[str, object],
+) -> dict:
+    """Fill only missing current quality facts from the same playback fingerprint."""
+    merged = dict(current)
+    filled = False
+
+    resolution_filled = False
+    for field in ("video_width", "video_height"):
+        if int(merged.get(field) or 0) <= 0 and int(persisted.get(field) or 0) > 0:
+            merged[field] = int(persisted.get(field) or 0)
+            resolution_filled = True
+            filled = True
+    if resolution_filled:
+        merged["video_resolution_source"] = _merge_quality_source_labels(
+            merged.get("video_resolution_source"),
+            persisted.get("video_resolution_source"),
+        )
+
+    if (
+        float(merged.get("video_fps") or 0.0) <= 0
+        and float(persisted.get("video_fps") or 0.0) > 0
+    ):
+        merged["video_fps"] = float(persisted.get("video_fps") or 0.0)
+        merged["video_fps_source"] = _merge_quality_source_labels(
+            merged.get("video_fps_source"),
+            persisted.get("video_fps_source"),
+        )
+        filled = True
+
+    if (
+        int(merged.get("video_bitrate_bps") or 0) <= 0
+        and int(persisted.get("video_bitrate_bps") or 0) > 0
+    ):
+        merged["video_bitrate_bps"] = int(persisted.get("video_bitrate_bps") or 0)
+        merged["video_bitrate_source"] = _merge_quality_source_labels(
+            merged.get("video_bitrate_source"),
+            persisted.get("video_bitrate_source"),
+        )
+        filled = True
+
+    if (
+        not normalize_video_scan_type(merged.get("video_scan_type"))
+        and normalize_video_scan_type(persisted.get("video_scan_type"))
+    ):
+        merged["video_scan_type"] = normalize_video_scan_type(
+            persisted.get("video_scan_type")
+        )
+        merged["video_scan_type_source"] = _merge_quality_source_labels(
+            merged.get("video_scan_type_source"),
+            persisted.get("video_scan_type_source"),
+        )
+        filled = True
+
+    if filled:
+        merged["quality_known"] = True
+        merged["quality_source"] = _merge_quality_source_labels(
+            merged.get("quality_source"),
+            persisted.get("quality_source"),
+        )
+    return merged
+
+
+def quality_evidence_complete(
+    quality: Mapping[str, object],
+    *,
+    require_scan_type: bool = False,
+) -> bool:
+    """Return whether cached evidence is enough to avoid deep quality fallback."""
+    return bool(
+        int(quality.get("video_width") or 0) > 0
+        and int(quality.get("video_height") or 0) > 0
+        and float(quality.get("video_fps") or 0.0) > 0
+        and int(quality.get("video_bitrate_bps") or 0) > 0
+        and (
+            not require_scan_type
+            or bool(normalize_video_scan_type(quality.get("video_scan_type")))
+        )
+    )
+
+
 def merge_ffprobe_quality_evidence(
     current: Mapping[str, object],
     ffprobe_quality: Mapping[str, object],

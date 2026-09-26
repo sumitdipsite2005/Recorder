@@ -147,6 +147,7 @@ def run_once(
     context_callback: Optional[Callable[[DashboardSnapshot], None]] = None,
     row_update_registry: Optional[Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]]] = None,
     source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
+    quality_evidence_registry: Optional[Dict[str, Mapping[str, object]]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[DashboardSnapshot, Tuple[ChangeEvent, ...]]:
     if stop_requested is not None and stop_requested():
@@ -169,12 +170,18 @@ def run_once(
             )
         )
     if window.status == "ACTIVE":
+        acquisition_kwargs = (
+            {"quality_evidence_registry": quality_evidence_registry}
+            if quality_evidence_registry is not None
+            else {}
+        )
         candidates_by_target, source_errors = acquire_active_targets(
             raw,
             target_views,
             progress_callback=progress_callback,
             source_freshness_registry=source_freshness_registry,
             stop_requested=stop_requested,
+            **acquisition_kwargs,
         )
     else:
         candidates_by_target, source_errors = {}, ()
@@ -509,6 +516,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
     display_order: Dict[str, List[str]] = {POLICY_ALL: [], POLICY_MANUAL: []}
     row_update_registry: Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]] = {}
     source_freshness_registry: Dict[str, Mapping[str, object]] = {}
+    quality_evidence_registry: Dict[str, Mapping[str, object]] = {}
     source_reference_registry: Dict[str, int] = {}
     started = datetime.now()
     output_paths = _coordinator_output_paths(config_path)
@@ -711,6 +719,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         ),
                         row_update_registry=row_update_registry,
                         source_freshness_registry=source_freshness_registry,
+                        quality_evidence_registry=quality_evidence_registry,
                         stop_requested=stop_event.is_set,
                     )
                 except KeyboardInterrupt:

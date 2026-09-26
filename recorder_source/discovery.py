@@ -36,6 +36,9 @@ from .quality import (
     extract_auth_expiry,
     merge_auth_expiries,
     merge_ffprobe_quality_evidence,
+    merge_persisted_quality_evidence,
+    quality_evidence_complete,
+    quality_evidence_snapshot,
     inspect_dash_manifest_drm,
     inspect_hls_manifest_drm,
     inspect_manifest_probe_evidence,
@@ -807,6 +810,7 @@ def probe_candidate_hls(
     *,
     timeout_sec: Optional[float] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    quality_evidence_registry: Optional[Dict[str, Mapping[str, object]]] = None,
 ) -> SourceCandidate:
     """Inspect one normalized candidate and return shared quality/probe facts."""
     if stop_requested is not None and stop_requested():
@@ -845,6 +849,7 @@ def probe_candidate_hls(
             urlopen_fn=urlopen,
         )
         manifest_expiry = _extract_expiry(final_url, text)
+        current_playback_fingerprint = playback_fingerprint(final_url, headers)
 
         def fetch_child_text(variant_url: str) -> str:
             child_text, _ = source_transport.fetch_stream_manifest_text(
@@ -956,18 +961,58 @@ def probe_candidate_hls(
             video_scan_type_source,
         )
 
+        current_quality = {
+            "quality_known": quality_known,
+            "quality_source": quality_source,
+            "video_fps": fps,
+            "video_fps_source": video_fps_source,
+            "video_width": width,
+            "video_height": height,
+            "video_resolution_source": video_resolution_source,
+            "video_bitrate_bps": bitrate,
+            "video_bitrate_source": video_bitrate_source,
+            "video_scan_type": scan_type,
+            "video_scan_type_source": video_scan_type_source,
+        }
+        cached_quality = (
+            quality_evidence_registry.get(current_playback_fingerprint)
+            if (
+                quality_evidence_registry is not None
+                and current_playback_fingerprint
+            )
+            else None
+        )
+        if cached_quality:
+            current_quality = merge_persisted_quality_evidence(
+                current_quality,
+                cached_quality,
+            )
+
+        quality_known = bool(current_quality.get("quality_known"))
+        quality_source = str(current_quality.get("quality_source") or "")
+        fps = float(current_quality.get("video_fps") or 0.0)
+        video_fps_source = str(current_quality.get("video_fps_source") or "")
+        width = int(current_quality.get("video_width") or 0)
+        height = int(current_quality.get("video_height") or 0)
+        video_resolution_source = str(
+            current_quality.get("video_resolution_source") or ""
+        )
+        bitrate = int(current_quality.get("video_bitrate_bps") or 0)
+        video_bitrate_source = str(
+            current_quality.get("video_bitrate_source") or ""
+        )
+        scan_type = str(current_quality.get("video_scan_type") or "")
+        video_scan_type_source = str(
+            current_quality.get("video_scan_type_source") or ""
+        )
+
         ffprobe_failure = ""
         bitrate_sample_failure = ""
-        manifest_complete = bool(
-            fps > 0
-            and width > 0
-            and height > 0
-            and bitrate > 0
+        quality_complete = quality_evidence_complete(
+            current_quality,
+            require_scan_type=is_hls,
         )
-        hls_needs_scan_type = bool(is_hls and not scan_type)
-        if probe_transport_launchable and (
-            not manifest_complete or hls_needs_scan_type
-        ):
+        if probe_transport_launchable and not quality_complete:
             if stop_requested is not None and stop_requested():
                 raise RuntimeError("Quality probe cancelled by stop request")
             try:
@@ -1036,6 +1081,29 @@ def probe_candidate_hls(
             except Exception as error:
                 ffprobe_failure = f"{type(error).__name__}: {error}"
 
+        final_quality = {
+            "quality_known": quality_known,
+            "quality_source": quality_source,
+            "video_fps": fps,
+            "video_fps_source": video_fps_source,
+            "video_width": width,
+            "video_height": height,
+            "video_resolution_source": video_resolution_source,
+            "video_bitrate_bps": bitrate,
+            "video_bitrate_source": video_bitrate_source,
+            "video_scan_type": scan_type,
+            "video_scan_type_source": video_scan_type_source,
+        }
+        if (
+            quality_evidence_registry is not None
+            and current_playback_fingerprint
+        ):
+            reusable_quality = quality_evidence_snapshot(final_quality)
+            if reusable_quality:
+                quality_evidence_registry[current_playback_fingerprint] = (
+                    reusable_quality
+                )
+
         probe_status = (
             "expired"
             if expired_now
@@ -1057,7 +1125,7 @@ def probe_candidate_hls(
             expiry=expiry,
             expiry_source="URL/manifest" if expiry is not None else "",
             stream_type="DASH" if is_dash else "HLS" if is_hls else candidate.stream_type,
-            playback_fingerprint=playback_fingerprint(final_url, headers),
+            playback_fingerprint=current_playback_fingerprint,
             quality_known=quality_known,
             quality_source=quality_source,
             video_width=width,
@@ -1245,6 +1313,7 @@ def probe_candidates(
     max_workers: int = QUALITY_PROBE_WORKERS,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    quality_evidence_registry: Optional[Dict[str, Mapping[str, object]]] = None,
 ) -> Tuple[SourceCandidate, ...]:
     """Probe each effective stream once and reuse that result across observations."""
     if stop_requested is not None and stop_requested():
@@ -1276,6 +1345,7 @@ def probe_candidates(
             representative_candidate,
             timeout_sec=timeout_sec,
             stop_requested=stop_requested,
+            quality_evidence_registry=quality_evidence_registry,
         )
 
     def failure_result(

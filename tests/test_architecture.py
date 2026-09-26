@@ -214,6 +214,22 @@ class ArchitectureGuardTests(unittest.TestCase):
         )
         self.assertIn("def sample_stream_video_bitrate(", quality)
 
+    def test_coordinator_quality_persistence_uses_playback_fingerprint_registry(self):
+        coordinator=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
+        acquisition=(ROOT/"recorder_coordinator"/"acquisition.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+
+        self.assertIn("quality_evidence_registry: Dict[str, Mapping[str, object]] = {}", coordinator)
+        self.assertIn("quality_evidence_registry=quality_evidence_registry", coordinator)
+        self.assertIn('"quality_evidence_registry": quality_evidence_registry', acquisition)
+        self.assertIn("current_playback_fingerprint = playback_fingerprint(final_url, headers)", discovery)
+        self.assertIn("merge_persisted_quality_evidence(", discovery)
+        self.assertIn("quality_evidence_complete(", discovery)
+        self.assertIn("def quality_evidence_snapshot(", quality)
+        self.assertIn("def merge_persisted_quality_evidence(", quality)
+        self.assertIn("def quality_evidence_complete(", quality)
+
     def test_coordinator_scan_uses_shared_cooperative_cancellation_contract(self):
         coordinator=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
         acquisition=(ROOT/"recorder_coordinator"/"acquisition.py").read_text(encoding="utf-8")

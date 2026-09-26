@@ -149,6 +149,45 @@ class CoordinatorCancellationTests(unittest.TestCase):
         self.assertIs(captured["stop_requested"], cancelled)
 
 
+class CoordinatorQualityPersistenceTests(unittest.TestCase):
+    def test_run_once_forwards_same_quality_registry_to_acquisition(self):
+        registry = {}
+        captured = []
+
+        class ConfigState:
+            raw_config = {}
+            def reload(self, now):
+                return (), False
+            def coordinator_window(self, now):
+                return type("Window", (), {"status": "ACTIVE"})()
+            def target_views(self, now, coordinator_active):
+                return ()
+
+        def fake_acquire(*args, **kwargs):
+            captured.append(kwargs.get("quality_evidence_registry"))
+            return {}, ()
+
+        with patch.object(coord, "acquire_active_targets", side_effect=fake_acquire), patch.object(
+            coord,
+            "build_snapshot",
+            return_value=type("Snapshot", (), {})(),
+        ), patch.object(coord, "diff_snapshots", return_value=()):
+            coord.run_once(
+                ConfigState(),
+                None,
+                quality_evidence_registry=registry,
+            )
+            coord.run_once(
+                ConfigState(),
+                None,
+                quality_evidence_registry=registry,
+            )
+
+        self.assertEqual(captured, [registry, registry])
+        self.assertIs(captured[0], registry)
+        self.assertIs(captured[1], registry)
+
+
 class OutputPathTests(unittest.TestCase):
     def test_coordinator_log_path_uses_configured_output_root(self):
         with tempfile.TemporaryDirectory() as td:

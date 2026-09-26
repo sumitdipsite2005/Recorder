@@ -38,6 +38,9 @@ from recorder_source.quality import (
     extract_auth_expiry,
     format_candidate_quality,
     merge_ffprobe_quality_evidence,
+    merge_persisted_quality_evidence,
+    quality_evidence_complete,
+    quality_evidence_snapshot,
     inspect_dash_manifest_drm,
     inspect_manifest_probe_evidence,
     parse_dash_manifest_quality,
@@ -954,6 +957,137 @@ https://edge.drmlive.net/live.mpd
         self.assertEqual(
             out.extra["manifest_variant_url"],
             "https://final.test/video.m3u8",
+        )
+
+    def test_persisted_quality_same_fingerprint_skips_repeat_deep_probe(self):
+        master = b'''#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=3322000,RESOLUTION=1920x1080
+video.m3u8
+'''
+        child = b'''#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6,
+seg.ts
+'''
+
+        class Headers:
+            def get(self, name, default=None):
+                return "application/vnd.apple.mpegurl"
+
+        class Response:
+            headers = Headers()
+            def __init__(self, body, final_url):
+                self.body = body
+                self.final_url = final_url
+                self.done = False
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self, n=-1):
+                if self.done:
+                    return b""
+                self.done = True
+                return self.body
+            def geturl(self):
+                return self.final_url
+
+        final_master = {"url": "https://final.test/master.m3u8"}
+
+        def fake_urlopen(request, timeout=0):
+            url = request.full_url
+            if url.endswith("/video.m3u8"):
+                return Response(child, "https://final.test/video.m3u8")
+            return Response(master, final_master["url"])
+
+        ffprobe = {
+            "quality_known": True,
+            "video_width": 1920,
+            "video_height": 1080,
+            "video_fps": 50.0,
+            "video_bitrate_bps": 3322000,
+            "video_bitrate_source": "manifest",
+            "video_scan_type": "progressive",
+        }
+        registry = {}
+        item = candidate(
+            stream_url="https://src.test/master.m3u8",
+            extra={"provider": "FANCODE", "source_group": "FANCODE"},
+        )
+
+        with patch(
+            "recorder_source.discovery.urlopen",
+            side_effect=fake_urlopen,
+        ), patch(
+            "recorder_source.discovery.probe_stream_quality_ffprobe",
+            return_value=ffprobe,
+        ) as deep_probe:
+            first = probe_candidate_hls(
+                item,
+                quality_evidence_registry=registry,
+            )
+            second = probe_candidate_hls(
+                item,
+                quality_evidence_registry=registry,
+            )
+
+            self.assertEqual(deep_probe.call_count, 1)
+            self.assertEqual(second.video_fps, 50.0)
+            self.assertEqual(second.video_fps_source, "ffprobe")
+            self.assertEqual(second.video_bitrate_bps, 3322000)
+            self.assertEqual(len(registry), 1)
+            self.assertIn(first.playback_fingerprint, registry)
+
+            final_master["url"] = "https://final.test/new-session.m3u8"
+            third = probe_candidate_hls(
+                item,
+                quality_evidence_registry=registry,
+            )
+
+        self.assertEqual(deep_probe.call_count, 2)
+        self.assertNotEqual(
+            first.playback_fingerprint,
+            third.playback_fingerprint,
+        )
+        self.assertEqual(len(registry), 2)
+
+    def test_persisted_quality_merge_never_overwrites_fresh_known_values(self):
+        persisted = {
+            "quality_known": True,
+            "quality_source": "manifest+ffprobe",
+            "video_width": 1920,
+            "video_height": 1080,
+            "video_resolution_source": "manifest",
+            "video_fps": 25.0,
+            "video_fps_source": "ffprobe",
+            "video_bitrate_bps": 3000000,
+            "video_bitrate_source": "sample",
+            "video_scan_type": "progressive",
+            "video_scan_type_source": "ffprobe",
+        }
+        current = {
+            "quality_known": True,
+            "quality_source": "manifest",
+            "video_width": 1920,
+            "video_height": 1080,
+            "video_resolution_source": "manifest",
+            "video_fps": 50.0,
+            "video_fps_source": "manifest",
+            "video_bitrate_bps": 0,
+            "video_bitrate_source": "",
+            "video_scan_type": "progressive",
+            "video_scan_type_source": "manifest",
+        }
+
+        merged = merge_persisted_quality_evidence(current, persisted)
+
+        self.assertEqual(merged["video_fps"], 50.0)
+        self.assertEqual(merged["video_fps_source"], "manifest")
+        self.assertEqual(merged["video_bitrate_bps"], 3000000)
+        self.assertTrue(
+            quality_evidence_complete(merged, require_scan_type=True)
+        )
+        self.assertEqual(
+            quality_evidence_snapshot(merged)["video_fps"],
+            50.0,
         )
 
     def test_shared_ffprobe_completion_samples_selected_stream_when_bitrate_missing(self):
