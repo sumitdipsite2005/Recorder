@@ -162,6 +162,22 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("playback_fingerprint(", discovery)
         self.assertNotIn("def _playback_fingerprint(", discovery)
 
+    def test_header_canonicalization_has_one_shared_owner(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        headers=(ROOT/"recorder_source"/"headers.py").read_text(encoding="utf-8")
+        self.assertIn("def canonicalize_header_name(", headers)
+        self.assertIn("source_headers.canonicalize_header_name(name)", recorder)
+        self.assertIn("canonicalize_header_name(", discovery)
+        self.assertNotIn("def _canonical_header_name(", discovery)
+
+    def test_discovery_expiry_merge_delegates_to_shared_quality_rule(self):
+        discovery=(ROOT/"recorder_source"/"discovery.py").read_text(encoding="utf-8")
+        quality=(ROOT/"recorder_source"/"quality.py").read_text(encoding="utf-8")
+        self.assertIn("def merge_auth_expiries(", quality)
+        self.assertIn("merged = merge_auth_expiries(*values)", discovery)
+        self.assertNotIn("return min(known) if known else None", discovery)
+
     def test_mature_recorder_consumes_shared_policy(self):
         text=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         self.assertIn("from recorder_source.policy import",text)
