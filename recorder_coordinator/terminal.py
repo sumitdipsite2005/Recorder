@@ -416,7 +416,6 @@ def _runtime_candidate_key(value: object) -> Tuple[object, ...]:
     return (
         str(getter("playlist_url", "") or ""),
         int(getter("matching_entry_index", 0) or 0),
-        str(getter("stream_url", "") or ""),
         str(getter("entry_title", "") or ""),
         str(getter("tvg_name", "") or ""),
         str(getter("group_title", "") or ""),
@@ -820,6 +819,11 @@ def render_dashboard(
                             getattr(candidate, "expiry_source", ""),
                         )
                     )
+                    expiry_display = (
+                        _warning_text(expiry_text, color)
+                        if getattr(candidate, "expiry", None) is None
+                        else _secondary_text(expiry_text, color)
+                    )
                     lines.append(
                         "        "
                         f"{marker_prefix}{state_prefix}{on_off} "
@@ -827,7 +831,7 @@ def render_dashboard(
                         f"{_secondary_text(tvg_name, color)} | "
                         f"{_group_text(group_name, color)} | "
                         f"{source_reference_text} | "
-                        f"{_secondary_text(expiry_text, color)} | "
+                        f"{expiry_display} | "
                         f"{_secondary_text(last_updated_text, color)} | "
                         f"{_secondary_text(freshness_text, color)}"
                         f"{trailing_decision}"
