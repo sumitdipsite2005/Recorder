@@ -198,6 +198,28 @@ class ManualRecordLaunchTests(unittest.TestCase):
         self.assertIn("  2. Second Event", rendered)
         self.assertNotIn("  1. First Event", rendered)
 
+    def test_manual_record_menu_reuses_event_and_identity_colors(self):
+        item=sony_candidate(title="Example Event")
+        snap=snapshot([item])
+        identity_key=next(
+            identity
+            for policy,identity in snap.blocks
+            if policy==coord.POLICY_MANUAL
+        )
+        rendered=coord.render_manual_record_menu(
+            snap,
+            ((1,identity_key),),
+            use_color=True,
+        )
+        self.assertIn(
+            "\033[38;2;41;159;214mExample Event\033[0m",
+            rendered,
+        )
+        self.assertIn(
+            "\033[38;2;145;153;160mlane:2120305/AG_Strea2309/ENG\033[0m",
+            rendered,
+        )
+
     def test_manual_launch_handoff_contains_selected_exact_source_and_identity(self):
         snap = snapshot([sony_candidate()])
         identity_key = next(
@@ -742,11 +764,11 @@ class SnapshotAndChangeTests(unittest.TestCase):
             colored,
         )
         self.assertIn(
-            "\033[38;2;255;215;0m[RECORDING]\033[0m",
+            "\033[38;2;255;135;3m[RECORDING]\033[0m",
             colored,
         )
         self.assertIn(
-            "\033[38;2;255;215;0mRECORDING\033[0m",
+            "\033[38;2;255;135;3mRECORDING\033[0m",
             colored,
         )
 
@@ -1084,6 +1106,34 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("\033[38;2;41;159;214mHockey\033[0m",rendered)
         self.assertIn("\033[1;93m[NEW]\033[0m",rendered)
 
+    def test_normal_on_is_uncolored_and_off_is_bright_red(self):
+        on_rendered=coord.render_dashboard(
+            snapshot([sony_candidate()]),
+            (),
+            use_color=True,
+        )
+        self.assertIn("[ON]",on_rendered)
+        self.assertNotIn("\033[1;92m[ON]\033[0m",on_rendered)
+
+        expired=replace(
+            sony_candidate(launchable=False,status="expired"),
+            expiry=datetime(2026,9,24,9,30,0).timestamp(),
+            expiry_source="manifest",
+        )
+        off_rendered=coord.render_dashboard(
+            snapshot([expired]),
+            (),
+            use_color=True,
+        )
+        self.assertIn("\033[1;91m[OFF]\033[0m",off_rendered)
+
+    def test_transient_update_marker_is_bright_yellow(self):
+        old=snapshot([sony_candidate(title="Shooting")])
+        new=snapshot([sony_candidate(title="Athletics")])
+        events=coord.diff_snapshots(old,new)
+        rendered=coord.render_dashboard(new,events,use_color=True)
+        self.assertIn("\033[1;93m[UPDATE]\033[0m",rendered)
+
     def test_source_reference_and_footer_share_muted_treatment_without_row_source_name(self):
         snap=snapshot([sony_candidate()])
         rendered=coord.render_dashboard(snap,(),use_color=True)
@@ -1205,9 +1255,60 @@ class SnapshotAndChangeTests(unittest.TestCase):
             if "Lower Event" in line
         )
         self.assertIn("\033[1;97;42m[SELECTED]\033[0m",selected_line)
-        self.assertIn("\033[1;92m[ON]\033[0m",selected_line)
+        self.assertIn("[ON]",selected_line)
+        self.assertNotIn("\033[1;92m[ON]\033[0m",selected_line)
         self.assertLess(selected_line.index("[SELECTED]"),selected_line.index("[ON]"))
         self.assertIn("not selected: lower quality",lower_line)
+
+    def test_same_feed_context_reason_is_not_user_facing(self):
+        context=sony_candidate(
+            playlist="https://context.test/list",
+            source_name="context-source",
+            title="Men's Marathon - Athletics - 26 Sep 2026 [ENG]",
+            tvg="",
+            ignored=True,
+            reason=(
+                "same feed identity context; source metadata is compatible "
+                "but less specific than a matching observation"
+            ),
+        )
+        snap=snapshot([context])
+        identity_key=next(
+            identity
+            for policy,identity in snap.blocks
+            if policy==coord.POLICY_MANUAL
+        )
+        runtime_row=runtime_candidate(
+            context,
+            status="IGNORED",
+            reason=(
+                "HLS (example.test) — same feed identity context; "
+                "source metadata is compatible but less specific than a matching observation"
+            ),
+            classification="IGNORED",
+        )
+        rendered=coord.render_dashboard(
+            snap,
+            (),
+            registry_entries={
+                identity_key:{
+                    "state":"RECORDING",
+                    "provider":"SONYLIV",
+                    "worker_pid":4321,
+                }
+            },
+            runtime_statuses={
+                identity_key:{
+                    "worker_state":"RECORDING",
+                    "current_candidate":None,
+                    "candidates":[runtime_row],
+                    "target_names":["T"],
+                    "source_count":1,
+                }
+            },
+        )
+        self.assertIn("[ON] Men's Marathon",rendered)
+        self.assertNotIn("same feed identity context",rendered)
 
     def test_unavailable_expiry_classification_is_front_loaded(self):
         expiry=datetime(2026,9,24,9,30,0).timestamp()

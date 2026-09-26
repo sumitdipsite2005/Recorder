@@ -61,7 +61,7 @@ _IMPORTANT_RGB = (220, 220, 220)
 _RUNTIME_STATE_RGB = {
     "AVAILABLE": _IMPORTANT_RGB,
     "LAUNCHING": _EVENT_RGB,
-    "RECORDING": _CHANGE_DETAIL_RGB,
+    "RECORDING": _MARKER_RGB,
     "ACTIVE": _CHANGE_DETAIL_RGB,
     "WAITING_FOR_SOURCE": _MARKER_RGB,
     "ENDED": _MUTED_RGB,
@@ -127,11 +127,12 @@ def _ansi_text(text: str, code: str, use_color: bool) -> str:
 
 
 def _on_text(text: str, use_color: bool) -> str:
-    return _ansi_text(text, "1;92", use_color)
+    # ON is the normal/default state; do not spend an attention color on it.
+    return text
 
 
 def _off_text(text: str, use_color: bool) -> str:
-    return _ansi_text(text, "1;93", use_color)
+    return _ansi_text(text, "1;91", use_color)
 
 
 def _warning_text(text: str, use_color: bool) -> str:
@@ -340,10 +341,8 @@ def _marker_text(events: Sequence[ChangeEvent], use_color: bool) -> str:
         return ""
 
     def marker(event: ChangeEvent) -> str:
-        text = f"[{event.marker}]"
-        if event.marker == "NEW":
-            return _warning_text(text, use_color)
-        return _marker(text, use_color)
+        # Change markers are temporary and should stand out from steady states.
+        return _warning_text(f"[{event.marker}]", use_color)
 
     return " ".join(marker(event) for event in events) + " "
 
@@ -506,6 +505,14 @@ def _classification_text(text: str, use_color: bool) -> str:
     if str(text or "").startswith("DRM "):
         return _hard_failure_text(text, use_color)
     return _warning_text(text, use_color)
+
+
+def _dashboard_decision_reason(value: object) -> str:
+    """Hide internal same-feed bookkeeping from the user-facing dashboard."""
+    text = str(value or "").strip()
+    if "same feed identity context" in text.casefold():
+        return ""
+    return text
 
 
 def render_dashboard(
@@ -759,7 +766,7 @@ def render_dashboard(
                     if len(quality_keys) > 1:
                         suffix.append(_marker("[BEST]", color))
                     suffix.extend(
-                        _marker(f"[{event.marker}]", color)
+                        _warning_text(f"[{event.marker}]", color)
                         for event in quality_events.get(block_key, ())
                     )
                 suffix_text = " " + " ".join(suffix) if suffix else ""
@@ -825,7 +832,9 @@ def render_dashboard(
                         candidate
                     )
                     classification = runtime_classification or local_classification
-                    decision_reason = runtime_reason or local_reason
+                    decision_reason = _dashboard_decision_reason(
+                        runtime_reason or local_reason
+                    )
 
                     on_off = (
                         _on_text("[ON]", color)
@@ -1112,7 +1121,10 @@ def render_coordinator_controls(sound_state: SoundSnoozeState) -> str:
 def render_manual_record_menu(
     snapshot: DashboardSnapshot,
     identity_choices: Sequence[Tuple[int, str]],
+    *,
+    use_color: Optional[bool] = None,
 ) -> str:
+    color = _terminal_is_interactive() if use_color is None else bool(use_color)
     lines = [
         "",
         "================ RECORD MANUAL IDENTITY ================",
@@ -1130,10 +1142,10 @@ def render_manual_record_menu(
             else ""
         ) or identity_key
         quality = quality_text(candidate, include_provenance=False)
-        lines.append(f"  {number}. {title}")
+        lines.append(f"  {number}. {_event_title(title, color)}")
         lines.append(
             f"     {block.identity.provider} | "
-            f"{block.identity.lane_key} | {quality}"
+            f"{_identity_text(block.identity.lane_key, color)} | {quality}"
         )
     lines.extend([
         "",
