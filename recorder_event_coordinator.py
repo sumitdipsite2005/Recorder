@@ -1218,6 +1218,7 @@ def _launch_manual_identity(
         provider=plan.identity.provider,
         selected_source_group=plan.selected_source_group,
         selected_candidate=plan.selected_candidate,
+        initial_candidate_pool=plan.candidate_pool,
         target_intents=plan.target_intents,
         recovery_playlist_urls=recovery_playlist_urls,
         recording_duration_min=plan.recording_duration_min,
