@@ -60,6 +60,21 @@ class ManualLaunchPlanTests(unittest.TestCase):
             "FanCode - Presidents Cup 2026 [English] - 4249106",
         )
 
+    def test_coordinator_filename_does_not_use_tvg_name(self):
+        item = SourceCandidate(
+            entry_title="",
+            tvg_name="Very Long TVG Name That Must Not Enter The Filename",
+            group_title="FanCode",
+        )
+        self.assertEqual(
+            _safe_base_name(
+                item,
+                "Presidents Cup",
+                "/mumbai/4249106_english_hls_b86f41b4c015704_1ta-di_h264",
+            ),
+            "FanCode - Presidents Cup - 4249106",
+        )
+
     def snapshot_for(self, targets, candidates_by_target):
         all_candidates = [
             candidate
