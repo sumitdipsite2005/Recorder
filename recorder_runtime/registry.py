@@ -24,6 +24,10 @@ from recorder_runtime.paths import RecorderOutputPaths
 SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
 
+# Hard Coordinator safety ceiling. Because the check is enforced while holding
+# the registry lock, MANUAL and ALL_IDENTITIES launches share one atomic limit.
+MAX_ACTIVE_IDENTITY_WORKERS = 20
+
 STATE_LAUNCHING = "LAUNCHING"
 STATE_RECORDING = "RECORDING"
 STATE_WAITING_FOR_SOURCE = "WAITING_FOR_SOURCE"
@@ -415,6 +419,21 @@ class IdentityRegistryStore:
                 raise IdentityLaunchBlocked(
                     f"{identity_key} is already {existing.get('state')} "
                     "in the current registry session"
+                )
+
+            active_count = sum(
+                1
+                for existing in entries.values()
+                if (
+                    isinstance(existing, Mapping)
+                    and existing.get("state") in OWNERSHIP_STATES
+                )
+            )
+            if active_count >= MAX_ACTIVE_IDENTITY_WORKERS:
+                raise IdentityLaunchBlocked(
+                    "Coordinator active recording limit reached "
+                    f"({active_count}/{MAX_ACTIVE_IDENTITY_WORKERS}); "
+                    "new launch blocked"
                 )
 
             entry: Dict[str, object] = {
