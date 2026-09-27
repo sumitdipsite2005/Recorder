@@ -359,7 +359,12 @@ def _coordinator_rendition_key(candidate) -> str:
 
 
 def _quality_group_key(candidate) -> Tuple[object, ...]:
-    """Group alternate entry points only when the rendition itself is known."""
+    """Build the first-stage technical quality group key.
+
+    Same-rendition rows may carry different bitrate evidence, so rendition
+    identity remains useful here. Presentation performs a second merge so one
+    canonical identity never repeats an identical visible Quality heading.
+    """
     rendition_key = _coordinator_rendition_key(candidate)
     if rendition_key:
         quality = _quality_key(candidate)
@@ -403,6 +408,73 @@ def _quality_evidence_rank(candidate) -> Tuple[object, ...]:
         int(bool(getattr(candidate, "video_scan_type", ""))),
         freshness,
     )
+
+
+def _merge_display_equivalent_quality_groups(
+    grouped: Mapping[
+        Tuple[object, ...],
+        Sequence[Tuple[object, object]],
+    ],
+) -> Tuple[
+    Dict[Tuple[object, ...], List[Tuple[object, object]]],
+    Dict[Tuple[object, ...], Tuple[object, ...]],
+]:
+    """Merge technical groups that would render the same Quality heading.
+
+    Product rule: inside one canonical identity, identical visible quality must
+    appear once. The first-stage rendition grouping is retained so alternate
+    bitrate evidence for the same actual rendition still collapses correctly.
+    """
+    merged: Dict[Tuple[object, ...], List[Tuple[object, object]]] = {}
+    aliases: Dict[Tuple[object, ...], Tuple[object, ...]] = {}
+
+    for technical_key, rows in grouped.items():
+        representative = max(
+            (candidate for _, candidate in rows),
+            key=_quality_evidence_rank,
+        )
+        display_key = ("display",) + tuple(_quality_key(representative))
+        aliases[technical_key] = display_key
+        target_rows = merged.setdefault(display_key, [])
+
+        seen_rows = {
+            (
+                source.source_id,
+                candidate.entry_title,
+                candidate.tvg_name,
+                candidate.group_title,
+                candidate_state(candidate),
+            )
+            for source, candidate in target_rows
+        }
+        for source, candidate in rows:
+            row_identity = (
+                source.source_id,
+                candidate.entry_title,
+                candidate.tvg_name,
+                candidate.group_title,
+                candidate_state(candidate),
+            )
+            if row_identity in seen_rows:
+                continue
+            seen_rows.add(row_identity)
+            target_rows.append((source, candidate))
+
+    return merged, aliases
+
+
+def _event_name_sort_key(candidate) -> str:
+    """Normalize an event name only for stable alphabetical presentation."""
+    raw = str(
+        getattr(candidate, "entry_title", "")
+        or getattr(candidate, "tvg_name", "")
+        or ""
+    ).casefold()
+    normalized = "".join(
+        character if character.isalnum() else " "
+        for character in raw
+    )
+    return " ".join(normalized.split())
 
 
 def _event_maps(events: Sequence[ChangeEvent]):
@@ -837,15 +909,27 @@ def render_dashboard(
                     seen_rows.add(row_identity)
                     grouped.setdefault(key, []).append((source, candidate))
 
+            grouped, quality_key_aliases = _merge_display_equivalent_quality_groups(
+                grouped
+            )
+
             representatives: Dict[Tuple[object, ...], object] = {}
             for quality_key, rows in grouped.items():
+                # Stable multi-pass ordering:
+                #   1. Last Updated (newest)
+                #   2. normalized event name (A-Z)
+                #   3. Source Updated (newest) only when the first two tie
                 rows.sort(
-                    key=lambda item: (
-                        block.row_last_updated.get(
-                            candidate_row_key(item[1]),
-                            datetime.min,
-                        ),
-                        float(item[1].extra.get("source_freshness_ts") or 0.0),
+                    key=lambda item: float(
+                        item[1].extra.get("source_freshness_ts") or 0.0
+                    ),
+                    reverse=True,
+                )
+                rows.sort(key=lambda item: _event_name_sort_key(item[1]))
+                rows.sort(
+                    key=lambda item: block.row_last_updated.get(
+                        candidate_row_key(item[1]),
+                        datetime.min,
                     ),
                     reverse=True,
                 )
@@ -854,7 +938,11 @@ def render_dashboard(
                     key=_quality_evidence_rank,
                 )
 
-            best_key = _quality_group_key(block.best_candidate)
+            technical_best_key = _quality_group_key(block.best_candidate)
+            best_key = quality_key_aliases.get(
+                technical_best_key,
+                ("display",) + tuple(_quality_key(block.best_candidate)),
+            )
             quality_keys = sorted(
                 grouped,
                 key=lambda key: (
