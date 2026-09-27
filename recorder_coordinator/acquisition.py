@@ -458,7 +458,13 @@ def acquire_active_targets(
         fetched_urls = set(documents)
         for key in source_specs_by_key:
             if key[0] not in fetched_urls:
-                failed_source_keys.add(key)
+                failed_source_keys.add(
+                    (
+                        str(key[0]),
+                        str(key[1]).strip().upper(),
+                        str(key[2]).strip().upper(),
+                    )
+                )
 
     freshness_by_url: Dict[str, Mapping[str, object]] = {}
     freshness_now = time.time()
