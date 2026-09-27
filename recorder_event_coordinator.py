@@ -632,6 +632,40 @@ def _has_visible_transient(
     )
 
 
+def _restore_dashboard_after_temporary_menu(
+    snapshot: Optional[DashboardSnapshot],
+    display_order: Mapping[str, Sequence[str]],
+    *,
+    config_path: Path,
+    refresh_interval_sec: float,
+    registry_entries: Mapping[str, Mapping[str, object]],
+    runtime_statuses: Mapping[str, Mapping[str, object]],
+    source_references: Mapping[str, int],
+    watch_text: str = "",
+) -> None:
+    """Remove a temporary menu and restore the last completed Coordinator view."""
+    if snapshot is None:
+        clear_live_status_line()
+        return
+
+    clear_live_status_line()
+    terminal_text = render_dashboard(
+        snapshot,
+        (),
+        display_order,
+        config_path=config_path,
+        refresh_interval_sec=refresh_interval_sec,
+        use_color=True,
+        registry_entries=registry_entries,
+        runtime_statuses=runtime_statuses,
+        source_references=source_references,
+    )
+    clear_dashboard_terminal()
+    print(terminal_text)
+    if watch_text:
+        set_live_status_line(watch_text)
+
+
 def run(config_path: Path, *, once: bool = False) -> int:
     state = CoordinatorConfigState(config_path)
     previous: Optional[DashboardSnapshot] = None
@@ -715,15 +749,36 @@ def run(config_path: Path, *, once: bool = False) -> int:
     record_choices: Tuple[Tuple[int, str], ...] = ()
     last_completed_raw_config: Mapping[str, object] = {}
 
-    def process_record_control(command: str, normalized: str) -> bool:
+    def process_record_control(
+        command: str,
+        normalized: str,
+        *,
+        during_scan: bool = False,
+    ) -> bool:
         nonlocal record_menu_open, record_choices, next_registry_refresh_monotonic
+        nonlocal dashboard_has_transient
 
         if record_menu_open:
             if normalized in {"__esc__", "esc", "cancel"}:
                 record_menu_open = False
                 record_choices = ()
-                clear_live_status_line()
-                print("Record selection cancelled.")
+                watch_text = ""
+                if not during_scan and next_refresh_monotonic > 0:
+                    watch_text = watch_status_text(
+                        last_scan_wall_time,
+                        next_refresh_monotonic,
+                    )
+                _restore_dashboard_after_temporary_menu(
+                    previous,
+                    display_order,
+                    config_path=config_path,
+                    refresh_interval_sec=state.refresh_interval_sec,
+                    registry_entries=registry_entries,
+                    runtime_statuses=runtime_statuses,
+                    source_references=source_reference_registry,
+                    watch_text=watch_text,
+                )
+                dashboard_has_transient = False
                 return True
 
             number_text = ""
@@ -1020,6 +1075,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         if process_record_control(
                             scan_command,
                             scan_normalized,
+                            during_scan=True,
                         ):
                             continue
 
