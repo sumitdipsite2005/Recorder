@@ -70,6 +70,27 @@ def _primary_metadata_values(candidate: SourceCandidate) -> Tuple[str, ...]:
     return tuple(values)
 
 
+def _metadata_values_compatible(
+    left_values: Sequence[str],
+    right_values: Sequence[str],
+) -> bool:
+    """Return whether two primary-metadata descriptions can describe one event."""
+    if not left_values or not right_values:
+        return False
+    for left in left_values:
+        for right in right_values:
+            if left == right:
+                return True
+            shorter, longer = (
+                (left, right)
+                if len(left) <= len(right)
+                else (right, left)
+            )
+            if len(shorter) >= 8 and shorter in longer:
+                return True
+    return False
+
+
 def _metadata_compatible_with_matching(
     candidate: SourceCandidate,
     matching_candidates: Sequence[SourceCandidate],
@@ -87,18 +108,7 @@ def _metadata_compatible_with_matching(
     if not matching_values:
         return True
 
-    for current in current_values:
-        for matching in matching_values:
-            if current == matching:
-                return True
-            shorter, longer = (
-                (current, matching)
-                if len(current) <= len(matching)
-                else (matching, current)
-            )
-            if len(shorter) >= 8 and shorter in longer:
-                return True
-    return False
+    return _metadata_values_compatible(current_values, matching_values)
 
 
 def _context_candidate_for_target(
@@ -162,24 +172,87 @@ def _identity_serialized(candidate: SourceCandidate) -> str:
     return derive_feed_identity(candidate, provider).serialized
 
 
+def _conflict_metadata_clusters(
+    candidates: Sequence[SourceCandidate],
+) -> List[List[SourceCandidate]]:
+    """Cluster conflicting observations that describe the same apparent event."""
+    clusters: List[List[SourceCandidate]] = []
+    for candidate in candidates:
+        candidate_values = _primary_metadata_values(candidate)
+        matching_indexes = [
+            index
+            for index, cluster in enumerate(clusters)
+            if any(
+                _metadata_values_compatible(
+                    candidate_values,
+                    _primary_metadata_values(existing),
+                )
+                for existing in cluster
+            )
+        ]
+        if not matching_indexes:
+            clusters.append([candidate])
+            continue
+
+        first_index = matching_indexes[0]
+        clusters[first_index].append(candidate)
+        for merge_index in reversed(matching_indexes[1:]):
+            clusters[first_index].extend(clusters.pop(merge_index))
+    return clusters
+
+
+def _cluster_metadata_values(
+    cluster: Sequence[SourceCandidate],
+) -> Tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        value
+        for candidate in cluster
+        for value in _primary_metadata_values(candidate)
+    ))
+
+
 def _freshness_eligible_identity_keys(
     candidates: Sequence[SourceCandidate],
+    *,
+    target_name: str = "",
+    transition_registry: Optional[
+        Dict[Tuple[str, str], Mapping[str, object]]
+    ] = None,
 ) -> Set[str]:
     """Return identities that remain target-eligible after freshness review.
 
-    Matching rows are marked ignored=False. Same-identity context rows are
-    freshness-disqualifying only when their primary metadata actually conflicts
-    with the matching observation. Shorter/incomplete metadata is not evidence
-    that the feed moved to another event. Unknown freshness and ties containing
-    matching evidence remain conservative: keep.
+    A single newer conflicting source is treated as an unconfirmed transition:
+    keep the identity for one completed scan and require the same conflicting
+    metadata to persist on the next scan. Two independent newer sources that
+    agree on the moved-to event confirm the transition immediately.
+
+    A matching observation that catches up to or exceeds the conflicting
+    freshness cancels any pending/confirmed transition. This keeps stale rows
+    from winning forever while preventing one noisy source from flapping the
+    Coordinator.
     """
     by_identity: Dict[str, List[SourceCandidate]] = {}
     for candidate in candidates:
         by_identity.setdefault(_identity_serialized(candidate), []).append(candidate)
 
+    if transition_registry is not None and target_name:
+        active_registry_keys = {
+            (target_name, identity_key)
+            for identity_key in by_identity
+        }
+        for registry_key in tuple(transition_registry):
+            if (
+                registry_key[0] == target_name
+                and registry_key not in active_registry_keys
+            ):
+                transition_registry.pop(registry_key, None)
+
     eligible: Set[str] = set()
     for identity_key, identity_candidates in by_identity.items():
-        known = []
+        state_key = (target_name, identity_key)
+        matching_known: List[Tuple[float, SourceCandidate]] = []
+        conflicting_known: List[Tuple[float, SourceCandidate]] = []
+
         for candidate in identity_candidates:
             if (
                 candidate.ignored
@@ -188,25 +261,120 @@ def _freshness_eligible_identity_keys(
                 ) is False
             ):
                 continue
+
             value = candidate.extra.get("source_freshness_ts")
             try:
                 timestamp = float(value)
             except (TypeError, ValueError):
                 continue
-            known.append((timestamp, candidate))
 
-        if not known:
+            if candidate.ignored:
+                conflicting_known.append((timestamp, candidate))
+            else:
+                matching_known.append((timestamp, candidate))
+
+        if not conflicting_known:
             eligible.add(identity_key)
+            if transition_registry is not None:
+                transition_registry.pop(state_key, None)
             continue
 
-        newest = max(timestamp for timestamp, _ in known)
-        freshest = [
-            candidate
-            for timestamp, candidate in known
-            if timestamp == newest
+        newest_matching = (
+            max(timestamp for timestamp, _ in matching_known)
+            if matching_known
+            else None
+        )
+        newer_conflicts = [
+            (timestamp, candidate)
+            for timestamp, candidate in conflicting_known
+            if newest_matching is None or timestamp > newest_matching
         ]
-        if any(not candidate.ignored for candidate in freshest):
+        if not newer_conflicts:
             eligible.add(identity_key)
+            if transition_registry is not None:
+                transition_registry.pop(state_key, None)
+            continue
+
+        clusters = _conflict_metadata_clusters(
+            [candidate for _, candidate in newer_conflicts]
+        )
+        agreeing_cluster = next(
+            (
+                cluster
+                for cluster in clusters
+                if len({
+                    str(candidate.playlist_url or "")
+                    for candidate in cluster
+                    if str(candidate.playlist_url or "")
+                }) >= 2
+            ),
+            None,
+        )
+        if agreeing_cluster is not None:
+            if transition_registry is not None:
+                transition_registry[state_key] = {
+                    "status": "confirmed",
+                    "metadata_values": _cluster_metadata_values(
+                        agreeing_cluster
+                    ),
+                }
+            continue
+
+        # Different newer sources disagree with each other. Do not guess which
+        # event won, and do not carry a previous pending decision through the
+        # ambiguity.
+        if len(clusters) != 1:
+            eligible.add(identity_key)
+            if transition_registry is not None:
+                transition_registry.pop(state_key, None)
+            continue
+
+        cluster = clusters[0]
+        current_values = _cluster_metadata_values(cluster)
+        previous_state = (
+            transition_registry.get(state_key)
+            if transition_registry is not None
+            else None
+        )
+        previous_values = tuple(
+            str(value)
+            for value in (
+                previous_state.get("metadata_values", ())
+                if isinstance(previous_state, Mapping)
+                else ()
+            )
+            if str(value)
+        )
+        same_transition = bool(
+            previous_values
+            and _metadata_values_compatible(
+                previous_values,
+                current_values,
+            )
+        )
+
+        if (
+            same_transition
+            and isinstance(previous_state, Mapping)
+            and str(previous_state.get("status") or "") == "confirmed"
+        ):
+            # Already confirmed on an earlier scan; remain moved until matching
+            # evidence catches up or the conflicting event itself changes.
+            continue
+
+        if same_transition and transition_registry is not None:
+            transition_registry[state_key] = {
+                "status": "confirmed",
+                "metadata_values": current_values,
+            }
+            continue
+
+        eligible.add(identity_key)
+        if transition_registry is not None:
+            transition_registry[state_key] = {
+                "status": "pending",
+                "metadata_values": current_values,
+            }
 
     return eligible
 
@@ -217,6 +385,9 @@ def acquire_active_targets(
     *,
     progress_callback: Optional[Callable[[str], None]] = None,
     source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
+    event_transition_registry: Optional[
+        Dict[Tuple[str, str], Mapping[str, object]]
+    ] = None,
     quality_evidence_registry: Optional[Dict[str, Mapping[str, object]]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Dict[str, Tuple[SourceCandidate, ...]], Tuple[str, ...]]:
@@ -441,7 +612,11 @@ def acquire_active_targets(
     # Ambiguous ties and identities with no usable freshness remain visible.
     for target_name, candidates in raw_candidates_by_target.items():
         raise_if_cancelled()
-        eligible_identity_keys = _freshness_eligible_identity_keys(candidates)
+        eligible_identity_keys = _freshness_eligible_identity_keys(
+            candidates,
+            target_name=target_name,
+            transition_registry=event_transition_registry,
+        )
         raw_candidates_by_target[target_name] = [
             candidate
             for candidate in candidates
