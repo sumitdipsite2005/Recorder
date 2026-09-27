@@ -325,18 +325,33 @@ def _quality_key(candidate) -> Tuple[int, int, float, int, str]:
 
 
 def _coordinator_rendition_key(candidate) -> str:
-    """Return the actual media-rendition path used for Coordinator grouping."""
+    """Return a confidently identified media-rendition path for grouping."""
     if candidate is None:
         return ""
     extra = candidate.extra if isinstance(candidate.extra, Mapping) else {}
-    resolved_url = str(
-        extra.get("manifest_variant_url")
-        or candidate.final_stream_url
+    selected_child = str(extra.get("manifest_variant_url") or "").strip()
+    resolved_url = selected_child or str(
+        candidate.final_stream_url
         or candidate.stream_url
         or ""
     ).strip()
     if not resolved_url:
         return ""
+
+    # A master/index URL can expose several real renditions. Without a resolved
+    # child path it is not specific enough to prove two rows are the same
+    # quality rendition.
+    if not selected_child:
+        clean_path = resolved_url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        terminal_name = clean_path.rsplit("/", 1)[-1].casefold()
+        if terminal_name in {
+            "master.m3u8",
+            "index.m3u8",
+            "playlist.m3u8",
+            "manifest.m3u8",
+        }:
+            return ""
+
     return quality_persistence_identity(
         candidate,
         resolved_url=resolved_url,
@@ -344,10 +359,17 @@ def _coordinator_rendition_key(candidate) -> str:
 
 
 def _quality_group_key(candidate) -> Tuple[object, ...]:
-    """Group alternate entry points to the same actual media rendition."""
+    """Group alternate entry points only when the rendition itself is known."""
     rendition_key = _coordinator_rendition_key(candidate)
     if rendition_key:
-        return ("rendition", rendition_key)
+        quality = _quality_key(candidate)
+        return (
+            "rendition",
+            rendition_key,
+            quality[0],
+            quality[1],
+            quality[2],
+        )
     return ("quality",) + tuple(_quality_key(candidate))
 
 
