@@ -150,6 +150,9 @@ def run_once(
     context_callback: Optional[Callable[[DashboardSnapshot], None]] = None,
     row_update_registry: Optional[Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]]] = None,
     source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
+    event_transition_registry: Optional[
+        Dict[Tuple[str, str], Mapping[str, object]]
+    ] = None,
     quality_evidence_registry: Optional[Dict[str, Mapping[str, object]]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[DashboardSnapshot, Tuple[ChangeEvent, ...]]:
@@ -183,6 +186,7 @@ def run_once(
             target_views,
             progress_callback=progress_callback,
             source_freshness_registry=source_freshness_registry,
+            event_transition_registry=event_transition_registry,
             stop_requested=stop_requested,
             **acquisition_kwargs,
         )
@@ -634,6 +638,9 @@ def run(config_path: Path, *, once: bool = False) -> int:
     display_order: Dict[str, List[str]] = {POLICY_ALL: [], POLICY_MANUAL: []}
     row_update_registry: Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]] = {}
     source_freshness_registry: Dict[str, Mapping[str, object]] = {}
+    event_transition_registry: Dict[
+        Tuple[str, str], Mapping[str, object]
+    ] = {}
     quality_evidence_registry: Dict[str, Mapping[str, object]] = {}
     source_reference_registry: Dict[str, int] = {}
     started = datetime.now()
@@ -837,6 +844,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         ),
                         row_update_registry=row_update_registry,
                         source_freshness_registry=source_freshness_registry,
+                        event_transition_registry=event_transition_registry,
                         quality_evidence_registry=quality_evidence_registry,
                         stop_requested=stop_event.is_set,
                     )
