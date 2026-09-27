@@ -389,6 +389,7 @@ def acquire_active_targets(
         Dict[Tuple[str, str], Mapping[str, object]]
     ] = None,
     quality_evidence_registry: Optional[Dict[str, Mapping[str, object]]] = None,
+    failed_source_keys: Optional[Set[Tuple[str, str, str]]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Dict[str, Tuple[SourceCandidate, ...]], Tuple[str, ...]]:
     def raise_if_cancelled() -> None:
@@ -451,6 +452,13 @@ def acquire_active_targets(
         )
 
     raise_if_cancelled()
+
+    if failed_source_keys is not None:
+        failed_source_keys.clear()
+        fetched_urls = set(documents)
+        for key in source_specs_by_key:
+            if key[0] not in fetched_urls:
+                failed_source_keys.add(key)
 
     freshness_by_url: Dict[str, Mapping[str, object]] = {}
     freshness_now = time.time()
@@ -534,6 +542,8 @@ def acquire_active_targets(
                 stream_headers=spec.stream_headers,
             )
         except Exception as error:
+            if failed_source_keys is not None:
+                failed_source_keys.add(key)
             errors.append(
                 f"{spec.name}: discovery parse failed ({type(error).__name__}: {error})"
             )
