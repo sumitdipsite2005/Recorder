@@ -774,17 +774,25 @@ def fetch_playlist_documents(
     if not unique_sources:
         return documents, tuple(errors), diagnostics
 
-    with ThreadPoolExecutor(
+    executor = ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="playlist_fetch",
-    ) as executor:
-        future_map = {executor.submit(fetch_one, source): source for source in unique_sources}
+    )
+    future_map = {}
+    cancelled = False
+    try:
+        future_map = {
+            executor.submit(fetch_one, source): source
+            for source in unique_sources
+        }
         completed: Dict[str, object] = {}
         completed_count = 0
         for future in as_completed(future_map):
             if stop_requested is not None and stop_requested():
+                cancelled = True
                 for pending in future_map:
-                    pending.cancel()
+                    if not pending.done():
+                        pending.cancel()
                 raise RuntimeError("Playlist scan cancelled by stop request")
             source = future_map[future]
             try:
@@ -795,6 +803,14 @@ def fetch_playlist_documents(
                 completed_count += 1
                 if progress_callback is not None:
                     progress_callback(completed_count, len(unique_sources))
+    finally:
+        if cancelled or (stop_requested is not None and stop_requested()):
+            for pending in future_map:
+                if not pending.done():
+                    pending.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
 
     if stop_requested is not None and stop_requested():
         raise RuntimeError("Playlist scan cancelled by stop request")
