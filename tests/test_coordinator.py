@@ -103,6 +103,31 @@ def runtime_candidate(
 
 
 class CoordinatorCancellationTests(unittest.TestCase):
+    def test_record_cancel_restore_helper_redraws_dashboard_and_watch_line(self):
+        snap=snapshot([sony_candidate()])
+        with patch.object(coord,"render_dashboard",return_value="DASHBOARD"), patch.object(
+            coord,"clear_live_status_line"
+        ) as clear_status, patch.object(
+            coord,"clear_dashboard_terminal"
+        ) as clear_dashboard, patch.object(
+            coord,"set_live_status_line"
+        ) as set_status, patch("builtins.print") as print_mock:
+            coord._restore_dashboard_after_temporary_menu(
+                snap,
+                {coord.POLICY_MANUAL:[],coord.POLICY_ALL:[]},
+                config_path=Path("recorder_dynamic_user_config.py"),
+                refresh_interval_sec=300,
+                registry_entries={},
+                runtime_statuses={},
+                source_references={},
+                watch_text="WATCH",
+            )
+
+        clear_status.assert_called_once()
+        clear_dashboard.assert_called_once()
+        print_mock.assert_called_once_with("DASHBOARD")
+        set_status.assert_called_once_with("WATCH")
+
     def test_windows_ctrl_c_sets_stop_event_before_main_loop_reads_queue(self):
         class FakeMsvcrt:
             def kbhit(self):
