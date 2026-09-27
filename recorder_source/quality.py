@@ -74,9 +74,14 @@ def run_grouped_quality_probes(
     if thread_name_prefix:
         executor_args["thread_name_prefix"] = str(thread_name_prefix)
 
-    with ThreadPoolExecutor(**executor_args) as executor:
-        future_map = {}
+    executor = ThreadPoolExecutor(**executor_args)
+    future_map = {}
+    cancelled = False
+    try:
         for entries in grouped.values():
+            if stop_requested is not None and stop_requested():
+                cancelled = True
+                break
             grouped_candidates = tuple(candidate for _, candidate in entries)
             group_representative = representative(grouped_candidates)
             future = executor.submit(
@@ -89,6 +94,10 @@ def run_grouped_quality_probes(
         completed_count = 0
         for future in as_completed(future_map):
             if stop_requested is not None and stop_requested():
+                cancelled = True
+                for pending_future in future_map:
+                    if not pending_future.done():
+                        pending_future.cancel()
                 break
 
             entries, group_representative = future_map[future]
@@ -103,6 +112,14 @@ def run_grouped_quality_probes(
             completed_count += len(entries)
             if progress_callback is not None:
                 progress_callback(completed_count, len(items))
+    finally:
+        if cancelled or (stop_requested is not None and stop_requested()):
+            for pending_future in future_map:
+                if not pending_future.done():
+                    pending_future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
 
     return tuple(
         item if item is not None else items[index]
