@@ -68,12 +68,16 @@ def candidate_row_key(candidate: SourceCandidate) -> Tuple[str, str, str, str]:
     )
 
 
-def candidate_update_key(candidate: SourceCandidate) -> Tuple[str, int, str]:
-    """Stable row identity used to retain Last Updated across refreshes."""
+def candidate_update_key(candidate: SourceCandidate) -> Tuple[str, int]:
+    """Stable source-row identity used to retain Last Updated across refreshes.
+
+    URL/token changes are deliberately excluded: Last Updated describes a
+    meaningful row metadata/state change, not refreshed delivery authorization.
+    The canonical feed identity is added by build_snapshot before this key.
+    """
     return (
         _candidate_source_id(candidate),
         int(candidate.matching_entry_index or 0),
-        str(candidate.stream_url or candidate.raw_stream_url or "").strip(),
     )
 
 
