@@ -776,10 +776,19 @@ class AcquisitionTests(unittest.TestCase):
         playlist='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games" group-title="Sports",Asian Games\nhttps://cdn.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
         def fake_probe(items):
             return tuple(replace(c, launchable=True, probe_status="working", quality_known=True, video_width=1920, video_height=1080, video_fps=50, video_bitrate_bps=5_000_000, final_stream_url=c.stream_url) for c in items)
+        failed_source_keys=set()
         with patch.object(coord_acquisition,"fetch_playlist_documents",return_value=({"https://good.test/list.m3u":playlist},("bad: OSError: boom",),{})), patch.object(coord_acquisition,"probe_candidates",side_effect=fake_probe):
-            found,errors=coord.acquire_active_targets(self._raw(),(view(),))
+            found,errors=coord.acquire_active_targets(
+                self._raw(),
+                (view(),),
+                failed_source_keys=failed_source_keys,
+            )
         self.assertEqual(len(found["T"]),1)
         self.assertEqual(errors,("bad: OSError: boom",))
+        self.assertEqual(
+            failed_source_keys,
+            {("https://bad.test/list.m3u","SONYLIV","SONYLIV_EVENTS")},
+        )
 
     def test_token_only_context_refresh_does_not_make_identity_disappear(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
@@ -1101,6 +1110,86 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertEqual([e.marker for e in events],["REMOVED"])
         self.assertFalse(events[0].beep)
 
+    def test_failed_source_retains_identity_as_unavailable_not_recordable(self):
+        prior_candidate=sony_candidate(
+            playlist="https://bad.test/list.m3u",
+            source_name="bad",
+        )
+        old=snapshot([prior_candidate])
+        retained=coord._retain_failed_source_observations(
+            old,
+            (view(),),
+            {"T":()},
+            {("https://bad.test/list.m3u","SONYLIV","SONYLIV_EVENTS")},
+        )
+        self.assertEqual(len(retained["T"]),1)
+        carried=retained["T"][0]
+        self.assertTrue(carried.ignored)
+        self.assertFalse(carried.launchable)
+        self.assertEqual(carried.probe_status,"source_unavailable")
+
+        new=coord.build_snapshot(
+            (view(),),
+            retained,
+            source_errors=("bad: HTTPError: HTTP Error 502: Bad Gateway",),
+            now=datetime(2026,9,24,10,5,0),
+        )
+        self.assertEqual(len(new.blocks),1)
+        self.assertIsNone(next(iter(new.blocks.values())).best_candidate)
+        events=coord.diff_snapshots(old,new)
+        self.assertFalse(any(event.marker=="REMOVED" for event in events))
+        self.assertTrue(any(
+            event.marker=="UPDATE"
+            and "SOURCE_UNAVAILABLE" in " ".join(event.details)
+            for event in events
+        ))
+
+    def test_successful_source_scan_can_remove_previously_retained_identity(self):
+        prior_candidate=sony_candidate(
+            playlist="https://bad.test/list.m3u",
+            source_name="bad",
+        )
+        old=snapshot([prior_candidate])
+        retained=coord._retain_failed_source_observations(
+            old,
+            (view(),),
+            {"T":()},
+            {("https://bad.test/list.m3u","SONYLIV","SONYLIV_EVENTS")},
+        )
+        retained_snapshot=coord.build_snapshot(
+            (view(),),
+            retained,
+            now=datetime(2026,9,24,10,5,0),
+        )
+        recovered=coord._retain_failed_source_observations(
+            retained_snapshot,
+            (view(),),
+            {"T":()},
+            set(),
+        )
+        recovered_snapshot=coord.build_snapshot(
+            (view(),),
+            recovered,
+            now=datetime(2026,9,24,10,10,0),
+        )
+        events=coord.diff_snapshots(retained_snapshot,recovered_snapshot)
+        self.assertTrue(any(event.marker=="REMOVED" for event in events))
+
+    def test_changed_target_definition_does_not_retain_failed_source_rows(self):
+        prior_candidate=sony_candidate(
+            playlist="https://bad.test/list.m3u",
+            source_name="bad",
+        )
+        old=snapshot([prior_candidate])
+        changed_view=view(target(primary=("Different Event",)))
+        retained=coord._retain_failed_source_observations(
+            old,
+            (changed_view,),
+            {"T":()},
+            {("https://bad.test/list.m3u","SONYLIV","SONYLIV_EVENTS")},
+        )
+        self.assertEqual(retained["T"],())
+
     def test_source_addition_emits_source_plus_without_beep(self):
         old=snapshot([sony_candidate(playlist="https://one/list",source_name="one")])
         new=snapshot([
@@ -1132,6 +1221,40 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertTrue(update[0].beep)
         self.assertIn("Shooting",update[0].details[0])
         self.assertIn("Athletics",update[0].details[0])
+
+    def test_change_log_collapses_identical_update_summaries_only(self):
+        key=(coord.POLICY_MANUAL,"SONYLIV|feed")
+        duplicate_a=coord.ChangeEvent(
+            "UPDATE",
+            key,
+            ("Candidate states PROBE_FAILED -> WORKING",),
+            beep=True,
+            source_id="https://one.test/list.m3u",
+        )
+        duplicate_b=coord.ChangeEvent(
+            "UPDATE",
+            key,
+            ("Candidate states PROBE_FAILED -> WORKING",),
+            beep=True,
+            source_id="https://two.test/list.m3u",
+        )
+        distinct=coord.ChangeEvent(
+            "UPDATE",
+            key,
+            ("Event Old -> New",),
+            beep=True,
+            source_id="https://three.test/list.m3u",
+        )
+        source_add=coord.ChangeEvent(
+            "SOURCE+",
+            key,
+            ("source added: four",),
+            source_id="https://four.test/list.m3u",
+        )
+        logged=coord._change_events_for_log(
+            (duplicate_a,duplicate_b,distinct,source_add)
+        )
+        self.assertEqual(logged,(duplicate_a,distinct,source_add))
 
     def test_quality_improvement_emits_quality_plus_and_beeps(self):
         old=snapshot([sony_candidate(fps=25)])
