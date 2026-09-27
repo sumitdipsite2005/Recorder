@@ -10,6 +10,7 @@ from recorder_runtime.registry import (
     IdentityLaunchBlocked,
     IdentityRegistryStore,
     InvalidRegistryTransition,
+    MAX_ACTIVE_IDENTITY_WORKERS,
     RegistryError,
     STATE_RECORDING,
     STATE_CRASHED,
@@ -169,6 +170,67 @@ class IdentityRegistryTests(unittest.TestCase):
 
             registry = store.read()
             entry = registry["entries"]["sony|lane-a|english"]
+            self.assertEqual(entry["state"], STATE_LAUNCHING)
+
+    def test_active_worker_limit_blocks_twenty_first_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self.make_store(td)
+            status = store.prepare_session(now=FIXED_TIME)
+
+            for index in range(MAX_ACTIVE_IDENTITY_WORKERS):
+                store.claim(
+                    identity_key=f"sony|lane-{index}|english",
+                    provider="SONY",
+                    display_name=f"Lane {index}",
+                    expected_session_id=status.session_id,
+                    now=FIXED_TIME,
+                )
+
+            with self.assertRaisesRegex(
+                IdentityLaunchBlocked,
+                r"active recording limit reached \(20/20\)",
+            ):
+                store.claim(
+                    identity_key="sony|lane-over-limit|english",
+                    provider="SONY",
+                    display_name="Over limit",
+                    expected_session_id=status.session_id,
+                    now=FIXED_TIME,
+                )
+
+            registry = store.read()
+            self.assertEqual(len(registry["entries"]), MAX_ACTIVE_IDENTITY_WORKERS)
+
+    def test_terminal_entry_does_not_consume_active_worker_capacity(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self.make_store(td)
+            status = store.prepare_session(now=FIXED_TIME)
+
+            for index in range(MAX_ACTIVE_IDENTITY_WORKERS):
+                identity_key=f"sony|lane-{index}|english"
+                store.claim(
+                    identity_key=identity_key,
+                    provider="SONY",
+                    display_name=f"Lane {index}",
+                    expected_session_id=status.session_id,
+                    now=FIXED_TIME,
+                )
+
+            store.transition(
+                identity_key="sony|lane-0|english",
+                new_state=STATE_CRASHED,
+                expected_session_id=status.session_id,
+                now=FIXED_TIME,
+            )
+
+            entry = store.claim(
+                identity_key="sony|replacement|english",
+                provider="SONY",
+                display_name="Replacement",
+                expected_session_id=status.session_id,
+                now=FIXED_TIME,
+            )
+
             self.assertEqual(entry["state"], STATE_LAUNCHING)
 
     def test_session_guard_rejects_stale_worker_update(self):
