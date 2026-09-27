@@ -188,6 +188,45 @@ class CoordinatorQualityPersistenceTests(unittest.TestCase):
         self.assertIs(captured[1], registry)
 
 
+class CoordinatorEventTransitionStateTests(unittest.TestCase):
+    def test_run_once_forwards_same_event_transition_registry_to_acquisition(self):
+        registry = {}
+        captured = []
+
+        class ConfigState:
+            raw_config = {}
+            def reload(self, now):
+                return (), False
+            def coordinator_window(self, now):
+                return type("Window", (), {"status": "ACTIVE"})()
+            def target_views(self, now, coordinator_active):
+                return ()
+
+        def fake_acquire(*args, **kwargs):
+            captured.append(kwargs.get("event_transition_registry"))
+            return {}, ()
+
+        with patch.object(coord, "acquire_active_targets", side_effect=fake_acquire), patch.object(
+            coord,
+            "build_snapshot",
+            return_value=type("Snapshot", (), {})(),
+        ), patch.object(coord, "diff_snapshots", return_value=()):
+            coord.run_once(
+                ConfigState(),
+                None,
+                event_transition_registry=registry,
+            )
+            coord.run_once(
+                ConfigState(),
+                None,
+                event_transition_registry=registry,
+            )
+
+        self.assertEqual(captured, [registry, registry])
+        self.assertIs(captured[0], registry)
+        self.assertIs(captured[1], registry)
+
+
 class OutputPathTests(unittest.TestCase):
     def test_coordinator_log_path_uses_configured_output_root(self):
         with tempfile.TemporaryDirectory() as td:
@@ -850,6 +889,46 @@ class AcquisitionTests(unittest.TestCase):
         ):
             found,_=coord.acquire_active_targets(raw,(view(),))
         self.assertEqual(found["T"],())
+
+    def test_fresh_matching_evidence_cancels_confirmed_event_move(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
+            {"url":"https://old.test/list.m3u","name":"old"},
+            {"url":"https://new.test/list.m3u","name":"new"},
+        ]}}
+        matching='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games",Asian Games\nhttps://a.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        moved='#EXTM3U\n#EXTINF:-1 tvg-name="Swimming",Swimming\nhttps://b.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        transition_registry={}
+        phase={"matching_ts":1000.0}
+        def freshness(url,*args,**kwargs):
+            return {
+                "timestamp":phase["matching_ts"] if "old.test" in url else 2000.0,
+                "source":"commit",
+                "content_hash":url,
+            }
+        with patch.object(coord_acquisition,"fetch_playlist_documents",
+            return_value=(
+                {"https://old.test/list.m3u":matching,"https://new.test/list.m3u":moved},
+                (),
+                {},
+            ),
+        ), patch.object(coord_acquisition,"resolve_playlist_source_freshness",side_effect=freshness
+        ), patch.object(coord_acquisition,"probe_candidates",side_effect=lambda items: tuple(items)
+        ):
+            first,_=coord.acquire_active_targets(
+                raw,(view(),),event_transition_registry=transition_registry
+            )
+            second,_=coord.acquire_active_targets(
+                raw,(view(),),event_transition_registry=transition_registry
+            )
+            phase["matching_ts"]=3000.0
+            third,_=coord.acquire_active_targets(
+                raw,(view(),),event_transition_registry=transition_registry
+            )
+
+        self.assertEqual(len(first["T"]),2)
+        self.assertEqual(second["T"],())
+        self.assertEqual(len(third["T"]),2)
+        self.assertEqual(transition_registry,{})
 
     def test_newer_shorter_metadata_does_not_reject_matching_identity(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
