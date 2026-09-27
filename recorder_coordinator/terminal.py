@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - non-Windows development/test hosts
 
 from recorder_runtime import sound as runtime_sound
 from recorder_runtime.sound import SoundSnoozeState
-from recorder_source.quality import quality_signature
+from recorder_source.quality import quality_persistence_identity, quality_signature
 
 from .models import (
     ChangeEvent,
@@ -322,6 +322,65 @@ def _quality_key(candidate) -> Tuple[int, int, float, int, str]:
     if candidate is None or not candidate.quality_known:
         return (0, 0, 0.0, 0, "")
     return quality_signature(candidate)
+
+
+def _coordinator_rendition_key(candidate) -> str:
+    """Return the actual media-rendition path used for Coordinator grouping."""
+    if candidate is None:
+        return ""
+    extra = candidate.extra if isinstance(candidate.extra, Mapping) else {}
+    resolved_url = str(
+        extra.get("manifest_variant_url")
+        or candidate.final_stream_url
+        or candidate.stream_url
+        or ""
+    ).strip()
+    if not resolved_url:
+        return ""
+    return quality_persistence_identity(
+        candidate,
+        resolved_url=resolved_url,
+    )
+
+
+def _quality_group_key(candidate) -> Tuple[object, ...]:
+    """Group alternate entry points to the same actual media rendition."""
+    rendition_key = _coordinator_rendition_key(candidate)
+    if rendition_key:
+        return ("rendition", rendition_key)
+    return ("quality",) + tuple(_quality_key(candidate))
+
+
+def _quality_evidence_rank(candidate) -> Tuple[object, ...]:
+    """Prefer explicit manifest evidence over measured fallback for one rendition."""
+    if candidate is None:
+        return (0, 0, 0, 0, 0.0)
+    bitrate = int(getattr(candidate, "video_bitrate_bps", 0) or 0)
+    bitrate_source = str(
+        getattr(candidate, "video_bitrate_source", "") or ""
+    ).strip().casefold()
+    source_rank = {
+        "manifest": 4,
+        "ffprobe": 3,
+        "stream": 3,
+        "format": 3,
+        "sample": 1,
+    }.get(bitrate_source, 2 if bitrate > 0 else 0)
+    width = int(getattr(candidate, "video_width", 0) or 0)
+    height = int(getattr(candidate, "video_height", 0) or 0)
+    fps = float(getattr(candidate, "video_fps", 0.0) or 0.0)
+    extra = candidate.extra if isinstance(candidate.extra, Mapping) else {}
+    try:
+        freshness = float(extra.get("source_freshness_ts") or 0.0)
+    except (TypeError, ValueError):
+        freshness = 0.0
+    return (
+        int(bitrate > 0),
+        source_rank,
+        int(width > 0 and height > 0 and fps > 0),
+        int(bool(getattr(candidate, "video_scan_type", ""))),
+        freshness,
+    )
 
 
 def _event_maps(events: Sequence[ChangeEvent]):
@@ -738,11 +797,11 @@ def render_dashboard(
                 for detail in event.details:
                     lines.append(f"    {_secondary_text(detail, color)}")
 
-            grouped: Dict[Tuple[int, int, float, int, str], List[Tuple[object, object]]] = {}
+            grouped: Dict[Tuple[object, ...], List[Tuple[object, object]]] = {}
             seen_rows = set()
             for source in block.observations.values():
                 for candidate in source.candidates:
-                    key = _quality_key(candidate)
+                    key = _quality_group_key(candidate)
                     row_identity = (
                         source.source_id,
                         candidate.entry_title,
@@ -756,19 +815,8 @@ def render_dashboard(
                     seen_rows.add(row_identity)
                     grouped.setdefault(key, []).append((source, candidate))
 
-            best_key = _quality_key(block.best_candidate)
-            quality_keys = sorted(
-                grouped,
-                key=lambda key: (
-                    0 if key == best_key and block.best_candidate is not None else 1,
-                    -(key[0] * key[1]),
-                    -key[2],
-                    -key[3],
-                ),
-            )
-            source_marker_consumed = set()
-            for quality_key in quality_keys:
-                rows = grouped[quality_key]
+            representatives: Dict[Tuple[object, ...], object] = {}
+            for quality_key, rows in grouped.items():
                 rows.sort(
                     key=lambda item: (
                         block.row_last_updated.get(
@@ -779,7 +827,28 @@ def render_dashboard(
                     ),
                     reverse=True,
                 )
-                representative = rows[0][1]
+                representatives[quality_key] = max(
+                    (candidate for _, candidate in rows),
+                    key=_quality_evidence_rank,
+                )
+
+            best_key = _quality_group_key(block.best_candidate)
+            quality_keys = sorted(
+                grouped,
+                key=lambda key: (
+                    0 if key == best_key and block.best_candidate is not None else 1,
+                    -(
+                        _quality_key(representatives[key])[0]
+                        * _quality_key(representatives[key])[1]
+                    ),
+                    -_quality_key(representatives[key])[2],
+                    -_quality_key(representatives[key])[3],
+                ),
+            )
+            source_marker_consumed = set()
+            for quality_key in quality_keys:
+                rows = grouped[quality_key]
+                representative = representatives[quality_key]
                 has_working_candidate = any(
                     candidate_state(candidate) == "WORKING"
                     for _, candidate in rows
