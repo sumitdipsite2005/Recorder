@@ -87,6 +87,7 @@ from recorder_coordinator.terminal import (
     watch_status_text,
     write_log,
 )
+from recorder_source.models import SourceCandidate
 from recorder_source.policy import (
     PLAYLIST_GROUP_MATCH_MODES as GROUP_MATCH_MODE,
     PLAYLIST_GROUP_PROFILES as GROUP_PROVIDER,
@@ -142,6 +143,110 @@ def _coordinator_log_path(
     )
 
 
+def _coordinator_source_key(
+    candidate: SourceCandidate,
+) -> Tuple[str, str, str]:
+    return (
+        str(candidate.playlist_url or ""),
+        str(candidate.extra.get("provider") or "UNKNOWN").strip().upper(),
+        str(candidate.extra.get("source_group") or "").strip().upper(),
+    )
+
+
+def _retained_failed_source_candidate(
+    candidate: SourceCandidate,
+) -> SourceCandidate:
+    detail = "playlist source unavailable in current Coordinator scan"
+    return replace(
+        candidate,
+        launchable=False,
+        probe_status="source_unavailable",
+        probe_error=detail,
+        ignored=True,
+        reason=detail + "; previous observation retained",
+        extra={
+            **dict(candidate.extra),
+            "coordinator_source_scan_status": "unavailable",
+            "coordinator_retained_observation": True,
+        },
+    )
+
+
+def _retain_failed_source_observations(
+    previous: Optional[DashboardSnapshot],
+    target_views: Sequence[TargetView],
+    candidates_by_target: Mapping[str, Sequence[SourceCandidate]],
+    failed_source_keys: Set[Tuple[str, str, str]],
+) -> Dict[str, Tuple[SourceCandidate, ...]]:
+    current = {
+        str(name): list(items)
+        for name, items in candidates_by_target.items()
+    }
+    if previous is None or not failed_source_keys:
+        return {
+            name: tuple(items)
+            for name, items in current.items()
+        }
+
+    previous_targets = {
+        view.target.name: view.target
+        for view in previous.target_views
+    }
+
+    def observation_key(candidate: SourceCandidate) -> Tuple[object, ...]:
+        return (
+            _coordinator_source_key(candidate),
+            int(candidate.matching_entry_index or 0),
+            str(candidate.stream_url or candidate.raw_stream_url or ""),
+            str(candidate.tvg_name or ""),
+            str(candidate.group_title or ""),
+            str(candidate.entry_title or ""),
+        )
+
+    for view in target_views:
+        if view.status != "ACTIVE":
+            continue
+        target_name = view.target.name
+        if previous_targets.get(target_name) != view.target:
+            continue
+
+        target_items = current.setdefault(target_name, [])
+        existing = {
+            observation_key(candidate)
+            for candidate in target_items
+        }
+        for candidate in previous.candidates_by_target.get(target_name, ()):
+            if _coordinator_source_key(candidate) not in failed_source_keys:
+                continue
+            retained = _retained_failed_source_candidate(candidate)
+            key = observation_key(retained)
+            if key in existing:
+                continue
+            target_items.append(retained)
+            existing.add(key)
+
+    return {
+        name: tuple(items)
+        for name, items in current.items()
+    }
+
+
+def _change_events_for_log(
+    events: Sequence[ChangeEvent],
+) -> Tuple[ChangeEvent, ...]:
+    """Collapse duplicate identity UPDATE summaries without changing dashboard events."""
+    result: List[ChangeEvent] = []
+    seen_updates = set()
+    for event in events:
+        if event.marker == "UPDATE":
+            signature = (event.block_key, event.details)
+            if signature in seen_updates:
+                continue
+            seen_updates.add(signature)
+        result.append(event)
+    return tuple(result)
+
+
 def run_once(
     config_state: CoordinatorConfigState,
     previous: Optional[DashboardSnapshot],
@@ -166,6 +271,7 @@ def run_once(
         coordinator_active=(window.status == "ACTIVE"),
     )
     raw = config_state.raw_config or {}
+    failed_source_keys: Set[Tuple[str, str, str]] = set()
     if context_callback is not None:
         context_callback(
             DashboardSnapshot(
@@ -187,8 +293,15 @@ def run_once(
             progress_callback=progress_callback,
             source_freshness_registry=source_freshness_registry,
             event_transition_registry=event_transition_registry,
+            failed_source_keys=failed_source_keys,
             stop_requested=stop_requested,
             **acquisition_kwargs,
+        )
+        candidates_by_target = _retain_failed_source_observations(
+            previous,
+            target_views,
+            candidates_by_target,
+            failed_source_keys,
         )
     else:
         candidates_by_target, source_errors = {}, ()
@@ -1233,7 +1346,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             source_references=source_reference_registry,
                         )
                         write_log(log_path, log_text)
-                        for event in events:
+                        for event in _change_events_for_log(events):
                             write_log(
                                 log_path,
                                 (
