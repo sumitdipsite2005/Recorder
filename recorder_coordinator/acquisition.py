@@ -549,7 +549,13 @@ def acquire_active_targets(
             )
         except Exception as error:
             if failed_source_keys is not None:
-                failed_source_keys.add(key)
+                failed_source_keys.add(
+                    (
+                        str(key[0]),
+                        str(key[1]).strip().upper(),
+                        str(key[2]).strip().upper(),
+                    )
+                )
             errors.append(
                 f"{spec.name}: discovery parse failed ({type(error).__name__}: {error})"
             )
