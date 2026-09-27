@@ -480,19 +480,40 @@ def acquire_active_targets(
     # GitHub commit lookups are independent network calls. Resolve source
     # freshness concurrently so one slow repository does not serialize startup.
     freshness_workers = min(6, max(1, len(source_specs)))
-    with ThreadPoolExecutor(
+    freshness_executor = ThreadPoolExecutor(
         max_workers=freshness_workers,
         thread_name_prefix="source_freshness",
-    ) as executor:
-        futures = [executor.submit(resolve_freshness, spec) for spec in source_specs]
+    )
+    futures = []
+    freshness_cancelled = False
+    try:
+        futures = [
+            freshness_executor.submit(resolve_freshness, spec)
+            for spec in source_specs
+        ]
         for future in as_completed(futures):
-            raise_if_cancelled()
+            if stop_requested is not None and stop_requested():
+                freshness_cancelled = True
+                for pending_future in futures:
+                    if not pending_future.done():
+                        pending_future.cancel()
+                raise RuntimeError("Coordinator scan cancelled by stop request")
             source_url, freshness = future.result()
             if freshness is None:
                 continue
             freshness_by_url[source_url] = freshness
             if source_freshness_registry is not None:
                 source_freshness_registry[source_url] = freshness
+    finally:
+        if freshness_cancelled or (
+            stop_requested is not None and stop_requested()
+        ):
+            for pending_future in futures:
+                if not pending_future.done():
+                    pending_future.cancel()
+            freshness_executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            freshness_executor.shutdown(wait=True)
 
     raise_if_cancelled()
 
