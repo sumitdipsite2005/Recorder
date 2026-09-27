@@ -784,13 +784,14 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(len(second["T"]),2)
         self.assertEqual(sum(not item.ignored for item in second["T"]),1)
 
-    def test_newer_nonmatching_metadata_rejects_stale_matching_identity(self):
+    def test_single_newer_nonmatching_source_requires_persistence_before_reject(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
             {"url":"https://old.test/list.m3u","name":"old"},
             {"url":"https://new.test/list.m3u","name":"new"},
         ]}}
         matching='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games",Asian Games\nhttps://a.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
         moved='#EXTM3U\n#EXTINF:-1 tvg-name="Swimming",Swimming\nhttps://b.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        transition_registry={}
         def freshness(url,*args,**kwargs):
             return {
                 "timestamp":1000.0 if "old.test" in url else 2000.0,
@@ -800,6 +801,47 @@ class AcquisitionTests(unittest.TestCase):
         with patch.object(coord_acquisition,"fetch_playlist_documents",
             return_value=(
                 {"https://old.test/list.m3u":matching,"https://new.test/list.m3u":moved},
+                (),
+                {},
+            ),
+        ), patch.object(coord_acquisition,"resolve_playlist_source_freshness",side_effect=freshness
+        ), patch.object(coord_acquisition,"probe_candidates",side_effect=lambda items: tuple(items)
+        ):
+            first,_=coord.acquire_active_targets(
+                raw,
+                (view(),),
+                event_transition_registry=transition_registry,
+            )
+            second,_=coord.acquire_active_targets(
+                raw,
+                (view(),),
+                event_transition_registry=transition_registry,
+            )
+        self.assertEqual(len(first["T"]),2)
+        self.assertEqual(second["T"],())
+
+    def test_two_newer_agreeing_sources_confirm_event_move_immediately(self):
+        raw={"NM3U8DL_PLAYLIST_GROUPS":{"COMMON":[],"SONYLIV_EVENTS":[
+            {"url":"https://old.test/list.m3u","name":"old"},
+            {"url":"https://new1.test/list.m3u","name":"new1"},
+            {"url":"https://new2.test/list.m3u","name":"new2"},
+        ]}}
+        matching='#EXTM3U\n#EXTINF:-1 tvg-name="Asian Games",Asian Games\nhttps://a.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        moved1='#EXTM3U\n#EXTINF:-1 tvg-name="Swimming",Swimming\nhttps://b.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        moved2='#EXTM3U\n#EXTINF:-1 tvg-name="Swimming",Swimming\nhttps://c.test/hls/live/2120305/AG_Strea2309/ENG/master.m3u8\n'
+        def freshness(url,*args,**kwargs):
+            return {
+                "timestamp":1000.0 if "old.test" in url else 2000.0,
+                "source":"commit",
+                "content_hash":url,
+            }
+        with patch.object(coord_acquisition,"fetch_playlist_documents",
+            return_value=(
+                {
+                    "https://old.test/list.m3u":matching,
+                    "https://new1.test/list.m3u":moved1,
+                    "https://new2.test/list.m3u":moved2,
+                },
                 (),
                 {},
             ),
@@ -1364,6 +1406,87 @@ class SnapshotAndChangeTests(unittest.TestCase):
         snap=snapshot([sony_candidate()])
         rendered=coord.render_dashboard(snap,())
         self.assertNotIn("[BEST]",rendered)
+
+    def test_dashboard_merges_master_and_direct_same_rendition_evidence(self):
+        identity_path="/mumbai/4249106_english_hls_b86f41b4c015704_1ta-di_h264"
+        direct_url=f"https://direct.test{identity_path}/1080p.m3u8?token=one"
+        master_url=f"https://proxy.test{identity_path}/index.m3u8?token=two"
+        master_child=f"https://proxy.test{identity_path}/1080p.m3u8?token=two"
+        lower_url=f"https://direct.test{identity_path}/720p.m3u8?token=three"
+
+        direct=replace(
+            sony_candidate(fps=25),
+            playlist_url="https://source1.test/list.m3u",
+            raw_stream_url=direct_url,
+            stream_url=direct_url,
+            final_stream_url=direct_url,
+            video_bitrate_bps=3_169_000,
+            video_bitrate_source="sample",
+            extra={
+                "provider":"FANCODE",
+                "source_name":"direct",
+                "source_group":"FANCODE",
+            },
+        )
+        master=replace(
+            sony_candidate(
+                playlist="https://source2.test/list.m3u",
+                source_name="master",
+                title="Day 3 World Feed",
+                tvg="Day 3 World Feed",
+                fps=25,
+                ignored=True,
+            ),
+            raw_stream_url=master_url,
+            stream_url=master_url,
+            final_stream_url=master_url,
+            video_bitrate_bps=3_322_000,
+            video_bitrate_source="manifest",
+            extra={
+                "provider":"FANCODE",
+                "source_name":"master",
+                "source_group":"FANCODE",
+                "manifest_variant_url":master_child,
+            },
+        )
+        lower=replace(
+            sony_candidate(
+                playlist="https://source3.test/list.m3u",
+                source_name="lower",
+                title="Day 3 World Feed",
+                tvg="Day 3 World Feed",
+                fps=25,
+                width=1280,
+                height=720,
+                ignored=True,
+            ),
+            raw_stream_url=lower_url,
+            stream_url=lower_url,
+            final_stream_url=lower_url,
+            video_bitrate_bps=1_847_000,
+            video_bitrate_source="sample",
+            extra={
+                "provider":"FANCODE",
+                "source_name":"lower",
+                "source_group":"FANCODE",
+            },
+        )
+
+        rendered=coord.render_dashboard(snapshot([direct,master,lower]),())
+
+        self.assertEqual(rendered.count("Quality : "),2)
+        self.assertIn(
+            "Quality : 1920x1080 | 25p | 3322 Kbps [BEST]",
+            rendered,
+        )
+        self.assertNotIn(
+            "Quality : 1920x1080 | 25p | ~3169 Kbps",
+            rendered,
+        )
+        self.assertIn(
+            "Quality : 1280x720 | 25p | ~1847 Kbps [FFmpeg sample]",
+            rendered,
+        )
 
     def test_source_plus_marker_is_on_added_source_row_only(self):
         old=snapshot([sony_candidate(playlist="https://one/list",source_name="one")])
