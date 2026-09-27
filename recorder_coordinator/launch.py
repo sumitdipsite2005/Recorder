@@ -72,7 +72,6 @@ def _safe_base_name(
 ) -> str:
     event_name = (
         str(candidate.entry_title or "").strip()
-        or str(candidate.tvg_name or "").strip()
         or str(fallback or "").strip()
     )
     group_name = str(candidate.group_title or "").strip()
