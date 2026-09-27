@@ -1715,6 +1715,68 @@ class SnapshotAndChangeTests(unittest.TestCase):
             rendered,
         )
 
+    def test_dashboard_merges_identical_visible_quality_across_rendition_paths(self):
+        base="https://cdn.test/hls/live/2120305/AG_Strea2309/ENG"
+        first_url=base + "/quality-a.m3u8?token=one"
+        second_url=base + "/quality-b.m3u8?token=two"
+        first=replace(
+            sony_candidate(
+                playlist="https://source1.test/list.m3u",
+                source_name="first",
+            ),
+            raw_stream_url=first_url,
+            stream_url=first_url,
+            final_stream_url=first_url,
+        )
+        second=replace(
+            sony_candidate(
+                playlist="https://source2.test/list.m3u",
+                source_name="second",
+            ),
+            raw_stream_url=second_url,
+            stream_url=second_url,
+            final_stream_url=second_url,
+        )
+
+        rendered=coord.render_dashboard(snapshot([first,second]),())
+
+        self.assertEqual(
+            rendered.count("Quality : 1920x1080 | 50p | 5000 Kbps"),
+            1,
+        )
+        self.assertNotIn("[BEST]",rendered)
+        self.assertEqual(rendered.count("[ON] Asian Games"),2)
+
+    def test_dashboard_keeps_different_visible_bitrates_on_different_paths_separate(self):
+        base="https://cdn.test/hls/live/2120305/AG_Strea2309/ENG"
+        first_url=base + "/quality-a.m3u8"
+        second_url=base + "/quality-b.m3u8"
+        first=replace(
+            sony_candidate(
+                playlist="https://source1.test/list.m3u",
+                source_name="first",
+            ),
+            raw_stream_url=first_url,
+            stream_url=first_url,
+            final_stream_url=first_url,
+        )
+        second=replace(
+            sony_candidate(
+                playlist="https://source2.test/list.m3u",
+                source_name="second",
+            ),
+            raw_stream_url=second_url,
+            stream_url=second_url,
+            final_stream_url=second_url,
+            video_bitrate_bps=4_900_000,
+        )
+
+        rendered=coord.render_dashboard(snapshot([first,second]),())
+
+        self.assertEqual(rendered.count("Quality : "),2)
+        self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps",rendered)
+        self.assertIn("Quality : 1920x1080 | 50p | 4900 Kbps",rendered)
+
     def test_source_plus_marker_is_on_added_source_row_only(self):
         old=snapshot([sony_candidate(playlist="https://one/list",source_name="one")])
         new=snapshot([
@@ -1776,6 +1838,41 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("Last Updated 10:00",coord.render_dashboard(first,()))
         self.assertIn("Last Updated 10:00",coord.render_dashboard(second,()))
         self.assertIn("Last Updated 10:07",coord.render_dashboard(third,()))
+
+    def test_last_updated_ignores_stream_url_token_refresh(self):
+        registry={}
+        t1=datetime(2026,9,24,10,0,0)
+        t2=datetime(2026,9,24,10,5,0)
+        base=sony_candidate(title="Shooting")
+        first_url=base.stream_url + "?token=one"
+        second_url=base.stream_url + "?token=two"
+        first_candidate=replace(
+            base,
+            raw_stream_url=first_url,
+            stream_url=first_url,
+            final_stream_url=first_url,
+        )
+        second_candidate=replace(
+            base,
+            raw_stream_url=second_url,
+            stream_url=second_url,
+            final_stream_url=second_url,
+        )
+        first=coord.build_snapshot(
+            (view(now=t1),),
+            {"T":(first_candidate,)},
+            now=t1,
+            row_update_registry=registry,
+        )
+        second=coord.build_snapshot(
+            (view(now=t2),),
+            {"T":(second_candidate,)},
+            now=t2,
+            row_update_registry=registry,
+        )
+
+        self.assertIn("Last Updated 10:00",coord.render_dashboard(first,()))
+        self.assertIn("Last Updated 10:00",coord.render_dashboard(second,()))
 
     def test_header_keeps_each_target_on_one_logical_line(self):
         now=datetime(2026,9,24,17,28,57)
@@ -2139,16 +2236,56 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("Source Updated 2026-09-23 23:55 [commit]",rendered)
         self.assertNotIn("23:55:30",rendered)
 
-    def test_equal_last_updated_rows_use_source_freshness_as_tiebreaker(self):
+    def test_equal_last_updated_rows_sort_by_event_name_before_source_freshness(self):
+        alpha=sony_candidate(
+            playlist="https://alpha/list",
+            source_name="alpha",
+            title="Alpha Event",
+        )
+        zulu=sony_candidate(
+            playlist="https://zulu/list",
+            source_name="zulu",
+            title="Zulu Event",
+        )
+        alpha=replace(
+            alpha,
+            extra={
+                **dict(alpha.extra),
+                "source_freshness_ts":1000.0,
+                "source_freshness_source":"commit",
+            },
+        )
+        zulu=replace(
+            zulu,
+            extra={
+                **dict(zulu.extra),
+                "source_freshness_ts":2000.0,
+                "source_freshness_source":"commit",
+            },
+        )
+        snap=snapshot([zulu,alpha])
+        block=next(iter(snap.blocks.values()))
+        tied=datetime(2026,9,24,10,0,0)
+        block.row_last_updated[candidate_row_key(alpha)]=tied
+        block.row_last_updated[candidate_row_key(zulu)]=tied
+        rendered=coord.render_dashboard(snap,())
+        self.assertLess(
+            rendered.index("[ON] Alpha Event"),
+            rendered.index("[ON] Zulu Event"),
+        )
+
+    def test_equal_last_updated_and_event_use_source_freshness_as_final_tiebreaker(self):
         older=sony_candidate(
             playlist="https://older/list",
             source_name="older",
-            title="Older source",
+            title="Same Event",
+            tvg="Older TVG",
         )
         newer=sony_candidate(
             playlist="https://newer/list",
             source_name="newer",
-            title="Newer source",
+            title="Same Event",
+            tvg="Newer TVG",
         )
         older=replace(
             older,
@@ -2173,8 +2310,8 @@ class SnapshotAndChangeTests(unittest.TestCase):
         block.row_last_updated[candidate_row_key(newer)]=tied
         rendered=coord.render_dashboard(snap,())
         self.assertLess(
-            rendered.index("[ON] Newer source"),
-            rendered.index("[ON] Older source"),
+            rendered.index("Newer TVG"),
+            rendered.index("Older TVG"),
         )
 
     def test_coordinator_info_does_not_repeat_info_entry_control(self):
