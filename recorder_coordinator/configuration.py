@@ -116,6 +116,7 @@ class CoordinatorConfigState:
         now: datetime,
         *,
         coordinator_active: bool = True,
+        coordinator_active_from: Optional[datetime] = None,
     ) -> Tuple[TargetView, ...]:
         return tuple(
             target_view(
@@ -123,6 +124,7 @@ class CoordinatorConfigState:
                 self.target_runtime.setdefault(target.name, TargetRuntime()),
                 now,
                 coordinator_active=coordinator_active,
+                coordinator_active_from=coordinator_active_from,
             )
             for target in self.targets
         )
@@ -311,12 +313,15 @@ def target_view(
     now: datetime,
     *,
     coordinator_active: bool = True,
+    coordinator_active_from: Optional[datetime] = None,
 ) -> TargetView:
     if not target.enabled:
         return TargetView(target, "DISABLED", None, None)
 
     if target.schedule_start is not None:
         active_from = target.schedule_start
+        if coordinator_active_from is not None and active_from <= coordinator_active_from:
+            active_from = coordinator_active_from
     else:
         if runtime.first_activation is None:
             if not coordinator_active:
@@ -324,23 +329,23 @@ def target_view(
             runtime.first_activation = now
         active_from = runtime.first_activation
 
-    if now < active_from:
-        active_until = (
-            active_from + timedelta(minutes=target.activity_duration_min)
-            if target.activity_duration_min is not None
-            else None
-        )
-        return TargetView(target, "SCHEDULED", active_from, active_until)
-
     active_until = (
         active_from + timedelta(minutes=target.activity_duration_min)
         if target.activity_duration_min is not None
         else None
     )
+
+    if not coordinator_active:
+        if coordinator_active_from is not None and active_from <= coordinator_active_from:
+            return TargetView(target, "WAITING_COORDINATOR", active_from, active_until)
+        if now < active_from:
+            return TargetView(target, "SCHEDULED", active_from, active_until)
+        return TargetView(target, "WAITING_COORDINATOR", active_from, active_until)
+
+    if now < active_from:
+        return TargetView(target, "SCHEDULED", active_from, active_until)
     if active_until is not None and now >= active_until:
         return TargetView(target, "EXPIRED", active_from, active_until)
-    if not coordinator_active:
-        return TargetView(target, "WAITING_COORDINATOR", active_from, active_until)
     return TargetView(target, "ACTIVE", active_from, active_until)
 
 
