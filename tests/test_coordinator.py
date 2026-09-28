@@ -2228,7 +2228,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
             refresh_interval_sec=120,
         )
         self.assertIn("Coordinator\n  Status    : WAITING",rendered)
-        self.assertIn("  Starts   : 2026-09-28 18:00:00",rendered)
+        self.assertIn("  Starts    : 2026-09-28 18:00:00",rendered)
         self.assertNotIn("  Started   : 2026-09-28 18:00:00",rendered)
         self.assertIn("Asian Games Athletics | MANUAL | WAITING for coordinator",rendered)
         self.assertIn(
