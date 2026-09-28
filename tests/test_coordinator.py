@@ -770,7 +770,7 @@ class TargetConfigTests(unittest.TestCase):
         ]}
         with self.assertRaises(ValueError): coord.parse_targets(raw)
 
-    def test_later_disabled_target_overrides_generated_enabled_target(self):
+    def test_disabled_duplicate_does_not_replace_enabled_target(self):
         raw={"IDENTITY_COORDINATOR_TARGETS":[
             {
                 "name":"Asian Games Boxing",
@@ -789,10 +789,11 @@ class TargetConfigTests(unittest.TestCase):
         ]}
         items=coord.parse_targets(raw)
         self.assertEqual(len(items),1)
-        self.assertFalse(items[0].enabled)
-        self.assertEqual(items[0].schedule_start,datetime(2026,9,28,23,0,0))
+        self.assertTrue(items[0].enabled)
+        self.assertEqual(items[0].primary,("Asian Games","Boxing"))
+        self.assertIsNone(items[0].schedule_start)
 
-    def test_later_enabled_target_overrides_disabled_target(self):
+    def test_enabled_target_wins_when_disabled_duplicate_comes_first(self):
         raw={"IDENTITY_COORDINATOR_TARGETS":[
             {
                 "name":"X",
@@ -812,6 +813,42 @@ class TargetConfigTests(unittest.TestCase):
         self.assertEqual(len(items),1)
         self.assertTrue(items[0].enabled)
         self.assertEqual(items[0].primary,("New",))
+
+    def test_standalone_disabled_target_is_retained(self):
+        raw={"IDENTITY_COORDINATOR_TARGETS":[
+            {
+                "name":"Disabled only",
+                "enabled":False,
+                "policy":"MANUAL",
+                "source_groups":["SONYLIV_EVENTS"],
+                "primary":["A"],
+            },
+        ]}
+        items=coord.parse_targets(raw)
+        self.assertEqual(len(items),1)
+        self.assertFalse(items[0].enabled)
+
+    def test_duplicate_disabled_targets_do_not_raise_or_duplicate_runtime_name(self):
+        raw={"IDENTITY_COORDINATOR_TARGETS":[
+            {
+                "name":"Disabled only",
+                "enabled":False,
+                "policy":"MANUAL",
+                "source_groups":["SONYLIV_EVENTS"],
+                "primary":["A"],
+            },
+            {
+                "name":"Disabled only",
+                "enabled":False,
+                "policy":"MANUAL",
+                "source_groups":["SONYLIV_EVENTS"],
+                "primary":["B"],
+            },
+        ]}
+        items=coord.parse_targets(raw)
+        self.assertEqual(len(items),1)
+        self.assertFalse(items[0].enabled)
+        self.assertEqual(items[0].primary,("A",))
 
     def test_schedule_and_activity_window(self):
         start=datetime(2026,9,24,11,0,0)
