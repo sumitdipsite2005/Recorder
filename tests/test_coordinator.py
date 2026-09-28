@@ -865,6 +865,37 @@ class TargetConfigTests(unittest.TestCase):
         self.assertEqual(v.status,"WAITING_COORDINATOR")
         self.assertIsNone(runtime.first_activation)
 
+    def test_target_after_coordinator_start_keeps_its_own_schedule(self):
+        now=datetime(2026,9,28,12,0,0)
+        coordinator_start=datetime(2026,9,28,18,0,0)
+        target_start=datetime(2026,9,28,23,0,0)
+        v=coord.target_view(
+            target(schedule_start=target_start),
+            coord.TargetRuntime(),
+            now,
+            coordinator_active=False,
+            coordinator_active_from=coordinator_start,
+        )
+        self.assertEqual(v.status,"SCHEDULED")
+        self.assertEqual(v.active_from,target_start)
+
+    def test_target_at_or_before_coordinator_start_waits_for_coordinator(self):
+        now=datetime(2026,9,28,12,0,0)
+        coordinator_start=datetime(2026,9,28,18,0,0)
+        v=coord.target_view(
+            target(
+                schedule_start=datetime(2026,9,28,17,0,0),
+                activity_duration_min=60,
+            ),
+            coord.TargetRuntime(),
+            now,
+            coordinator_active=False,
+            coordinator_active_from=coordinator_start,
+        )
+        self.assertEqual(v.status,"WAITING_COORDINATOR")
+        self.assertEqual(v.active_from,coordinator_start)
+        self.assertEqual(v.active_until,datetime(2026,9,28,19,0,0))
+
     def test_sources_for_tv_group_does_not_implicitly_include_common(self):
         raw={"NM3U8DL_PLAYLIST_GROUPS":{
             "COMMON":["https://common.test/list"],
@@ -2163,6 +2194,61 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertEqual(len(event_watch_lines),1)
         self.assertIn("| Provider=- | Identity blocks=0",event_watch_lines[0])
 
+    def test_waiting_coordinator_shows_targets_without_event_watch(self):
+        now=datetime(2026,9,28,12,13,36)
+        coordinator_start=datetime(2026,9,28,18,0,0)
+        immediate=target(name="Asian Games Athletics")
+        later=target(
+            name="Asian Games Boxing",
+            schedule_start=datetime(2026,9,28,23,0,0),
+        )
+        views=(
+            coord.TargetView(immediate,"WAITING_COORDINATOR",coordinator_start,None),
+            coord.TargetView(
+                later,
+                "SCHEDULED",
+                datetime(2026,9,28,23,0,0),
+                None,
+            ),
+        )
+        snap=coord.build_snapshot(
+            views,
+            {"Asian Games Athletics":(),"Asian Games Boxing":()},
+            coordinator_window=coord.CoordinatorWindow(
+                "WAITING",
+                coordinator_start,
+                None,
+            ),
+            now=now,
+        )
+        rendered=coord.render_dashboard(
+            snap,
+            (),
+            config_path=Path("recorder_dynamic_user_config.py"),
+            refresh_interval_sec=120,
+        )
+        self.assertIn("Coordinator\n  Status    : WAITING",rendered)
+        self.assertIn("  Starts   : 2026-09-28 18:00:00",rendered)
+        self.assertNotIn("  Started   : 2026-09-28 18:00:00",rendered)
+        self.assertIn("Asian Games Athletics | MANUAL | WAITING for coordinator",rendered)
+        self.assertIn(
+            "Asian Games Boxing | MANUAL | SCHEDULED from 2026-09-28 23:00:00",
+            rendered,
+        )
+        self.assertNotIn("EVENT WATCH",rendered)
+        self.assertNotIn("No qualifying identities",rendered)
+
+    def test_coordinator_wait_status_matches_mature_recorder_style(self):
+        rendered=coord.coordinator_wait_status_text(
+            datetime(2026,9,28,18,0,0),
+            now=datetime(2026,9,28,12,13,36),
+        )
+        self.assertEqual(
+            rendered,
+            "[WAIT] Waiting for start time 2026-09-28 18:00:00 "
+            "(remaining 05:46:24)...",
+        )
+
     def test_compact_source_name_preserves_github_provenance(self):
         self.assertEqual(
             coord.compact_source_name(
@@ -2848,6 +2934,20 @@ class RegistryStateChangeTests(unittest.TestCase):
 
 
 class TimingTests(unittest.TestCase):
+    def test_waiting_coordinator_sleeps_until_start_not_refresh_interval(self):
+        now=datetime(2026,9,28,12,13,36)
+        start=datetime(2026,9,28,18,0,0)
+        snap=coord.DashboardSnapshot(
+            now,
+            (),
+            coord.CoordinatorWindow("WAITING",start,None),
+            {},
+        )
+        self.assertEqual(
+            coord.next_watch_sleep_seconds(snap,120,now=now),
+            (start-now).total_seconds(),
+        )
+
     def test_watch_sleep_does_not_sleep_past_target_start(self):
         now=datetime(2026,9,24,10,0,0)
         t=target(schedule_start=now+timedelta(seconds=30))
