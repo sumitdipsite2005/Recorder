@@ -770,6 +770,49 @@ class TargetConfigTests(unittest.TestCase):
         ]}
         with self.assertRaises(ValueError): coord.parse_targets(raw)
 
+    def test_later_disabled_target_overrides_generated_enabled_target(self):
+        raw={"IDENTITY_COORDINATOR_TARGETS":[
+            {
+                "name":"Asian Games Boxing",
+                "policy":"ALL_IDENTITIES",
+                "source_groups":["COMMON","SONYLIV_EVENTS"],
+                "primary":["Asian Games","Boxing"],
+            },
+            {
+                "name":"Asian Games Boxing",
+                "enabled":False,
+                "policy":"ALL_IDENTITIES",
+                "source_groups":["COMMON","SONYLIV_EVENTS"],
+                "primary":["Asian Games","Boxing"],
+                "schedule_start":"2026-09-28 23:00",
+            },
+        ]}
+        items=coord.parse_targets(raw)
+        self.assertEqual(len(items),1)
+        self.assertFalse(items[0].enabled)
+        self.assertEqual(items[0].schedule_start,datetime(2026,9,28,23,0,0))
+
+    def test_later_enabled_target_overrides_disabled_target(self):
+        raw={"IDENTITY_COORDINATOR_TARGETS":[
+            {
+                "name":"X",
+                "enabled":False,
+                "policy":"MANUAL",
+                "source_groups":["SONYLIV_EVENTS"],
+                "primary":["Old"],
+            },
+            {
+                "name":"X",
+                "policy":"MANUAL",
+                "source_groups":["SONYLIV_EVENTS"],
+                "primary":["New"],
+            },
+        ]}
+        items=coord.parse_targets(raw)
+        self.assertEqual(len(items),1)
+        self.assertTrue(items[0].enabled)
+        self.assertEqual(items[0].primary,("New",))
+
     def test_schedule_and_activity_window(self):
         start=datetime(2026,9,24,11,0,0)
         t=target(schedule_start=start, activity_duration_min=60)
