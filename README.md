@@ -6,6 +6,42 @@
 
 Recorder started as a mature dynamic recording engine. The project now adds an identity-aware **Inspect / Watch / Record / Auto** layer around that engine, turning playlist discovery into an unattended recording workflow rather than a one-shot recording command.
 
+## Why Recorder exists
+
+Recording a live stream sounds simple — until you need the recording to actually survive for hours unattended.
+
+Have you ever:
+
+- started an overnight recording, only to discover in the morning that the stream died halfway through?
+- finished a long recording and realized the source had degraded, buffered, or become unusable while the event kept going?
+- lost part of a recording because authorization expired, a VPN or network path changed, or the source URL stopped working while nobody was watching?
+
+A downloader can report an error and stop. A live recorder has a harder job: **time keeps moving even when the source fails**.
+
+Recorder was built around that problem. Its recording engine continuously treats the current stream as something that may need to be renewed, replaced, recovered, or upgraded while preserving the recording itself. It can evaluate alternative sources, react to authorization and access failures, recover from stream problems, perform controlled source changes, and keep working toward the best complete recording it can produce.
+
+But keeping one recording alive is only half the problem.
+
+What if you are watching several playlists or events at once? What if the same underlying feed appears through multiple sources? What if you want the right recording to start when a qualifying stream appears — without manually checking playlists all day?
+
+That is the job of the **Coordinator**.
+
+The Coordinator continuously **Inspect → Watch → Record → Auto**:
+
+- it discovers and inspects available streams;
+- understands when different source rows represent the same logical feed;
+- watches those identities as sources appear, disappear, recover, or change;
+- prevents duplicate recordings of the same feed;
+- lets a user start selected recordings manually; or
+- launches qualifying recordings automatically and continues watching for more.
+
+Together, the two layers solve different parts of the same real-world problem:
+
+**The Coordinator decides what needs attention and when recording should begin.  
+The Recorder keeps that recording alive when the live-stream environment stops behaving perfectly.**
+
+The result is not simply a command that downloads a stream. It is an unattended live-recording system designed around the reality that online sources, networks, authorization, quality, and availability can all change while the event itself continues.
+
 ## Inspect → Watch → Record → Auto
 
 | Stage | What Recorder does |
