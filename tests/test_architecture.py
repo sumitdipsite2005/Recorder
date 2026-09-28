@@ -555,6 +555,15 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("shared_selection_policy_for_provider(",text)
         self.assertNotIn("SHARED_PROVIDER_SELECTION_POLICIES",text)
 
+    def test_identity_worker_preserves_match_all_for_startup_summary(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        self.assertIn("NM3U8DL_PLAYLIST_MATCH_ALL = False", recorder)
+        self.assertIn("match_all=NM3U8DL_PLAYLIST_MATCH_ALL", recorder)
+        self.assertIn(
+            "NM3U8DL_PLAYLIST_MATCH_ALL = first_intent.match_all",
+            recorder,
+        )
+
     def test_selection_reasoning_has_one_shared_owner(self):
         recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         terminal=(ROOT/"recorder_coordinator"/"terminal.py").read_text(encoding="utf-8")
