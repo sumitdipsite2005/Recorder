@@ -292,20 +292,10 @@ NM3U8DL_AUDIO_OFFSET_SEC = 0.0
 
 # Part A: Dynamic per-source (URL + headers + keys)
 
-# ICCCTV
-# NM3U8DL_PART_A = 'N_m3u8DL-RE "https://live-d-01-icc-we.akamaized.net/variant/v1blackout/vcg-01-d/DASH_DASH/Live/channel(vcg-01-ch-hd-03)/manifest.mpd?vcfilter=486d73e7-26d4-45cb-a5ae-d4c7f346ce60&hdnts=st=1782046873~exp=1782046913~acl=/variant/v1blackout/vcg-01-d/*~id=96870cdd-9d68-4ce7-9dfd-6f94a7306c54~hmac=f3abfa6f7d9b92610b977d27444b7a71579ac3493725086c2ffcc4b14e27490e&hdcore=2.11.3" -H "Accept: */*" -H "Origin: https://www.icc-cricket.com" -H "Referer: https://www.icc-cricket.com/" -H "Sec-GPC: 1" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36" --key 39bd302cdeed3710a89fb004d232ab67:9869f804ba18d7e508cbff781829221c --use-shaka-packager'
-
-# 7AU
-# NM3U8DL_PART_A = 'N_m3u8DL-RE "https://csm-e-sevenextprdlive-eb.bln1.yospace.com/csm/extlive/sevenprd01,MISC501.m3u8?appId=7plus&deviceType=web&platformType=web&ppId=cd7879b06cb4f677c1646ab19f231ae4d8763ff04bafe729c7f810cfe5169dbb&videoType=live&accountId=5650355166001&advertId=null&uaId=cd7879b06cb4f677c1646ab19f231ae4d8763ff04bafe729c7f810cfe5169dbb&optinDeviceType=&optinAdTracking=0&tvid=509e1aa82e31411d80be01940533e5ff&pc=3000&deviceId=68353795-bee5-4347-b991-5e58ae6defa1&mstatus=true&hl=en&ozid=2bb67ed5-c8f1-4a9e-8da2-396211d02e09&deviceSubType=desktop&referenceId=MISC501&vid=6309122219112&yo.hb=5000&pp=csai-web&custParams=y%253D7%2526c%253Dn%2526dpc%253D3205&y=7&c=n&dpc=3205&yo.pp=aGRudHM9ZXhwPTE3ODczODY3MjJ-YWNsPS8qfmhtYWM9NWRlZGM1Y2RkNjY0MmRiMmNhYzk2ZWJhZDk2ZjNmZTU4MjhhNzMzOTcxMWEwNTU5MzgwODk2Zjc0OTAzY2I1OSZQb2xpY3k9ZXlKVGRHRjBaVzFsYm5RaU9sdDdJa052Ym1ScGRHbHZiaUk2ZXlKRVlYUmxUR1Z6YzFSb1lXNGlPbnNpUVZkVE9rVndiMk5vVkdsdFpTSTZNVGM0TnpNNE5qY3lNbjBzSWtSaGRHVkhjbVZoZEdWeVZHaGhiaUk2ZXlKQlYxTTZSWEJ2WTJoVWFXMWxJam94TnpnM016QXdNekl4ZlgxOVhYMF8mU2lnbmF0dXJlPVdwMEFIamVMLXYzfkpQNllNRktKYlZpWUV-UUJTYUh0cmN-S1J6ZWVJNlZ6Y0dLckFDUlIxUkV2aFFTeVYtREN-Vnl1RXNkbHpxbUdjaWxnY3dzQ203WU5QVjNDTks4aWpiTHpDNWZpdllSUnpxSWZuNS1tUUhKYk5Xc3dUYVFVZzJMaTg5Y2VLZXdMNkl1UUJ3dnZmOXNRajU0RXU5VExuc1pHOWFrcEQ5VHZCZWMxQWdVVHdzdEI0VnQ1aWw3TXdicn5jS3QyWWlXT1V2bHpBcUY0UUVnbjRjdUFGM0dHYlhkLU9pVWw2cHRwVlE1SDRoSTNVZDdHUXB-TnlPSUcxc2YzNkRkZ0JkN0NHYlF4MnNQUlY0bmhsQUJwMXJBdDJOUU5qMVR5SWRzdVl4c1RJTGZqUjZRMkJKYzd-TjhOdVd-cHRvcGE1eFkzY3VhMEF0VS1PUV9fJktleS1QYWlyLUlkPUFQS0FJT1Q0TTZLTjZDUU9BV0VR" -H "Accept: */*" -H "Origin: null" -H "Referer: https://7plus.com.au/" -H "Sec-GPC: 1" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36" --key 9cd408c15ec3359cb2512ef8c12627b9:df75b6bc664fe0b9d3d244531b7d28b6 --key c447e1401f34397d957a0b52ebe714eb:9a0031a73287e13676d342af13127b11 --use-shaka-packager --live-wait-time 10'
-
-# HOTSTAR
-# NM3U8DL_PART_A = 'N_m3u8DL-RE "https://live15p.hotstar.com/hls/live/2004207/inallow-duleep-2026/hin/1540076896/15mindvrm025927a804abe9424582fbd0398011a09723august2026/master_ap.m3u8?a=ns&hdnea=exp=1787466045~acl=/hls/live/2004207/inallow-duleep-2026/hin/1540076896/15mindvrm025927a804abe9424582fbd0398011a09723august2026/master_ap*~data=ip=Zt26r0bIrlZrAEgJsnoSNT-userid=SpWJsURgPPjk1o6gO2zKOfKEwVe7wgTqILOkNnIKa2cK-did=SeF3lusrNCTsZBeenGRygWmXHKOmgloOXrinQRyCdNpd-cc=in-bl=jhs-de=6-pl=androidtv-ap=25.02.16.1-ut=paid-ttl=1800-type=paid-raf=1787464845-~hmac=d15e2d817c470626e3149e2f6ea95fb8f7461c5dd04b465c19ad7733da40f456" -H "Accept: */*" -H "Origin: https://www.hotstar.com" -H "Referer: https://www.hotstar.com/" -H "Sec-GPC: 1" -H "User-Agent: Hotstar;in.startv.hotstar/25.02.24.8.11169@rtxcric(Android/15)"'
-
-# FANCODE FROM DRMLIVE
-# NM3U8DL_PART_A = 'N_m3u8DL-RE  "https://in-mc-fblive.fancode.com/mumbai/143399_english_hls_b76266f66a74436_1ta-di_h264/index.m3u8" -H "Referer: https://www.fancode.com/" -H "Sec-GPC: 1" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"'
-
-# SONY LIV FROM DRMLIVE
-# NM3U8DL_PART_A = 'N_m3u8DL-RE  "https://sonydaimenew.akamaized.net/hls/live/2105079/cricodi2308/ENG/std_lrh-800300010.m3u8?hdnea=exp=1787497331~acl=/*~id=71421041997590671143781694294564~hmac=115f8cbf63088c063cbdc30cd40b575908f5365de03104d3ef7f6c1d999833a9" -H "Accept: */*" -H "Origin: https://www.sonyliv.com" -H "Referer: https://www.sonyliv.com/" -H "Sec-GPC: 1" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"'
+# Example only. Runtime source details belong in recorder_dynamic_user_config.py
+# or are supplied by the discovery/acquisition path. Do not commit live signed
+# playback URLs, cookies, authorization tokens, or decryption keys here.
+# NM3U8DL_PART_A = 'N_m3u8DL-RE "https://example.invalid/live/master.m3u8" -H "User-Agent: Example"'
 
 
 # Part B: Static/default options (appended to command with dynamic chunk name).
