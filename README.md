@@ -303,3 +303,11 @@ Development is normally validated on `dev` and promoted to `main` after the regr
 The completed system includes source discovery, quality inspection, canonical identity grouping, MANUAL and ALL_IDENTITIES operation, duplicate prevention, shared worker ownership, automatic launches, dashboard monitoring, recovery integration, sound controls, and the shared 20-worker ceiling.
 
 Future work can continue on top of this baseline without changing the completed Inspect / Watch / Record / Auto model.
+
+### End-user installation status
+
+Recorder is currently maintained as a **source-code project**, not yet as a packaged desktop application or one-click installer.
+
+The recording system itself is implemented and stable, but a new user currently needs to provide the required configuration and install the supporting runtime tools/dependencies before running it.
+
+A simpler run-only installation/distribution path for non-developers is planned as future work.
