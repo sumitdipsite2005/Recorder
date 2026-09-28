@@ -84,6 +84,10 @@ A canonical identity can have only one active owner. The registry covers workers
 
 The Coordinator is the main Inspect / Watch interface. It presents the system as a live terminal dashboard rather than a GUI.
 
+![Recorder Coordinator dashboard](docs/images/coordinator-dashboard1.png)
+
+![Recorder Coordinator dashboard](docs/images/coordinator-dashboard2.png)
+
 It shows:
 
 - **ACTIVE RECORDINGS**
