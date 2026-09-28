@@ -81,6 +81,7 @@ from recorder_coordinator.terminal import (
     play_launch_sound,
     clear_dashboard_terminal,
     clear_live_status_line,
+    coordinator_wait_status_text,
     render_coordinator_controls,
     render_dashboard,
     render_header,
@@ -275,6 +276,7 @@ def run_once(
     target_views = config_state.target_views(
         now,
         coordinator_active=(window.status == "ACTIVE"),
+        coordinator_active_from=window.active_from,
     )
     raw = config_state.raw_config or {}
     failed_source_keys: Set[Tuple[str, str, str]] = set()
@@ -339,18 +341,26 @@ def next_watch_sleep_seconds(
 ) -> float:
     """Return the next watch delay without sleeping past known timing boundaries."""
     current = now or datetime.now()
-    delays = [max(1.0, float(refresh_interval_sec))]
 
     window = snapshot.coordinator_window
-    if window is not None:
-        if window.status == "WAITING" and window.active_from > current:
-            delays.append(max(1.0, (window.active_from - current).total_seconds()))
-        elif (
-            window.status == "ACTIVE"
-            and window.active_until is not None
-            and window.active_until > current
-        ):
-            delays.append(max(1.0, (window.active_until - current).total_seconds()))
+    if (
+        window is not None
+        and window.status == "WAITING"
+        and window.active_from > current
+    ):
+        # Match the mature recorder's scheduled-wait behavior: once the
+        # Coordinator configuration is loaded, do not run empty watch cycles
+        # before activation. Wake at the Coordinator start boundary instead.
+        return max(1.0, (window.active_from - current).total_seconds())
+
+    delays = [max(1.0, float(refresh_interval_sec))]
+    if (
+        window is not None
+        and window.status == "ACTIVE"
+        and window.active_until is not None
+        and window.active_until > current
+    ):
+        delays.append(max(1.0, (window.active_until - current).total_seconds()))
 
     for view in snapshot.target_views:
         if (
@@ -367,6 +377,17 @@ def next_watch_sleep_seconds(
             delays.append(max(1.0, (view.active_until - current).total_seconds()))
 
     return min(delays)
+
+
+def _coordinator_live_status_text(
+    snapshot: DashboardSnapshot,
+    last_scan_wall_time: Optional[float],
+    next_refresh_monotonic: float,
+) -> str:
+    window = snapshot.coordinator_window
+    if window is not None and window.status == "WAITING":
+        return coordinator_wait_status_text(window.active_from)
+    return watch_status_text(last_scan_wall_time, next_refresh_monotonic)
 
 
 def _manual_record_choices(
@@ -1287,7 +1308,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     last_scan_wall_time = time.time()
                     force_refresh = False
                     set_live_status_line(
-                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                        _coordinator_live_status_text(
+                            snapshot,
+                            last_scan_wall_time,
+                            next_refresh_monotonic,
+                        )
                     )
                     continue
 
@@ -1462,7 +1487,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 next_refresh_monotonic = time.monotonic() + sleep_for
                 force_refresh = refresh_requested_during_scan
                 set_live_status_line(
-                    watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                    _coordinator_live_status_text(
+                        snapshot,
+                        last_scan_wall_time,
+                        next_refresh_monotonic,
+                    )
                 )
                 if meaningful:
                     _play_scan_ready_sound(
