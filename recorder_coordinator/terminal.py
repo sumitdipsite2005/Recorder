@@ -1382,13 +1382,24 @@ def write_log(path: Path, text: str) -> None:
         handle.write(text.rstrip() + "\n")
 
 
-COORDINATOR_NOTIFICATION_SOUND_FILENAME = "happy_notification.wav"
+COORDINATOR_REFRESH_SOUND_FILENAME = "refresh.wav"
+COORDINATOR_LAUNCH_SOUND_FILENAME = "launch.wav"
 COORDINATOR_NOTIFICATION_VOLUME = 0.75
 
 
+def _coordinator_sound_path(filename: str) -> Path:
+    """Resolve one optional Coordinator WAV beside the repo scripts."""
+    return Path(__file__).resolve().parent.parent / filename
+
+
 def _coordinator_notification_sound_path() -> Path:
-    """Resolve the optional one-shot Coordinator sound beside the repo scripts."""
-    return Path(__file__).resolve().parent.parent / COORDINATOR_NOTIFICATION_SOUND_FILENAME
+    """Compatibility helper for the normal Coordinator refresh/change sound."""
+    return _coordinator_sound_path(COORDINATOR_REFRESH_SOUND_FILENAME)
+
+
+def _coordinator_launch_sound_path() -> Path:
+    """Resolve the one-shot sound for a successful automatic worker launch."""
+    return _coordinator_sound_path(COORDINATOR_LAUNCH_SOUND_FILENAME)
 
 
 def _scale_pcm_frames(frames: bytes, sample_width: int, volume: float) -> bytes:
@@ -1463,19 +1474,22 @@ def _attenuated_notification_sound_path(
         return source_path
 
 
-def beep(
-    events: Sequence[ChangeEvent],
-    sound_state: Optional[SoundSnoozeState] = None,
-) -> None:
-    if sound_state is not None and runtime_sound.is_sound_snoozed(
-        sound_state,
-        indefinite_modes=("coordinator_run",),
-    ):
-        return
-    if winsound is None or not any(event.beep for event in events):
+def _sound_is_snoozed(
+    sound_state: Optional[SoundSnoozeState],
+) -> bool:
+    return (
+        sound_state is not None
+        and runtime_sound.is_sound_snoozed(
+            sound_state,
+            indefinite_modes=("coordinator_run",),
+        )
+    )
+
+
+def _play_coordinator_wav(sound_path: Path) -> None:
+    if winsound is None:
         return
     try:
-        sound_path = _coordinator_notification_sound_path()
         if sound_path.is_file():
             playback_path = _attenuated_notification_sound_path(sound_path)
             winsound.PlaySound(
@@ -1489,3 +1503,23 @@ def beep(
         winsound.Beep(659, 320)
     except Exception:
         pass
+
+
+def beep(
+    events: Sequence[ChangeEvent],
+    sound_state: Optional[SoundSnoozeState] = None,
+) -> None:
+    if _sound_is_snoozed(sound_state):
+        return
+    if not any(event.beep for event in events):
+        return
+    _play_coordinator_wav(_coordinator_notification_sound_path())
+
+
+def play_launch_sound(
+    sound_state: Optional[SoundSnoozeState] = None,
+) -> None:
+    """Play one sound for a scan that successfully launched Auto worker(s)."""
+    if _sound_is_snoozed(sound_state):
+        return
+    _play_coordinator_wav(_coordinator_launch_sound_path())
