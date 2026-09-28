@@ -552,6 +552,52 @@ class ActiveWorkerLimitNotificationTests(unittest.TestCase):
         )
 
 
+class ScanReadySoundTests(unittest.TestCase):
+    def test_refresh_sound_flushes_terminal_before_playback(self):
+        event=coord.ChangeEvent(
+            "NEW",
+            (coord.POLICY_MANUAL,"id"),
+            ("appeared",),
+            beep=True,
+        )
+        order=[]
+        with patch.object(
+            coord.sys.stdout,
+            "flush",
+            side_effect=lambda: order.append("flush"),
+        ), patch.object(
+            coord,
+            "beep",
+            side_effect=lambda events,state: order.append("refresh"),
+        ):
+            coord._play_scan_ready_sound(
+                (event,),
+                coord.SoundSnoozeState(),
+                auto_launch_succeeded=False,
+            )
+
+        self.assertEqual(order,["flush","refresh"])
+
+    def test_launch_sound_flushes_terminal_before_playback(self):
+        order=[]
+        with patch.object(
+            coord.sys.stdout,
+            "flush",
+            side_effect=lambda: order.append("flush"),
+        ), patch.object(
+            coord,
+            "play_launch_sound",
+            side_effect=lambda state: order.append("launch"),
+        ):
+            coord._play_scan_ready_sound(
+                (),
+                coord.SoundSnoozeState(),
+                auto_launch_succeeded=True,
+            )
+
+        self.assertEqual(order,["flush","launch"])
+
+
 class AutoLaunchSoundDecisionTests(unittest.TestCase):
     def test_multiple_successful_auto_launches_reduce_to_one_scan_sound_decision(self):
         outcomes=(
