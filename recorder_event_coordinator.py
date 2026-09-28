@@ -18,7 +18,7 @@ import runpy
 import sys
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -102,6 +102,52 @@ from recorder_source.policy import (
 
 
 REGISTRY_REFRESH_INTERVAL_SEC = 1.0
+
+
+@dataclass(frozen=True)
+class CoordinatorCycleContext:
+    now: datetime
+    config_messages: Tuple[str, ...]
+    window: CoordinatorWindow
+    target_views: Tuple[TargetView, ...]
+    raw: Mapping[str, object]
+
+
+def _prepare_cycle_context(
+    config_state: CoordinatorConfigState,
+    *,
+    stop_requested: Optional[Callable[[], bool]] = None,
+) -> CoordinatorCycleContext:
+    if stop_requested is not None and stop_requested():
+        raise RuntimeError("Coordinator scan cancelled by stop request")
+
+    now = datetime.now()
+    config_messages, _ = config_state.reload(now)
+    window = config_state.coordinator_window(now)
+    target_views = config_state.target_views(
+        now,
+        coordinator_active=(window.status == "ACTIVE"),
+    )
+    return CoordinatorCycleContext(
+        now=now,
+        config_messages=tuple(config_messages),
+        window=window,
+        target_views=tuple(target_views),
+        raw=dict(config_state.raw_config or {}),
+    )
+
+
+def _initial_header_preview(
+    context: CoordinatorCycleContext,
+) -> Optional[DashboardSnapshot]:
+    if context.window.status != "ACTIVE":
+        return None
+    return DashboardSnapshot(
+        created_at=context.now,
+        target_views=context.target_views,
+        coordinator_window=context.window,
+        blocks={},
+    )
 
 
 def _default_config_path() -> Path:
@@ -259,7 +305,7 @@ def run_once(
     previous: Optional[DashboardSnapshot],
     *,
     progress_callback: Optional[Callable[[str], None]] = None,
-    context_callback: Optional[Callable[[DashboardSnapshot], None]] = None,
+    cycle_context: Optional[CoordinatorCycleContext] = None,
     row_update_registry: Optional[Dict[Tuple[object, ...], Tuple[Tuple[object, ...], datetime]]] = None,
     source_freshness_registry: Optional[Dict[str, Mapping[str, object]]] = None,
     event_transition_registry: Optional[
@@ -270,24 +316,17 @@ def run_once(
 ) -> Tuple[DashboardSnapshot, Tuple[ChangeEvent, ...]]:
     if stop_requested is not None and stop_requested():
         raise RuntimeError("Coordinator scan cancelled by stop request")
-    now = datetime.now()
-    config_messages, _ = config_state.reload(now)
-    window = config_state.coordinator_window(now)
-    target_views = config_state.target_views(
-        now,
-        coordinator_active=(window.status == "ACTIVE"),
+
+    context = cycle_context or _prepare_cycle_context(
+        config_state,
+        stop_requested=stop_requested,
     )
-    raw = config_state.raw_config or {}
+    now = context.now
+    config_messages = context.config_messages
+    window = context.window
+    target_views = context.target_views
+    raw = context.raw
     failed_source_keys: Set[Tuple[str, str, str]] = set()
-    if context_callback is not None:
-        context_callback(
-            DashboardSnapshot(
-                created_at=now,
-                target_views=tuple(target_views),
-                coordinator_window=window,
-                blocks={},
-            )
-        )
     if window.status == "ACTIVE":
         acquisition_kwargs = (
             {"quality_evidence_registry": quality_evidence_registry}
@@ -316,7 +355,7 @@ def run_once(
     if stop_requested is not None and stop_requested():
         raise RuntimeError("Coordinator scan cancelled by stop request")
 
-    if progress_callback is not None:
+    if progress_callback is not None and window.status == "ACTIVE":
         progress_callback("Building identities...")
 
     snapshot = build_snapshot(
@@ -1178,16 +1217,23 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 and (force_refresh or now_monotonic >= next_refresh_monotonic)
             ):
                 try:
-                    def show_initial_header(preview: DashboardSnapshot) -> None:
-                        clear_live_status_line()
-                        clear_dashboard_terminal()
-                        print(
-                            render_header(
-                                preview,
-                                config_path=config_path,
-                                refresh_interval_sec=state.refresh_interval_sec,
-                            )
+                    cycle_context: Optional[CoordinatorCycleContext] = None
+                    if previous is None and not once:
+                        cycle_context = _prepare_cycle_context(
+                            state,
+                            stop_requested=stop_event.is_set,
                         )
+                        preview = _initial_header_preview(cycle_context)
+                        if preview is not None:
+                            clear_live_status_line()
+                            clear_dashboard_terminal()
+                            print(
+                                render_header(
+                                    preview,
+                                    config_path=config_path,
+                                    refresh_interval_sec=state.refresh_interval_sec,
+                                )
+                            )
 
                     scan_results: "queue.Queue[Tuple[str, object]]" = queue.Queue()
                     scan_progress = {"text": ""}
@@ -1205,11 +1251,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                                 progress_callback=(
                                     None if once else scan_progress_callback
                                 ),
-                                context_callback=(
-                                    show_initial_header
-                                    if previous is None and not once
-                                    else None
-                                ),
+                                cycle_context=cycle_context,
                                 row_update_registry=row_update_registry,
                                 source_freshness_registry=source_freshness_registry,
                                 event_transition_registry=event_transition_registry,
