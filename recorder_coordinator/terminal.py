@@ -204,12 +204,6 @@ def _target_search_text(target: IdentityTarget) -> str:
                 item for item in (_phrase_group_text(value) for value in target.required) if item
             )
         )
-    if target.rejected:
-        extras.append(
-            "exclude: " + " OR ".join(
-                item for item in (_phrase_group_text(value) for value in target.rejected) if item
-            )
-        )
     if target.preferred:
         extras.append(
             "prefer: " + " OR ".join(
@@ -726,7 +720,7 @@ def render_dashboard(
 
     if active_entries:
         lines.append("")
-        lines.append(_event_title("RECORDINGS", color))
+        lines.append(_event_title("ACTIVE RECORDINGS", color))
         for identity_key, entry, state in sorted(
             active_entries,
             key=lambda item: (
@@ -789,7 +783,9 @@ def render_dashboard(
                     2 + len(f"[{state}]") + 1
                 )
                 lines.append(
-                    f"  {state_flag} {event_name} | {tvg_name} | {group_name} "
+                    f"  {state_flag} {_event_title(event_name, color)} | "
+                    f"{_secondary_text(tvg_name, color)} | "
+                    f"{_group_text(group_name, color)} "
                     f"| {provider} | {source_text} | {quality}"
                 )
                 lines.append(
@@ -817,7 +813,7 @@ def render_dashboard(
         lines.append("")
         lines.extend(snapshot.config_messages)
 
-    for policy, heading in ((POLICY_MANUAL, "MANUAL"), (POLICY_ALL, "ALL IDENTITIES")):
+    for policy, heading in ((POLICY_ALL, "ALL IDENTITIES"), (POLICY_MANUAL, "MANUAL")):
         policy_blocks = [block for key, block in snapshot.blocks.items() if key[0] == policy]
         if display_order is not None:
             position = {
@@ -1320,6 +1316,7 @@ def render_coordinator_controls(sound_state: SoundSnoozeState) -> str:
         "",
         "  R  Record a MANUAL identity",
         "  S  Sound / notification snooze",
+        "  I / Esc  Close information",
         "  F5 Refresh now",
         "  Ctrl+C  Exit",
         "====================================================================",
