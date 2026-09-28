@@ -212,16 +212,13 @@ def parse_targets(raw: Mapping[str, object]) -> Tuple[IdentityTarget, ...]:
             "IDENTITY_COORDINATOR_TARGETS must be a list of explicit MANUAL/ALL targets"
         )
 
-    seen_names: Set[str] = set()
+    target_index_by_name: Dict[str, int] = {}
     for index, item in enumerate(configured, start=1):
         if not isinstance(item, Mapping):
             raise ValueError(f"target {index} must be a dictionary")
         name = str(item.get("name") or "").strip()
         if not name:
             raise ValueError(f"target {index} needs a stable unique name")
-        if name in seen_names:
-            raise ValueError(f"duplicate target name {name!r}")
-        seen_names.add(name)
 
         source_groups = tuple(
             str(group).strip().upper()
@@ -236,26 +233,40 @@ def parse_targets(raw: Mapping[str, object]) -> Tuple[IdentityTarget, ...]:
         if not match_all and not primary:
             raise ValueError(f"{name}: primary search is required unless match_all=True")
 
-        targets.append(
-            IdentityTarget(
-                name=name,
-                policy=_normalize_policy(item.get("policy")),
-                source_groups=source_groups,
-                primary=primary,
-                required=_tuple_config(item.get("required")),
-                rejected=_tuple_config(item.get("rejected")),
-                preferred=_tuple_config(item.get("preferred")),
-                match_all=match_all,
-                enabled=bool(item.get("enabled", True)),
-                schedule_start=_parse_schedule_start(item.get("schedule_start")),
-                activity_duration_min=_parse_optional_minutes(
-                    item.get("activity_duration_min"), "activity_duration_min"
-                ),
-                worker_recording_duration_min=_parse_optional_minutes(
-                    item.get("worker_recording_duration_min"), "worker_recording_duration_min"
-                ),
-            )
+        parsed_target = IdentityTarget(
+            name=name,
+            policy=_normalize_policy(item.get("policy")),
+            source_groups=source_groups,
+            primary=primary,
+            required=_tuple_config(item.get("required")),
+            rejected=_tuple_config(item.get("rejected")),
+            preferred=_tuple_config(item.get("preferred")),
+            match_all=match_all,
+            enabled=bool(item.get("enabled", True)),
+            schedule_start=_parse_schedule_start(item.get("schedule_start")),
+            activity_duration_min=_parse_optional_minutes(
+                item.get("activity_duration_min"), "activity_duration_min"
+            ),
+            worker_recording_duration_min=_parse_optional_minutes(
+                item.get("worker_recording_duration_min"), "worker_recording_duration_min"
+            ),
         )
+
+        existing_index = target_index_by_name.get(name)
+        if existing_index is None:
+            target_index_by_name[name] = len(targets)
+            targets.append(parsed_target)
+            continue
+
+        existing_target = targets[existing_index]
+        if existing_target.enabled and parsed_target.enabled:
+            raise ValueError(f"duplicate enabled target name {name!r}")
+
+        # Generated target lists are commonly followed by an explicit override.
+        # If either declaration is disabled, the later declaration wins so a
+        # disabled explicit block can intentionally turn off/configure the
+        # generated target without creating an ambiguous active duplicate.
+        targets[existing_index] = parsed_target
 
     return tuple(targets)
 
