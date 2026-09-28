@@ -212,13 +212,37 @@ def parse_targets(raw: Mapping[str, object]) -> Tuple[IdentityTarget, ...]:
             "IDENTITY_COORDINATOR_TARGETS must be a list of explicit MANUAL/ALL targets"
         )
 
-    target_index_by_name: Dict[str, int] = {}
+    # Target names identify active runtime targets. Disabled declarations do not
+    # participate in duplicate-name enforcement and must never suppress or
+    # replace an enabled target with the same name.
+    enabled_names: Set[str] = set()
     for index, item in enumerate(configured, start=1):
         if not isinstance(item, Mapping):
             raise ValueError(f"target {index} must be a dictionary")
         name = str(item.get("name") or "").strip()
         if not name:
             raise ValueError(f"target {index} needs a stable unique name")
+        if not bool(item.get("enabled", True)):
+            continue
+        if name in enabled_names:
+            raise ValueError(f"duplicate enabled target name {name!r}")
+        enabled_names.add(name)
+
+    retained_disabled_names: Set[str] = set()
+    for index, item in enumerate(configured, start=1):
+        name = str(item.get("name") or "").strip()
+        enabled = bool(item.get("enabled", True))
+
+        # If an enabled target exists with this name, any disabled declaration
+        # is inert configuration and is ignored entirely.
+        if not enabled and name in enabled_names:
+            continue
+
+        # Multiple disabled declarations with the same name are also inert.
+        # Keep one for DISABLED presentation/config-diff behavior without
+        # creating duplicate runtime-name entries.
+        if not enabled and name in retained_disabled_names:
+            continue
 
         source_groups = tuple(
             str(group).strip().upper()
@@ -242,7 +266,7 @@ def parse_targets(raw: Mapping[str, object]) -> Tuple[IdentityTarget, ...]:
             rejected=_tuple_config(item.get("rejected")),
             preferred=_tuple_config(item.get("preferred")),
             match_all=match_all,
-            enabled=bool(item.get("enabled", True)),
+            enabled=enabled,
             schedule_start=_parse_schedule_start(item.get("schedule_start")),
             activity_duration_min=_parse_optional_minutes(
                 item.get("activity_duration_min"), "activity_duration_min"
@@ -251,25 +275,11 @@ def parse_targets(raw: Mapping[str, object]) -> Tuple[IdentityTarget, ...]:
                 item.get("worker_recording_duration_min"), "worker_recording_duration_min"
             ),
         )
-
-        existing_index = target_index_by_name.get(name)
-        if existing_index is None:
-            target_index_by_name[name] = len(targets)
-            targets.append(parsed_target)
-            continue
-
-        existing_target = targets[existing_index]
-        if existing_target.enabled and parsed_target.enabled:
-            raise ValueError(f"duplicate enabled target name {name!r}")
-
-        # Generated target lists are commonly followed by an explicit override.
-        # If either declaration is disabled, the later declaration wins so a
-        # disabled explicit block can intentionally turn off/configure the
-        # generated target without creating an ambiguous active duplicate.
-        targets[existing_index] = parsed_target
+        targets.append(parsed_target)
+        if not enabled:
+            retained_disabled_names.add(name)
 
     return tuple(targets)
-
 
 def diff_target_configs(
     previous: Sequence[IdentityTarget],
