@@ -88,6 +88,7 @@ from recorder_coordinator.terminal import (
     render_sound_snooze_menu,
     set_live_status_line,
     update_display_order,
+    update_display_quality_registry,
     update_source_reference_registry,
     watch_status_text,
     write_log,
@@ -777,6 +778,7 @@ def _restore_dashboard_after_temporary_menu(
     registry_entries: Mapping[str, Mapping[str, object]],
     runtime_statuses: Mapping[str, Mapping[str, object]],
     source_references: Mapping[str, int],
+    display_quality_registry: Mapping[Tuple[object, ...], object],
     watch_text: str = "",
 ) -> None:
     """Remove a temporary menu and restore the last completed Coordinator view."""
@@ -795,6 +797,7 @@ def _restore_dashboard_after_temporary_menu(
         registry_entries=registry_entries,
         runtime_statuses=runtime_statuses,
         source_references=source_references,
+        display_quality_registry=display_quality_registry,
     )
     clear_dashboard_terminal()
     print(terminal_text)
@@ -812,6 +815,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
         Tuple[str, str], Mapping[str, object]
     ] = {}
     quality_evidence_registry: Dict[str, Mapping[str, object]] = {}
+    display_quality_registry: Dict[Tuple[object, ...], object] = {}
     source_reference_registry: Dict[str, int] = {}
     started = datetime.now()
     output_paths = _coordinator_output_paths(config_path)
@@ -914,6 +918,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     registry_entries=registry_entries,
                     runtime_statuses=runtime_statuses,
                     source_references=source_reference_registry,
+                    display_quality_registry=display_quality_registry,
                     watch_text=watch_text,
                 )
                 dashboard_has_transient = False
@@ -1104,6 +1109,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                                 registry_entries=registry_entries,
                                 runtime_statuses=runtime_statuses,
                                 source_references=source_reference_registry,
+                    display_quality_registry=display_quality_registry,
                             )
                             clear_dashboard_terminal()
                             print(terminal_text)
@@ -1237,6 +1243,10 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     if result_kind == "error":
                         raise result_payload
                     snapshot, events = result_payload
+                    display_quality_registry = update_display_quality_registry(
+                        display_quality_registry,
+                        snapshot,
+                    )
                     last_completed_raw_config = dict(state.raw_config or {})
                 except KeyboardInterrupt:
                     raise
@@ -1373,6 +1383,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         registry_entries=registry_entries,
                         runtime_statuses=runtime_statuses,
                         source_references=source_reference_registry,
+                    display_quality_registry=display_quality_registry,
                     )
                     clear_dashboard_terminal()
                     print(terminal_text)
@@ -1388,6 +1399,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             registry_entries=registry_entries,
                             runtime_statuses=runtime_statuses,
                             source_references=source_reference_registry,
+                    display_quality_registry=display_quality_registry,
                         )
                         write_log(log_path, log_text)
                         for event in _change_events_for_log(events):
@@ -1471,6 +1483,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         registry_entries=registry_entries,
                         runtime_statuses=runtime_statuses,
                         source_references=source_reference_registry,
+                    display_quality_registry=display_quality_registry,
                         watch_text=watch_text,
                     )
                     dashboard_has_transient = False
@@ -1532,6 +1545,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     registry_entries=registry_entries,
                     runtime_statuses=runtime_statuses,
                     source_references=source_reference_registry,
+                    display_quality_registry=display_quality_registry,
                     watch_text=message,
                 )
                 dashboard_has_transient = False
