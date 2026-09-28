@@ -2263,28 +2263,50 @@ class SnapshotAndChangeTests(unittest.TestCase):
             "premiumplugx.com/VIP/pluglist.php",
         )
 
-    def test_initial_context_callback_runs_before_acquisition(self):
-        order=[]
+    def test_waiting_cycle_has_no_initial_header_preview(self):
+        now=datetime(2026,9,28,12,13,36)
+        context=coord.CoordinatorCycleContext(
+            now=now,
+            config_messages=(),
+            window=coord.CoordinatorWindow(
+                "WAITING",
+                datetime(2026,9,28,18,0,0),
+                None,
+            ),
+            target_views=(),
+            raw={},
+        )
+        self.assertIsNone(coord._initial_header_preview(context))
+
+    def test_prepared_active_cycle_is_reused_for_preview_and_acquisition(self):
+        reload_calls=[]
         now=datetime(2026,9,24,10,0,0)
 
         class FakeState:
             raw_config={}
             def reload(self, value):
+                reload_calls.append(value)
                 return (), False
             def coordinator_window(self, value):
                 return coord.CoordinatorWindow("ACTIVE",value,None)
             def target_views(self, value, *, coordinator_active=True):
                 return (view(now=value),)
 
-        def context(snapshot):
-            order.append("header")
-        def acquire(*args, **kwargs):
-            order.append("acquire")
-            return {"T":()}, ()
+        state=FakeState()
+        context=coord._prepare_cycle_context(state)
+        preview=coord._initial_header_preview(context)
+        self.assertIsNotNone(preview)
+        self.assertEqual(len(reload_calls),1)
 
-        with patch.object(coord,"acquire_active_targets",side_effect=acquire):
-            coord.run_once(FakeState(),None,context_callback=context)
-        self.assertEqual(order[:2],["header","acquire"])
+        with patch.object(
+            coord,
+            "acquire_active_targets",
+            return_value=({"T":()}, ()),
+        ) as acquire:
+            coord.run_once(state,None,cycle_context=context)
+
+        self.assertEqual(len(reload_calls),1)
+        acquire.assert_called_once()
 
     def test_nextpvr_reference_palette_is_used_for_event_group_and_marker(self):
         snap=snapshot([sony_candidate(group="Hockey")])
