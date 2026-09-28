@@ -857,6 +857,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
     last_scan_wall_time: Optional[float] = None
     dashboard_has_transient = False
     sound_state = SoundSnoozeState()
+    info_menu_open = False
     sound_menu_open = False
     record_menu_open = False
     record_choices: Tuple[Tuple[int, str], ...] = ()
@@ -1065,6 +1066,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             and previous is not None
                             and not force_refresh
                             and not record_menu_open
+                            and not info_menu_open
                             and not sound_menu_open
                         ):
                             clear_live_status_line()
@@ -1105,6 +1107,8 @@ def run(config_path: Path, *, once: bool = False) -> int:
             now_monotonic = time.monotonic()
             if (
                 not record_menu_open
+                and not info_menu_open
+                and not sound_menu_open
                 and (force_refresh or now_monotonic >= next_refresh_monotonic)
             ):
                 try:
@@ -1395,6 +1399,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 if (
                     next_refresh_monotonic > 0
                     and not record_menu_open
+                    and not info_menu_open
                     and not sound_menu_open
                 ):
                     set_live_status_line(
@@ -1407,23 +1412,44 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 clear_live_status_line()
                 print("\nIdentity Coordinator stopped by user.")
                 return 0
+            if info_menu_open:
+                if normalized in {"i", "info", "__esc__", "esc", "cancel"}:
+                    info_menu_open = False
+                    watch_text = (
+                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                        if next_refresh_monotonic > 0
+                        else ""
+                    )
+                    _restore_dashboard_after_temporary_menu(
+                        previous,
+                        display_order,
+                        config_path=config_path,
+                        refresh_interval_sec=state.refresh_interval_sec,
+                        registry_entries=registry_entries,
+                        runtime_statuses=runtime_statuses,
+                        source_references=source_reference_registry,
+                        watch_text=watch_text,
+                    )
+                    dashboard_has_transient = False
+                else:
+                    set_live_status_line("Press I or Esc to close")
+                continue
+
             if sound_menu_open:
+                message = ""
                 if normalized in {"__esc__", "esc", "cancel"}:
                     sound_menu_open = False
-                    clear_live_status_line()
-                    print("Sound control cancelled; sound state is unchanged.")
+                    message = "Sound control cancelled; sound state is unchanged."
                 elif normalized in {"m", "15", "15m"}:
                     runtime_sound.set_timed_sound_snooze(
                         sound_state,
                         duration_sec=15 * 60.0,
                     )
                     sound_menu_open = False
-                    clear_live_status_line()
                     message = (
                         "Sound snoozed for 15 minutes. Coordinator scanning "
                         "and change detection continue normally."
                     )
-                    print(message)
                     write_log(
                         log_path,
                         f"{datetime.now():%Y-%m-%d %H:%M:%S} SOUND SNOOZE — 15 minutes",
@@ -1434,12 +1460,10 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         "coordinator_run",
                     )
                     sound_menu_open = False
-                    clear_live_status_line()
                     message = (
                         "Sound snoozed for the full Coordinator run. Coordinator "
                         "scanning and change detection continue normally."
                     )
-                    print(message)
                     write_log(
                         log_path,
                         f"{datetime.now():%Y-%m-%d %H:%M:%S} "
@@ -1448,8 +1472,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 elif normalized in {"u", "unsnooze", "restore"}:
                     runtime_sound.clear_sound_snooze(sound_state)
                     sound_menu_open = False
-                    clear_live_status_line()
-                    print("Sound restored.")
+                    message = "Sound restored."
                     write_log(
                         log_path,
                         f"{datetime.now():%Y-%m-%d %H:%M:%S} SOUND RESTORED",
@@ -1458,10 +1481,17 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     set_live_status_line("Select M/F/U or Esc")
                     continue
 
-                if next_refresh_monotonic > 0:
-                    set_live_status_line(
-                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
-                    )
+                _restore_dashboard_after_temporary_menu(
+                    previous,
+                    display_order,
+                    config_path=config_path,
+                    refresh_interval_sec=state.refresh_interval_sec,
+                    registry_entries=registry_entries,
+                    runtime_statuses=runtime_statuses,
+                    source_references=source_reference_registry,
+                    watch_text=message,
+                )
+                dashboard_has_transient = False
                 continue
 
             if process_record_control(command, normalized):
@@ -1472,17 +1502,17 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 continue
 
             if normalized in {"i", "info"}:
+                info_menu_open = True
                 clear_live_status_line()
+                clear_dashboard_terminal()
                 print(render_coordinator_controls(sound_state))
-                if next_refresh_monotonic > 0:
-                    set_live_status_line(
-                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
-                    )
+                set_live_status_line("Press I or Esc to close")
                 continue
 
             if normalized in {"s", "sound"}:
                 sound_menu_open = True
                 clear_live_status_line()
+                clear_dashboard_terminal()
                 print(render_sound_snooze_menu(sound_state))
                 set_live_status_line("Select M/F/U or Esc")
                 continue
