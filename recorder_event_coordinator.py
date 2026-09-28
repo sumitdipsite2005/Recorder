@@ -778,7 +778,7 @@ def _restore_dashboard_after_temporary_menu(
     registry_entries: Mapping[str, Mapping[str, object]],
     runtime_statuses: Mapping[str, Mapping[str, object]],
     source_references: Mapping[str, int],
-    display_quality_registry: Mapping[Tuple[object, ...], object],
+    display_quality_registry: Optional[Mapping[Tuple[object, ...], object]] = None,
     watch_text: str = "",
 ) -> None:
     """Remove a temporary menu and restore the last completed Coordinator view."""
@@ -1109,7 +1109,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                                 registry_entries=registry_entries,
                                 runtime_statuses=runtime_statuses,
                                 source_references=source_reference_registry,
-                    display_quality_registry=display_quality_registry,
+                                display_quality_registry=display_quality_registry,
                             )
                             clear_dashboard_terminal()
                             print(terminal_text)
@@ -1383,7 +1383,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                         registry_entries=registry_entries,
                         runtime_statuses=runtime_statuses,
                         source_references=source_reference_registry,
-                    display_quality_registry=display_quality_registry,
+                        display_quality_registry=display_quality_registry,
                     )
                     clear_dashboard_terminal()
                     print(terminal_text)
@@ -1399,7 +1399,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             registry_entries=registry_entries,
                             runtime_statuses=runtime_statuses,
                             source_references=source_reference_registry,
-                    display_quality_registry=display_quality_registry,
+                            display_quality_registry=display_quality_registry,
                         )
                         write_log(log_path, log_text)
                         for event in _change_events_for_log(events):
