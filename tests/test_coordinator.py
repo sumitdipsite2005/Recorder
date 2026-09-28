@@ -1369,7 +1369,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
             if line.startswith("[1]")
         )
         self.assertIn("[1] RECORDING SONYLIV",identity_line)
-        self.assertIn("RECORDINGS",rendered)
+        self.assertIn("ACTIVE RECORDINGS",rendered)
         recording_line=next(
             line for line in rendered.splitlines()
             if "[RECORDING]" in line
@@ -1406,7 +1406,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
             runtime_statuses=runtime_statuses,
         )
         self.assertIn(
-            "\033[38;2;41;159;214mRECORDINGS\033[0m",
+            "\033[38;2;41;159;214mACTIVE RECORDINGS\033[0m",
             colored,
         )
         self.assertIn(
@@ -1415,6 +1415,14 @@ class SnapshotAndChangeTests(unittest.TestCase):
         )
         self.assertIn(
             "\033[38;2;255;135;3mRECORDING\033[0m",
+            colored,
+        )
+        self.assertIn(
+            "\033[38;2;41;159;214mAsian Games\033[0m",
+            colored,
+        )
+        self.assertIn(
+            "\033[38;2;41;159;214mSports\033[0m",
             colored,
         )
 
@@ -1616,8 +1624,24 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("RECORDER EVENT COORDINATOR",rendered)
         self.assertIn("Target 1",rendered)
         self.assertIn("Asian Games | MANUAL | ACTIVE",rendered)
-        self.assertIn("Search: Asian Games | required: ENG | exclude: Highlights",rendered)
+        self.assertIn("Search: Asian Games | required: ENG",rendered)
+        self.assertNotIn("exclude: Highlights",rendered)
         self.assertIn("Sources: SONYLIV_EVENTS",rendered)
+
+    def test_dashboard_renders_all_identities_before_manual(self):
+        manual_target=target(name="Manual",policy=coord.POLICY_MANUAL)
+        all_target=target(name="Auto",policy=coord.POLICY_ALL)
+        candidate=sony_candidate()
+        snap=coord.build_snapshot(
+            (view(manual_target),view(all_target)),
+            {"Manual":(candidate,),"Auto":(candidate,)},
+            now=datetime(2026,9,24,10,0,0),
+        )
+        rendered=coord.render_dashboard(snap,())
+        self.assertLess(
+            rendered.index("--- ALL IDENTITIES ---"),
+            rendered.index("--- MANUAL ---"),
+        )
 
     def test_dashboard_groups_quality_variants_under_one_identity(self):
         a=sony_candidate(playlist="https://one/list",source_name="one",fps=50)
@@ -2319,6 +2343,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         rendered=coord.render_coordinator_controls(state)
         self.assertNotIn("I  Coordinator information & controls",rendered)
         self.assertIn("S  Sound / notification snooze",rendered)
+        self.assertIn("I / Esc  Close information",rendered)
 
     def test_watch_footer_advertises_record_and_f5_refresh(self):
         rendered=coord.watch_status_text(0.0,coord.time.monotonic()+60)
