@@ -29,6 +29,7 @@ import json
 import runpy
 import base64
 import hashlib
+import ipaddress
 import socket
 import queue
 import tempfile
@@ -58,14 +59,38 @@ from http.cookiejar import CookieJar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 
+from recorder_runtime import sound as runtime_sound
+from recorder_runtime.identity_launch import (
+    IdentityLaunchRequest,
+    target_match_contexts_for_recovery_playlist,
+)
+from recorder_runtime.paths import build_recorder_output_paths
 from recorder_source import discovery as source_discovery
+from recorder_source import headers as source_headers
+from recorder_source import json_playlist as source_json_playlist
+from recorder_source import playback as source_playback
+from recorder_source import playlist_headers as source_playlist_headers
+from recorder_source import manifest as source_manifest
 from recorder_source import matching as source_matching
 from recorder_source import selection as source_selection
+from recorder_source import quality as source_quality
+from recorder_source import transport as source_transport
+from recorder_source.identity import derive_feed_identity
 from recorder_source.models import (
     SelectionDecision,
     SelectionPolicy,
     SourceAcquisitionRequest,
     SourceCandidate,
+)
+from recorder_source.policy import (
+    PLAYLIST_GROUP_LIFECYCLES as SHARED_PLAYLIST_GROUP_LIFECYCLES,
+    PLAYLIST_GROUP_MATCH_MODES as SHARED_PLAYLIST_GROUP_MATCH_MODES,
+    PLAYLIST_GROUP_PROFILES as SHARED_PLAYLIST_GROUP_PROFILES,
+    PLAYLIST_GROUP_SOURCE_BUCKETS as SHARED_PLAYLIST_GROUP_SOURCE_BUCKETS,
+    PLAYLIST_USER_AGENTS as SHARED_PLAYLIST_USER_AGENTS,
+    PROVIDER_ADDED_HEADERS as SHARED_PROVIDER_ADDED_HEADERS,
+    apply_lifecycle_scan_type_policy as shared_apply_lifecycle_scan_type_policy,
+    selection_policy_for_provider as shared_selection_policy_for_provider,
 )
 
 # User configuration is shared through OneDrive across all recorder machines.
@@ -81,9 +106,14 @@ elif os.name == "nt":
 else:
     raise RuntimeError("Unsupported operating system for recorder config location.")
 
-DYNAMIC_CONFIG_PATH = os.path.join(
-    RECORDER_CONFIG_DIR,
-    "recorder_dynamic_user_config.py",
+DYNAMIC_CONFIG_PATH = os.path.abspath(
+    os.path.expanduser(
+        os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        or os.path.join(
+            RECORDER_CONFIG_DIR,
+            "recorder_dynamic_user_config.py",
+        )
+    )
 )
 
 if not os.path.isfile(DYNAMIC_CONFIG_PATH):
@@ -99,11 +129,20 @@ NM3U8DL_PLAYLIST_PRIMARY_PHRASES = _dynamic_user_config["NM3U8DL_PLAYLIST_PRIMAR
 NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = _dynamic_user_config["NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS"]
 NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = _dynamic_user_config["NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS"]
 NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = _dynamic_user_config["NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS"]
+# Coordinator identity launches can intentionally use MATCH ALL with no primary
+# phrases. Direct recorder runs keep the historical default of False.
+NM3U8DL_PLAYLIST_MATCH_ALL = False
 NM3U8DL_PLAYLIST_GROUP = _dynamic_user_config["NM3U8DL_PLAYLIST_GROUP"]
 NM3U8DL_PLAYLIST_GROUPS = _dynamic_user_config["NM3U8DL_PLAYLIST_GROUPS"]
 SCHEDULE_START = _dynamic_user_config["SCHEDULE_START"]
 RUN_DURATION_MIN = _dynamic_user_config["RUN_DURATION_MIN"]
 BASE_NAME = _dynamic_user_config["BASE_NAME"]
+OUTPUT_PATHS = build_recorder_output_paths(
+    _dynamic_user_config.get("RECORDING_OUTPUT_DIR")
+)
+RECORDING_OUTPUT_DIR = str(OUTPUT_PATHS.root)
+RECORDING_LOGS_DIR = str(OUTPUT_PATHS.recording_logs)
+PLAYLIST_HISTORY_DIR = str(OUTPUT_PATHS.playlist_history)
 
 
 
@@ -131,18 +170,15 @@ PLAYLIST_HISTORY_STALE_LOCK_SEC = 5 * 60
 
 # Playlist group → command/runtime profile.
 # The user selects only NM3U8DL_PLAYLIST_GROUP above.
-NM3U8DL_PLAYLIST_GROUP_PROFILES = {
-    "HOTSTAR_EVENTS": "HOTSTAR",
-    "KHEL": "KHEL",
-    "JIO_STAR_SPORTS": "JIO",
-    "SONYLIV_EVENTS": "SONYLIV",
-    "SONY_TV": "SONYLIV",
-    "FANCODE": "FANCODE",
-}
+NM3U8DL_PLAYLIST_GROUP_PROFILES = dict(SHARED_PLAYLIST_GROUP_PROFILES)
 
 NM3U8DL_PLAYLIST_GROUP_PROFILE_OVERRIDES = {
     "SONY_TV": {
         "quality_upgrade_enabled": False,
+    },
+    "JIO_STAR_SPORTS": {
+        # This linear-TV group has no useful upgrade above 1080p50.
+        "quality_upgrade_1080p50_ceiling": True,
     },
 }
 
@@ -150,26 +186,12 @@ NM3U8DL_PLAYLIST_GROUP_PROFILE_OVERRIDES = {
 # profile. Fixed TV-channel groups use a strong channel phrase/alias match plus
 # qualifier gates; event groups keep flexible phrase matching for variable titles.
 # The historical EXACT_CHANNEL mode name is retained for compatibility/history.
-NM3U8DL_PLAYLIST_GROUP_MATCH_MODES = {
-    "HOTSTAR_EVENTS": "EVENT_PHRASE",
-    "JIO_STAR_SPORTS": "EXACT_CHANNEL",
-    "KHEL": "EXACT_CHANNEL",
-    "SONY_TV": "EXACT_CHANNEL",
-    "SONYLIV_EVENTS": "EVENT_PHRASE",
-    "FANCODE": "EVENT_PHRASE",
-}
+NM3U8DL_PLAYLIST_GROUP_MATCH_MODES = dict(SHARED_PLAYLIST_GROUP_MATCH_MODES)
 
 # Stream lifecycle belongs to the playlist group, independently of matching or
 # downloader profile. Event streams may genuinely end; linear TV channels should
 # recover by resolving a fresh source instead of ending the overall recording.
-NM3U8DL_PLAYLIST_GROUP_LIFECYCLES = {
-    "HOTSTAR_EVENTS": "EVENT",
-    "SONYLIV_EVENTS": "EVENT",
-    "FANCODE": "EVENT",
-    "JIO_STAR_SPORTS": "LINEAR_TV",
-    "KHEL": "LINEAR_TV",
-    "SONY_TV": "LINEAR_TV",
-}
+NM3U8DL_PLAYLIST_GROUP_LIFECYCLES = dict(SHARED_PLAYLIST_GROUP_LIFECYCLES)
 
 # Cookie handling is universal by default:
 # if a canonical Cookie exists, send it once.
@@ -185,11 +207,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "HOTSTAR": {
         "safe_overtime_min": 60,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": False,
-        "added_headers": {
-            "Accept": "*/*",
-            "Sec-GPC": "1",
-        },
+        "allow_unknown_expiry": shared_selection_policy_for_provider("HOTSTAR").allow_unknown_expiry,
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["HOTSTAR"]),
         "key_mode": "SHAKA",
         "extra_args": "",
         "quality_upgrade_enabled": True,
@@ -201,8 +220,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "JIO": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": True,
-        "added_headers": {},
+        "allow_unknown_expiry": shared_selection_policy_for_provider("JIO").allow_unknown_expiry,
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["JIO"]),
         "key_mode": "MP4DECRYPT",
         "extra_args": "--thread-count 1 --live-keep-segments",
         "hard_stall_required": 20,
@@ -217,11 +236,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "KHEL": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": True,
-        "added_headers": {
-            "Accept": "*/*",
-            "Sec-GPC": "1",
-        },
+        "allow_unknown_expiry": shared_selection_policy_for_provider("KHEL").allow_unknown_expiry,
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["KHEL"]),
         "key_mode": "SHAKA",
         "extra_args": "",
     },
@@ -229,18 +245,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "SONYLIV": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": True,
-        "added_headers": {
-            "Accept": "*/*",
-            "Origin": "https://www.sonyliv.com",
-            "Referer": "https://www.sonyliv.com/",
-            "Sec-GPC": "1",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/142.0.0.0 Safari/537.36"
-            ),
-        },
+        "allow_unknown_expiry": shared_selection_policy_for_provider("SONYLIV").allow_unknown_expiry,
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["SONYLIV"]),
         "key_mode": "NONE",
         "extra_args": "",
         "quality_upgrade_enabled": True,
@@ -252,19 +258,9 @@ NM3U8DL_PLAYLIST_PROFILES = {
     "FANCODE": {
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
-        "allow_unknown_expiry": True,
-        "prefer_unknown_expiry_on_equal_quality": True,
-        "added_headers": {
-            "Accept": "*/*",
-            "Origin": "https://www.fancode.com",
-            "Referer": "https://www.fancode.com/",
-            "Sec-GPC": "1",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/142.0.0.0 Safari/537.36"
-            ),
-        },
+        "allow_unknown_expiry": shared_selection_policy_for_provider("FANCODE").allow_unknown_expiry,
+        "prefer_unknown_expiry_on_equal_quality": shared_selection_policy_for_provider("FANCODE").prefer_unknown_expiry_on_equal_quality,
+        "added_headers": dict(SHARED_PROVIDER_ADDED_HEADERS["FANCODE"]),
         "key_mode": "SHAKA",
         "extra_args": "",
         "quality_upgrade_enabled": True,
@@ -274,15 +270,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     },
 }
 
-NM3U8DL_PLAYLIST_USER_AGENTS = {
-    "DEFAULT": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/141.0.0.0 Safari/537.36"
-    ),
-    "OTT_NAVIGATOR": "OTT Navigator/1.7.1.4",
-    "TIVIMATE": "TiviMate",
-}
+NM3U8DL_PLAYLIST_USER_AGENTS = dict(SHARED_PLAYLIST_USER_AGENTS)
 
 
 # N_M3U8DL CONFIG (if DOWNLOAD_MODE == "N_m3u8DL-RE")
@@ -415,15 +403,17 @@ NM3U8DL_PLAYLIST_ACCESS_CHECK_INTERVAL_SEC = 30
 NM3U8DL_PLAYLIST_FETCH_WORKERS = 8
 
 # Dynamic source quality inspection
-NM3U8DL_QUALITY_PROBE_WORKERS = 6
-NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC = 8
-NM3U8DL_QUALITY_HTTP_MAX_ATTEMPTS = 2
-NM3U8DL_QUALITY_HTTP_RETRY_BASE_SEC = 0.5
-NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC = 2.0
-NM3U8DL_QUALITY_HTTP_RETRYABLE_STATUS_CODES = (408, 425, 429, 500, 502, 503, 504)
-NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC = 20
-NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC = 4
-NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC = 12
+NM3U8DL_QUALITY_PROBE_WORKERS = source_quality.QUALITY_PROBE_WORKERS
+NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC = source_transport.QUALITY_HTTP_TIMEOUT_SEC
+NM3U8DL_QUALITY_HTTP_MAX_ATTEMPTS = source_transport.QUALITY_HTTP_MAX_ATTEMPTS
+NM3U8DL_QUALITY_HTTP_RETRY_BASE_SEC = source_transport.QUALITY_HTTP_RETRY_BASE_SEC
+NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC = source_transport.QUALITY_HTTP_RETRY_MAX_SEC
+NM3U8DL_QUALITY_HTTP_RETRYABLE_STATUS_CODES = (
+    source_transport.QUALITY_HTTP_RETRYABLE_STATUS_CODES
+)
+NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC = source_quality.QUALITY_FFPROBE_TIMEOUT_SEC
+NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC = source_quality.QUALITY_BITRATE_SAMPLE_SEC
+NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC = source_quality.QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC
 
 # DASH P/I detection follows: MPD scanType -> H.264 SPS -> H.264 picture/field
 # structure -> idet. FFprobe is deliberately not part of P/I detection.
@@ -457,6 +447,14 @@ class EngineResult:
 
 
 @dataclass(frozen=True)
+class RecorderProcessOutcome:
+    """Terminal outcome exposed by the mature recorder process boundary."""
+
+    status: str  # manual_stopped | ended | error
+    reason: str
+
+
+@dataclass(frozen=True)
 class RecorderEngine:
     """Lightweight engine descriptor to enable clean future splits."""
 
@@ -477,6 +475,8 @@ class RecorderState:
 
     # Stop / timing
     stop_flag: bool = False
+    manual_stop_requested: bool = False
+    normal_terminal_reason: Optional[str] = None
     start_time: float = field(default_factory=time.time)
     deadline_ts: Optional[float] = None
     alarm_linger_until: Optional[float] = None
@@ -561,6 +561,14 @@ class RecorderState:
     nm3u8dl_key_listener_stop_event: Optional[threading.Event] = None
     nm3u8dl_key_listener_thread: Optional[threading.Thread] = None
     
+    # Identity-worker launch context. The Coordinator supplies one already
+    # selected startup source; later source resolution remains constrained by
+    # the same canonical identity and frozen launch-time target intent.
+    identity_launch_request: Optional[IdentityLaunchRequest] = None
+    identity_initial_source: Optional[dict] = None
+    identity_feed_key: Optional[str] = None
+    identity_status_callback: Optional[Callable[[dict], None]] = None
+
     # Dynamic playlist renewal / access-block state
     nm3u8dl_running_source: Optional[dict] = None
     nm3u8dl_pending_source: Optional[dict] = None
@@ -591,6 +599,15 @@ class RecorderState:
     nm3u8dl_failover_probations: dict = field(default_factory=dict)
     nm3u8dl_failover_retry_source: Optional[dict] = None
     nm3u8dl_bad_stream_fingerprints: dict = field(default_factory=dict)
+    # Second-level protection for redirectors that evade exact-fingerprint
+    # exclusion by returning a different final playback URL every fresh scan.
+    # The key is the original exposed request URL + playback-relevant headers.
+    nm3u8dl_bad_stream_routes: dict = field(default_factory=dict)
+    # Literal-IP playback endpoints are excluded recording-wide after one exact
+    # session has used both normal downloader attempts and failed 2/2. Every
+    # playlist entry that resolves to the same IP is then excluded together,
+    # regardless of wrapper URL, token, or playlist source.
+    nm3u8dl_bad_stream_ips: dict = field(default_factory=dict)
     # Operator rejections are intentionally separate from automatic failover.
     # They last only for this RecorderState/recording and must survive VPN/access
     # resets that are allowed to forgive route-dependent automatic failures.
@@ -1493,77 +1510,15 @@ def log(*args, level="INFO", **print_kwargs):
 
 
 def _is_timeout_exception(error) -> bool:
-    """Return True only for a real operation timeout, including urllib wrapping."""
-    if isinstance(error, (subprocess.TimeoutExpired, TimeoutError)):
-        return True
-
-    if isinstance(error, URLError):
-        reason = getattr(error, "reason", None)
-        return isinstance(reason, (subprocess.TimeoutExpired, TimeoutError))
-
-    return False
+    return source_transport.is_timeout_exception(error)
 
 
 def _is_nm3u8dl_retryable_http_get_error(error: Exception) -> bool:
-    """Return whether one idempotent HTTP GET is safe to retry once."""
-    if isinstance(error, HTTPError):
-        try:
-            return int(getattr(error, "code", 0) or 0) in (
-                NM3U8DL_QUALITY_HTTP_RETRYABLE_STATUS_CODES
-            )
-        except Exception:
-            return False
-
-    if _is_timeout_exception(error):
-        return True
-
-    if isinstance(error, URLError):
-        reason = getattr(error, "reason", None)
-        return isinstance(reason, (OSError, ConnectionError))
-
-    return isinstance(error, subprocess.TimeoutExpired)
+    return source_transport.is_retryable_http_get_error(error)
 
 
 def _nm3u8dl_http_retry_delay_sec(error: Exception, retry_number: int) -> float:
-    """Bound Retry-After/exponential backoff so candidate scans remain responsive."""
-    delay = min(
-        float(NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC),
-        float(NM3U8DL_QUALITY_HTTP_RETRY_BASE_SEC)
-        * (2 ** max(0, int(retry_number) - 1)),
-    )
-
-    if isinstance(error, HTTPError):
-        headers = getattr(error, "headers", None)
-        retry_after = (
-            str(headers.get("Retry-After") or "").strip()
-            if headers is not None
-            else ""
-        )
-
-        if retry_after:
-            parsed_delay = None
-
-            try:
-                parsed_delay = max(0.0, float(retry_after))
-            except Exception:
-                try:
-                    retry_at = parsedate_to_datetime(retry_after)
-                    if retry_at.tzinfo is None:
-                        retry_at = retry_at.replace(tzinfo=timezone.utc)
-                    parsed_delay = max(
-                        0.0,
-                        retry_at.timestamp() - time.time(),
-                    )
-                except Exception:
-                    parsed_delay = None
-
-            if parsed_delay is not None:
-                delay = min(
-                    float(NM3U8DL_QUALITY_HTTP_RETRY_MAX_SEC),
-                    float(parsed_delay),
-                )
-
-    return max(0.0, float(delay))
+    return source_transport.http_retry_delay_sec(error, retry_number)
 
 
 def _run_nm3u8dl_retryable_http_get(
@@ -1571,41 +1526,10 @@ def _run_nm3u8dl_retryable_http_get(
     *,
     stop_requested: Optional[Callable[[], bool]] = None,
 ):
-    """Run a safe GET with one bounded retry for transient transport failures."""
-    max_attempts = max(1, int(NM3U8DL_QUALITY_HTTP_MAX_ATTEMPTS))
-
-    for attempt in range(1, max_attempts + 1):
-        if stop_requested is not None and stop_requested():
-            raise RuntimeError("Quality probe cancelled by stop request")
-
-        try:
-            return operation()
-        except Exception as error:
-            if (
-                attempt >= max_attempts
-                or not _is_nm3u8dl_retryable_http_get_error(error)
-            ):
-                raise
-
-            try:
-                close_fn = getattr(error, "close", None)
-                if callable(close_fn):
-                    close_fn()
-            except Exception:
-                pass
-
-            delay = _nm3u8dl_http_retry_delay_sec(
-                error,
-                retry_number=attempt,
-            )
-            deadline = time.monotonic() + delay
-
-            while time.monotonic() < deadline:
-                if stop_requested is not None and stop_requested():
-                    raise RuntimeError("Quality probe cancelled by stop request")
-                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-
-    raise RuntimeError("HTTP retry loop ended unexpectedly")
+    return source_transport.run_retryable_http_get(
+        operation,
+        stop_requested=stop_requested,
+    )
 
 
 def _format_timeout_source(source) -> str:
@@ -1961,8 +1885,17 @@ def raw_external_end(invocation, returncode=None, status: str = ""):
     )
 
 
+def _safe_subprocess_text_kwargs(kwargs: dict) -> dict:
+    """Prevent undecodable external-tool bytes from killing reader threads."""
+    safe = dict(kwargs)
+    if safe.get("text") or safe.get("universal_newlines"):
+        safe.setdefault("errors", "replace")
+    return safe
+
+
 def run_external_capture(cmd, *, raw_tool: str, raw_context: str = "", **kwargs):
     """subprocess.run wrapper that adds raw diagnostics without changing live output."""
+    kwargs = _safe_subprocess_text_kwargs(kwargs)
     invocation = raw_external_start(raw_tool, raw_context)
     raw_external_write(invocation, repr(cmd), "command")
     raw_external_write(
@@ -1995,6 +1928,7 @@ def run_external_capture(cmd, *, raw_tool: str, raw_context: str = "", **kwargs)
 
 def check_output_external(cmd, *, raw_tool: str, raw_context: str = "", **kwargs):
     """subprocess.check_output wrapper; preserves its existing stdout semantics."""
+    kwargs = _safe_subprocess_text_kwargs(kwargs)
     invocation = raw_external_start(raw_tool, raw_context)
     raw_external_write(invocation, repr(cmd), "command")
     raw_external_write(
@@ -2055,8 +1989,7 @@ def append_raw_external_to_summarylog(summary_path: str) -> int:
 
 
 def _clear_sound_snooze(state: RecorderState):
-    state.sound_snooze_mode = None
-    state.sound_snooze_until_ts = None
+    runtime_sound.clear_sound_snooze(state)
     state.sound_snooze_run_attempt = None
 
 
@@ -2066,13 +1999,14 @@ def is_sound_snoozed(state: Optional[RecorderState], now_ts: Optional[float] = N
         return False
 
     mode = getattr(state, "sound_snooze_mode", None)
-    now = time.time() if now_ts is None else float(now_ts)
-
-    if mode == "timed":
-        until_ts = getattr(state, "sound_snooze_until_ts", None)
-        if until_ts is not None and now < float(until_ts):
+    timed_state = runtime_sound.timed_sound_snoozed(
+        state,
+        now_ts=now_ts,
+    )
+    if timed_state is not None:
+        if timed_state:
             return True
-        _clear_sound_snooze(state)
+        state.sound_snooze_run_attempt = None
         log("SOUND SNOOZE ENDED — 15-minute snooze expired; sound restored")
         return False
 
@@ -2748,6 +2682,7 @@ def make_signal_handler(state: RecorderState):
         )
         log("")
         log("Stopping by Ctrl-C...", level="WARN")
+        state.manual_stop_requested = True
         state.stop_flag = True
         if state.nm3u8dl_stop_event is not None:
             state.nm3u8dl_stop_event.set()
@@ -3014,16 +2949,16 @@ def cancel_console_interaction_if_active(state: RecorderState, message: str):
 
 def _set_sound_snooze(state: RecorderState, mode: Optional[str]):
     if mode == "timed":
-        state.sound_snooze_mode = "timed"
-        state.sound_snooze_until_ts = time.time() + (15 * 60.0)
+        runtime_sound.set_timed_sound_snooze(
+            state,
+            duration_sec=15 * 60.0,
+        )
         state.sound_snooze_run_attempt = None
     elif mode == "run":
-        state.sound_snooze_mode = "run"
-        state.sound_snooze_until_ts = None
+        runtime_sound.set_indefinite_sound_snooze(state, "run")
         state.sound_snooze_run_attempt = int(getattr(state, "run_attempt_index", 0) or 0)
     elif mode == "recording":
-        state.sound_snooze_mode = "recording"
-        state.sound_snooze_until_ts = None
+        runtime_sound.set_indefinite_sound_snooze(state, "recording")
         state.sound_snooze_run_attempt = None
     else:
         _clear_sound_snooze(state)
@@ -4601,11 +4536,7 @@ def get_nm3u8dl_playlist_source_bucket() -> str:
     """Return the configured playlist-source bucket for the active runtime group."""
     group_name = NM3U8DL_PLAYLIST_GROUP.strip().upper()
 
-    return {
-        "JIO_STAR_SPORTS": "TV",
-        "KHEL": "TV",
-        "SONY_TV": "TV",
-    }.get(group_name, group_name)
+    return SHARED_PLAYLIST_GROUP_SOURCE_BUCKETS.get(group_name, group_name)
 
 
 def get_nm3u8dl_playlist_urls() -> List[str]:
@@ -4687,6 +4618,7 @@ def _get_nm3u8dl_match_definition():
         required=NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS,
         rejected=NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS,
         preferred=NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS,
+        match_all=NM3U8DL_PLAYLIST_MATCH_ALL,
     )
 
 
@@ -4968,123 +4900,27 @@ def _run_nm3u8dl_curl_get_text(
     headers: Optional[dict] = None,
     timeout_sec: float = 25,
 ) -> tuple:
-    """
-    Fetch one small text resource with real curl and return
-    (text, http_status, final_url, raw_bytes).
-
-    Used only for the DRMLive path whose server behavior has been proven
-    manually with curl but not with Python urllib.
-    """
-    status_marker = b"\n__RECORDER_CURL_HTTP_STATUS__:"
-    final_url_marker = b"\n__RECORDER_CURL_FINAL_URL__:"
-
-    curl_args = [
-        _get_nm3u8dl_curl_binary(),
-        "-sS",
-        "-L",
-        "--compressed",
-        "-A",
-        str(user_agent),
-    ]
-
-    for name, value in (headers or {}).items():
-        header_name = str(name or "").strip()
-
-        if (
-            not header_name
-            or value is None
-            or header_name.casefold() == "user-agent"
-        ):
-            continue
-
-        curl_args.extend([
-            "-H",
-            f"{header_name}: {str(value)}",
-        ])
-
-    curl_args.extend([
-        "-w",
-        (
-            "\n__RECORDER_CURL_HTTP_STATUS__:%{http_code}"
-            "\n__RECORDER_CURL_FINAL_URL__:%{url_effective}"
-        ),
-        str(url),
-    ])
-
-    try:
-        result = subprocess.run(
-            curl_args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=float(timeout_sec),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
+    """Use the shared real-curl text transport with mature timeout logging."""
+    def timeout_callback(
+        error: BaseException,
+        timeout_value: float,
+        source_url: str,
+    ) -> None:
         log_timeout_exception(
             error,
             "curl",
-            timeout_sec,
+            timeout_value,
             context="GET",
-            source=url,
-        )
-        raise
-
-    if result.returncode != 0:
-        stderr_text = result.stderr.decode(
-            "utf-8",
-            errors="replace",
-        ).strip()
-        raise RuntimeError(
-            "curl GET failed"
-            + (f": {stderr_text}" if stderr_text else "")
+            source=source_url,
         )
 
-    body, separator, trailer = result.stdout.rpartition(
-        status_marker
+    return source_transport.curl_get_text(
+        url,
+        user_agent,
+        headers=headers,
+        timeout_sec=timeout_sec,
+        timeout_callback=timeout_callback,
     )
-
-    if not separator:
-        raise RuntimeError(
-            "curl GET returned no HTTP status marker"
-        )
-
-    status_bytes, separator, final_url_bytes = trailer.partition(
-        final_url_marker
-    )
-
-    if not separator:
-        raise RuntimeError(
-            "curl GET returned no final-URL marker"
-        )
-
-    try:
-        http_status = int(status_bytes.strip())
-    except Exception as error:
-        raise RuntimeError(
-            "curl GET returned an invalid HTTP status"
-        ) from error
-
-    final_url = final_url_bytes.decode(
-        "utf-8",
-        errors="replace",
-    ).strip()
-
-    if not (200 <= http_status < 300):
-        raise HTTPError(
-            final_url or str(url),
-            http_status,
-            f"HTTP Error {http_status}",
-            None,
-            None,
-        )
-
-    text = body.decode(
-        "utf-8-sig",
-        errors="replace",
-    )
-
-    return text, http_status, final_url, body
-
 
 def _run_nm3u8dl_curl_status_request(
     args: List[str],
@@ -5175,377 +5011,14 @@ def get_nm3u8dl_playlist_activation_provider(playlist_url: str) -> str:
     return NM3U8DL_PLAYLIST_ACTIVATION_PROVIDERS.get(host, "")
 
 
-# Generic JSON-playlist adapter. JSON source URLs remain entirely in the user
-# playlist-group configuration; the recorder recognizes supported JSON vocabulary
-# by field/container aliases rather than by provider name, host, or URL.
-NM3U8DL_JSON_RECORD_LIST_ALIASES = (
-    "channels",
-    "streams",
-    "items",
-    "entries",
-    "data",
-)
-
-NM3U8DL_JSON_FIELD_ALIASES = {
-    "name": (
-        "name",
-        "channel_name",
-        "channel",
-        "title",
-    ),
-    "stream_url": (
-        "stream_url",
-        "stream",
-        "url",
-        "link",
-    ),
-    "id": (
-        "id",
-        "channel_id",
-        "tvg_id",
-        "tvg-id",
-    ),
-    "group_title": (
-        "group_title",
-        "group",
-        "category",
-    ),
-    "key_id": (
-        "key_id",
-        "kid",
-    ),
-    "key": (
-        "key",
-    ),
-    "license_key": (
-        "license_key",
-        "drm_key",
-        "clearkey",
-    ),
-}
-
-# Convenience aliases for common per-record HTTP headers. A JSON record may
-# alternatively provide a generic headers/http_headers/request_headers object.
-# The explicit header object wins if both forms supply the same header.
-NM3U8DL_JSON_HEADER_FIELD_ALIASES = {
-    "Cookie": (
-        "cookie",
-        "cookies",
-    ),
-    "User-Agent": (
-        "user_agent",
-        "user-agent",
-        "useragent",
-    ),
-    "Origin": (
-        "origin",
-    ),
-    "Referer": (
-        "referer",
-        "referrer",
-    ),
-    "Authorization": (
-        "authorization",
-        "auth_header",
-    ),
-}
-
-NM3U8DL_JSON_HEADER_OBJECT_ALIASES = (
-    "headers",
-    "http_headers",
-    "request_headers",
-)
-
-
-def _normalize_nm3u8dl_json_field_name(value: str) -> str:
-    return (
-        str(value or "")
-        .strip()
-        .casefold()
-        .replace("-", "_")
-        .replace(" ", "_")
-    )
-
-
-def _get_nm3u8dl_json_alias_value(record: dict, aliases) -> object:
-    if not isinstance(record, dict):
-        return None
-
-    normalized_record = {}
-
-    for key, value in record.items():
-        normalized_key = _normalize_nm3u8dl_json_field_name(key)
-
-        if normalized_key and normalized_key not in normalized_record:
-            normalized_record[normalized_key] = value
-
-    for alias in aliases:
-        normalized_alias = _normalize_nm3u8dl_json_field_name(alias)
-
-        if normalized_alias in normalized_record:
-            return normalized_record[normalized_alias]
-
-    return None
-
-
-def _get_nm3u8dl_json_text_value(record: dict, aliases) -> str:
-    value = _get_nm3u8dl_json_alias_value(record, aliases)
-
-    if value is None or isinstance(value, (dict, list, tuple, set)):
-        return ""
-
-    return (
-        str(value)
-        .replace("\r", " ")
-        .replace("\n", " ")
-        .strip()
-    )
-
-
-def _find_nm3u8dl_json_records(data) -> tuple:
-    if isinstance(data, list):
-        return data, "$"
-
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            "JSON playlist root must be an object or array"
-        )
-
-    normalized_root = {
-        _normalize_nm3u8dl_json_field_name(key): (key, value)
-        for key, value in data.items()
-        if _normalize_nm3u8dl_json_field_name(key)
-    }
-
-    for alias in NM3U8DL_JSON_RECORD_LIST_ALIASES:
-        normalized_alias = _normalize_nm3u8dl_json_field_name(alias)
-        matched = normalized_root.get(normalized_alias)
-
-        if matched is None:
-            continue
-
-        original_key, value = matched
-
-        if isinstance(value, list):
-            return value, str(original_key)
-
-    raise RuntimeError(
-        "JSON playlist contains no recognized record list "
-        f"({', '.join(NM3U8DL_JSON_RECORD_LIST_ALIASES)})"
-    )
-
-
-def _escape_nm3u8dl_json_extinf_attribute(value: str) -> str:
-    # M3U attributes are quoted. Preserve the human-readable value while making
-    # an embedded quote unable to terminate the synthetic attribute early.
-    return str(value or "").replace('"', "'").strip()
-
-
-def _get_nm3u8dl_json_record_headers(record: dict) -> dict:
-    headers = {}
-
-    # Convenience scalar fields first.
-    for header_name, aliases in (
-        NM3U8DL_JSON_HEADER_FIELD_ALIASES.items()
-    ):
-        value = _get_nm3u8dl_json_text_value(record, aliases)
-
-        if value:
-            headers[header_name] = value
-
-    # A dedicated header object is more explicit and therefore higher
-    # precedence than the convenience scalar aliases above.
-    header_object = _get_nm3u8dl_json_alias_value(
-        record,
-        NM3U8DL_JSON_HEADER_OBJECT_ALIASES,
-    )
-
-    if isinstance(header_object, dict):
-        for name, value in header_object.items():
-            header_name = str(name or "").strip()
-
-            if (
-                not header_name
-                or value is None
-                or isinstance(value, (dict, list, tuple, set))
-            ):
-                continue
-
-            header_value = (
-                str(value)
-                .replace("\r", " ")
-                .replace("\n", " ")
-                .strip()
-            )
-
-            if not header_value:
-                continue
-
-            existing_name = next(
-                (
-                    current_name
-                    for current_name in headers
-                    if current_name.casefold() == header_name.casefold()
-                ),
-                None,
-            )
-
-            if existing_name is not None:
-                del headers[existing_name]
-
-            headers[header_name] = header_value
-
-    return headers
-
-
-def _build_nm3u8dl_m3u_entry_from_json_record(record: dict) -> list:
-    name = _get_nm3u8dl_json_text_value(
-        record,
-        NM3U8DL_JSON_FIELD_ALIASES["name"],
-    )
-    stream_url = _get_nm3u8dl_json_text_value(
-        record,
-        NM3U8DL_JSON_FIELD_ALIASES["stream_url"],
-    )
-
-    if not name or not stream_url:
-        return []
-
-    tvg_id = _get_nm3u8dl_json_text_value(
-        record,
-        NM3U8DL_JSON_FIELD_ALIASES["id"],
-    )
-    group_title = _get_nm3u8dl_json_text_value(
-        record,
-        NM3U8DL_JSON_FIELD_ALIASES["group_title"],
-    )
-
-    attributes = []
-
-    if tvg_id:
-        attributes.append(
-            f'tvg-id="{_escape_nm3u8dl_json_extinf_attribute(tvg_id)}"'
-        )
-
-    attributes.append(
-        f'tvg-name="{_escape_nm3u8dl_json_extinf_attribute(name)}"'
-    )
-
-    if group_title:
-        attributes.append(
-            f'group-title="{_escape_nm3u8dl_json_extinf_attribute(group_title)}"'
-        )
-
-    extinf = (
-        "#EXTINF:-1 "
-        + " ".join(attributes)
-        + f",{name}"
-    )
-
-    lines = [extinf]
-
-    license_key = _get_nm3u8dl_json_text_value(
-        record,
-        NM3U8DL_JSON_FIELD_ALIASES["license_key"],
-    )
-
-    if not license_key:
-        key_id = _get_nm3u8dl_json_text_value(
-            record,
-            NM3U8DL_JSON_FIELD_ALIASES["key_id"],
-        )
-        key_value = _get_nm3u8dl_json_text_value(
-            record,
-            NM3U8DL_JSON_FIELD_ALIASES["key"],
-        )
-
-        if key_id and key_value:
-            license_key = f"{key_id}:{key_value}"
-
-    if license_key:
-        lines.extend([
-            "#KODIPROP:inputstream.adaptive.license_type=clearkey",
-            "#KODIPROP:inputstream.adaptive.license_key=" + license_key,
-        ])
-
-    headers = _get_nm3u8dl_json_record_headers(record)
-
-    if headers:
-        lines.append(
-            "#EXTHTTP:"
-            + json.dumps(
-                headers,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-
-    lines.append(stream_url)
-    return lines
-
-
+# JSON playlist adaptation is shared with Inspect/Watch. The mature policy
+# preserves its established requirement that a usable JSON record has both
+# a recognized name and stream URL.
 def adapt_nm3u8dl_json_playlist_text(playlist_text: str) -> tuple:
-    """
-    Convert a recognized JSON playlist into synthetic M3U text.
-
-    Returns (playlist_text, metadata). Non-JSON input is returned unchanged with
-    metadata indicating no adaptation. JSON is recognized by content, never URL.
-    """
-    text = str(playlist_text or "")
-    stripped = text.lstrip()
-
-    if not stripped.startswith(("{", "[")):
-        return text, {
-            "adapted": False,
-            "source_format": "m3u",
-        }
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(
-            "Playlist response looks like JSON but could not be parsed "
-            f"(line {error.lineno}, column {error.colno})"
-        ) from error
-
-    records, record_container = _find_nm3u8dl_json_records(data)
-    output_lines = ["#EXTM3U"]
-    usable_record_count = 0
-    skipped_record_count = 0
-
-    for record in records:
-        if not isinstance(record, dict):
-            skipped_record_count += 1
-            continue
-
-        entry_lines = _build_nm3u8dl_m3u_entry_from_json_record(record)
-
-        if not entry_lines:
-            skipped_record_count += 1
-            continue
-
-        output_lines.extend(entry_lines)
-        usable_record_count += 1
-
-    if usable_record_count == 0:
-        raise RuntimeError(
-            "JSON playlist contained no usable records with recognized "
-            "name and stream URL fields"
-        )
-
-    synthetic_text = "\n".join(output_lines) + "\n"
-
-    return synthetic_text, {
-        "adapted": True,
-        "source_format": "json",
-        "record_container": record_container,
-        "record_count": len(records),
-        "usable_record_count": usable_record_count,
-        "skipped_record_count": skipped_record_count,
-        "synthetic_m3u_sha256": hashlib.sha256(
-            synthetic_text.encode("utf-8")
-        ).hexdigest(),
-    }
+    return source_json_playlist.adapt_json_playlist_text(
+        playlist_text,
+        policy=source_json_playlist.MATURE_JSON_PLAYLIST_POLICY,
+    )
 
 
 def fetch_nm3u8dl_playlist_text(
@@ -6212,16 +5685,35 @@ def activate_nm3u8dl_playlist_if_present(
     return metadata
 
 def find_nm3u8dl_playlist_entries(
-    playlist_text: str
+    playlist_text: str,
+    *,
+    match_definitions: Optional[Iterable[object]] = None,
 ) -> List[dict]:
-    request = SourceAcquisitionRequest(
-        match=_get_nm3u8dl_match_definition(),
-        target_name=BASE_NAME,
-    )
-    result = source_discovery.discover_playlist_text(
-        playlist_text,
-        request,
-    )
+    definitions = tuple(match_definitions or (_get_nm3u8dl_match_definition(),))
+    matched_candidates = {}
+
+    for definition in definitions:
+        request = SourceAcquisitionRequest(
+            match=definition,
+            target_name=BASE_NAME,
+        )
+        result = source_discovery.discover_playlist_text(
+            playlist_text,
+            request,
+        )
+        for candidate in result.candidates:
+            key = (
+                candidate.extinf,
+                candidate.stream_url,
+                tuple(candidate.option_lines),
+            )
+            existing = matched_candidates.get(key)
+            if (
+                existing is None
+                or candidate.preferred_qualifier_score
+                > existing.preferred_qualifier_score
+            ):
+                matched_candidates[key] = candidate
 
     matches = [
         {
@@ -6233,7 +5725,7 @@ def find_nm3u8dl_playlist_entries(
             "stream_url": candidate.stream_url,
             "preferred_qualifier_score": candidate.preferred_qualifier_score,
         }
-        for candidate in result.candidates
+        for candidate in matched_candidates.values()
     ]
 
     if not matches:
@@ -6246,26 +5738,12 @@ def find_nm3u8dl_playlist_entries(
 
 
 def _extract_nm3u8dl_auth_expiries(value: str) -> List[int]:
-    expiries = []
-
-    for match in re.finditer(
-        r'(?:^|[?&~=;])(?:exp|expires)=(\d+)',
-        str(value),
-        flags=re.IGNORECASE,
-    ):
-        expiries.append(int(match.group(1)))
-
-    return expiries
+    return list(source_quality.extract_auth_expiries(value))
 
 
 def _merge_nm3u8dl_auth_expiries(*expiries) -> Optional[int]:
-    known = [
-        int(expiry)
-        for expiry in expiries
-        if expiry is not None
-    ]
+    return source_quality.merge_auth_expiries(*expiries)
 
-    return min(known) if known else None
 
 def get_nm3u8dl_expiry_source(
     url_header_expiry: Optional[int],
@@ -6356,302 +5834,95 @@ def get_nm3u8dl_auth_expiry(
     stream_url: str,
     headers: Optional[dict] = None
 ) -> Optional[int]:
-
-    values_to_check = [stream_url]
-
+    values = [stream_url]
     if headers:
-        values_to_check.extend(
-            str(value)
-            for value in headers.values()
-        )
+        values.extend(str(value) for value in headers.values())
+    return source_quality.extract_auth_expiry(*values)
 
-    expiries = []
-
-    for value in values_to_check:
-        expiries.extend(
-            _extract_nm3u8dl_auth_expiries(value)
-        )
-
-    if not expiries:
-        return None
-
-    return min(expiries)
 
 def canonicalize_nm3u8dl_header_name(name: str) -> str:
-    raw_name = str(name).strip()
-
-    normalized = (
-        raw_name
-        .lower()
-        .replace("_", "-")
-    )
-
-    aliases = {
-        "cookie": "Cookie",
-        "referer": "Referer",
-        "referrer": "Referer",
-        "origin": "Origin",
-        "user-agent": "User-Agent",
-        "useragent": "User-Agent",
-        "authorization": "Authorization",
-    }
-
-    return aliases.get(normalized, raw_name)
+    return source_headers.canonicalize_header_name(name)
 
 
 def split_nm3u8dl_stream_url_metadata(
     stream_url: str
 ):
-    stream_url = str(stream_url).strip()
-
-    clean_url, separator, metadata_text = (
-        stream_url.partition("|")
+    return source_playlist_headers.split_stream_url_metadata(
+        stream_url,
+        policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
     )
-
-    clean_url = clean_url.strip()
-
-    # Some playlists use:
-    #
-    #   index.mpd?|cookie=...
-    #
-    # Here the "?" is empty and belongs to the player-style
-    # pipe syntax rather than to a real URL query.
-    #
-    # Genuine query strings remain untouched:
-    #
-    #   index.mpd?hdnea=...|cookie=...
-    #
-    pipe_headers = {}
-
-    if not separator:
-        return clean_url, pipe_headers
-
-    if clean_url.endswith("?"):
-        clean_url = clean_url[:-1]
-
-    for item in metadata_text.split("&"):
-        item = item.strip()
-
-        if not item:
-            continue
-
-        name, equals, value = item.partition("=")
-
-        if not equals:
-            continue
-
-        header_name = canonicalize_nm3u8dl_header_name(
-            name
-        )
-
-        if not header_name:
-            continue
-
-        pipe_headers[header_name] = value.strip()
-
-    return clean_url, pipe_headers
 
 
 def get_nm3u8dl_playlist_header_sources(
     option_lines: List[str]
 ):
-    extvlc_headers = {}
-    exthttp_headers = {}
+    return source_playlist_headers.playlist_header_sources(
+        option_lines,
+        policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
+    )
 
-    for line in option_lines:
-        if line.startswith("#EXTHTTP:"):
-            raw_json = line[len("#EXTHTTP:"):].strip()
-            data = json.loads(raw_json)
-
-            for name, value in data.items():
-                if value is None:
-                    continue
-
-                header_name = (
-                    canonicalize_nm3u8dl_header_name(name)
-                )
-
-                exthttp_headers[header_name] = (
-                    str(value).strip()
-                )
-
-        elif line.startswith(
-            "#EXTVLCOPT:http-cookie="
-        ):
-            extvlc_headers["Cookie"] = (
-                line.split("=", 1)[1].strip()
-            )
-
-        elif line.startswith(
-            "#EXTVLCOPT:http-referrer="
-        ):
-            extvlc_headers["Referer"] = (
-                line.split("=", 1)[1].strip()
-            )
-
-        elif line.startswith(
-            "#EXTVLCOPT:http-user-agent="
-        ):
-            extvlc_headers["User-Agent"] = (
-                line.split("=", 1)[1].strip()
-            )
-
-        elif line.startswith(
-            "#EXTVLCOPT:http-extra-headers="
-        ):
-            raw_header = line.split("=", 1)[1]
-
-            name, separator, value = (
-                raw_header.partition(":")
-            )
-
-            if separator:
-                header_name = (
-                    canonicalize_nm3u8dl_header_name(name)
-                )
-
-                extvlc_headers[header_name] = (
-                    value.strip()
-                )
-
-    return extvlc_headers, exthttp_headers
 
 NM3U8DL_METADATA_CONFLICTS_SEEN = set()
+
+
+def _log_nm3u8dl_playlist_header_conflict(
+    header_name: str,
+    existing_source: str,
+    source_name: str,
+    existing_value: str,
+    new_value: str,
+):
+    conflict_signature = (
+        header_name.casefold(),
+        existing_source,
+        source_name,
+        existing_value,
+        new_value,
+    )
+    if conflict_signature in NM3U8DL_METADATA_CONFLICTS_SEEN:
+        return
+
+    if new_value == "<blank>":
+        log(
+            "Playlist metadata conflict : "
+            f"{header_name} is blank in {source_name}; "
+            f"keeping {existing_source}",
+            level="WARN",
+        )
+    else:
+        log(
+            "Playlist metadata conflict : "
+            f"{header_name} differs between "
+            f"{existing_source} and {source_name}; "
+            f"using {source_name}",
+            level="WARN",
+        )
+    NM3U8DL_METADATA_CONFLICTS_SEEN.add(conflict_signature)
+
 
 def merge_nm3u8dl_playlist_headers(
     extvlc_headers: dict,
     exthttp_headers: dict,
     pipe_headers: dict,
 ) -> dict:
-
-    headers = {}
-    header_sources = {}
-
-    def apply_headers(
-        source_name: str,
-        source_headers: dict,
-    ):
-        for name, value in source_headers.items():
-            header_name = (
-                canonicalize_nm3u8dl_header_name(name)
-            )
-
-            header_key = header_name.lower()
-            value = str(value).strip()
-
-            existing_name = None
-
-            for current_name in headers:
-                if current_name.lower() == header_key:
-                    existing_name = current_name
-                    break
-
-            if existing_name is not None:
-                existing_value = headers[existing_name]
-                existing_source = header_sources[
-                    header_key
-                ]
-
-                if not value and str(existing_value).strip():
-                    # A blank higher-precedence value is missing information,
-                    # not an instruction to erase a useful header already found
-                    # on this same playlist entry.
-                    conflict_signature = (
-                        header_key,
-                        existing_source,
-                        source_name,
-                        existing_value,
-                        "<blank>",
-                    )
-
-                    if (
-                        conflict_signature
-                        not in NM3U8DL_METADATA_CONFLICTS_SEEN
-                    ):
-                        log(
-                            "Playlist metadata conflict : "
-                            f"{header_name} is blank in {source_name}; "
-                            f"keeping {existing_source}",
-                            level="WARN",
-                        )
-
-                        NM3U8DL_METADATA_CONFLICTS_SEEN.add(
-                            conflict_signature
-                        )
-
-                    continue
-
-                if existing_value != value:
-                    conflict_signature = (
-                        header_key,
-                        existing_source,
-                        source_name,
-                        existing_value,
-                        value,
-                    )
-
-                    if (
-                        conflict_signature
-                        not in NM3U8DL_METADATA_CONFLICTS_SEEN
-                    ):
-                        log(
-                            "Playlist metadata conflict : "
-                            f"{header_name} differs between "
-                            f"{existing_source} and {source_name}; "
-                            f"using {source_name}",
-                            level="WARN",
-                        )
-
-                        NM3U8DL_METADATA_CONFLICTS_SEEN.add(
-                            conflict_signature
-                        )
-
-                del headers[existing_name]
-
-            headers[header_name] = value
-            header_sources[header_key] = source_name
-
-    # Lowest → highest precedence.
-    apply_headers(
-        "#EXTVLCOPT",
-        extvlc_headers,
+    return source_playlist_headers.merge_header_layers(
+        ("#EXTVLCOPT", extvlc_headers),
+        ("#EXTHTTP", exthttp_headers),
+        ("URL pipe metadata", pipe_headers),
+        policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
+        conflict_callback=_log_nm3u8dl_playlist_header_conflict,
     )
-
-    apply_headers(
-        "#EXTHTTP",
-        exthttp_headers,
-    )
-
-    apply_headers(
-        "URL pipe metadata",
-        pipe_headers,
-    )
-
-    return headers
 
 
 def normalize_nm3u8dl_playlist_entry(
     entry: dict
 ) -> dict:
-
-    clean_stream_url, pipe_headers = (
-        split_nm3u8dl_stream_url_metadata(
-            entry["stream_url"]
-        )
+    clean_stream_url, headers = source_playlist_headers.parse_stream_url_and_headers(
+        entry["stream_url"],
+        entry["option_lines"],
+        policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
+        conflict_callback=_log_nm3u8dl_playlist_header_conflict,
     )
-
-    extvlc_headers, exthttp_headers = (
-        get_nm3u8dl_playlist_header_sources(
-            entry["option_lines"]
-        )
-    )
-
-    headers = merge_nm3u8dl_playlist_headers(
-        extvlc_headers=extvlc_headers,
-        exthttp_headers=exthttp_headers,
-        pipe_headers=pipe_headers,
-    )
-
     return {
         "extinf": entry["extinf"],
         "option_lines": entry["option_lines"],
@@ -6670,79 +5941,8 @@ def _nm3u8dl_b64url_decode(value: str) -> bytes:
 
 
 def normalize_nm3u8dl_playlist_license_key(value: str) -> List[str]:
-    """
-    Normalize playlist license-key metadata into the internal key format.
-
-    Supported inputs:
-    - Plain KID:KEY values.
-    - ClearKey license URLs.
-    - ClearKey JWK Sets:
-        {"keys":[{"kid":"...","k":"...","kty":"oct"}], ...}
-
-    Unknown/non-JWK formats are preserved unchanged so existing playlist
-    behavior is not altered.
-    """
-    value = str(value).strip()
-
-    if not value:
-        return []
-
-    # Existing formats already understood downstream.
-    if not value.startswith("{"):
-        return [value]
-
-    try:
-        data = json.loads(value)
-    except json.JSONDecodeError:
-        # Preserve pre-existing behavior for an unrecognized value.
-        return [value]
-
-    jwk_keys = data.get("keys")
-
-    # JSON, but not the ClearKey JWK-Set representation handled here.
-    if not isinstance(jwk_keys, list):
-        return [value]
-
-    normalized_keys = []
-
-    for item in jwk_keys:
-        if not isinstance(item, dict):
-            continue
-
-        kty = str(item.get("kty") or "").strip().lower()
-        kid_b64 = str(item.get("kid") or "").strip()
-        key_b64 = str(item.get("k") or "").strip()
-
-        # ClearKey uses symmetric ("oct") JWK keys.
-        if kty != "oct" or not kid_b64 or not key_b64:
-            continue
-
-        try:
-            kid_hex = _nm3u8dl_b64url_decode(kid_b64).hex()
-            key_hex = _nm3u8dl_b64url_decode(key_b64).hex()
-        except Exception as error:
-            raise RuntimeError(
-                "Invalid base64url value in ClearKey JWK license_key"
-            ) from error
-
-        # ClearKey KIDs and AES-128 keys must each be 16 bytes.
-        if len(kid_hex) != 32 or len(key_hex) != 32:
-            raise RuntimeError(
-                "Invalid ClearKey JWK license_key: "
-                "KID and key must each decode to 16 bytes"
-            )
-
-        pair = f"{kid_hex}:{key_hex}"
-
-        if pair not in normalized_keys:
-            normalized_keys.append(pair)
-
-    if not normalized_keys:
-        raise RuntimeError(
-            "ClearKey JWK license_key contained no usable oct keys"
-        )
-
-    return normalized_keys
+    """Use the shared mature/Coordinator ClearKey metadata normalizer."""
+    return list(source_discovery.normalize_playlist_license_key(value))
 
 
 def get_nm3u8dl_playlist_license_type(
@@ -6982,101 +6182,71 @@ def get_nm3u8dl_effective_headers(
     *,
     emit_logs: bool = False,
 ) -> dict:
-    """Build the exact HTTP-header set used for this playlist group."""
-
+    """Build the exact shared HTTP-header set used for this playlist group."""
     profile = get_nm3u8dl_playlist_profile()
-    headers = dict(profile["added_headers"])
-
     group_name = NM3U8DL_PLAYLIST_GROUP.strip().upper()
-
+    provider = SHARED_PLAYLIST_GROUP_PROFILES.get(group_name, group_name)
     cookie_policy = (
         NM3U8DL_PLAYLIST_GROUP_COOKIE_POLICY
         .get(group_name, "AUTO")
         .strip()
         .upper()
     )
-
     if cookie_policy not in ("AUTO", "SUPPRESS"):
         raise RuntimeError(
             f'Unknown Cookie policy "{cookie_policy}" '
             f'for playlist group "{group_name}"'
         )
 
+    filtered_headers = {}
     for name, value in (playlist_headers or {}).items():
         header_name = canonicalize_nm3u8dl_header_name(name)
-
         if not header_name:
             continue
-
-        if (
-            header_name.lower() == "cookie"
-            and cookie_policy == "SUPPRESS"
-        ):
+        if header_name.casefold() == "cookie" and cookie_policy == "SUPPRESS":
             if emit_logs:
                 log(
                     f"Playlist Cookie found but suppressed by "
                     f"{group_name} Cookie policy",
                     level="WARN",
                 )
-
             continue
-
-        existing_name = None
-
-        for current_name in headers:
-            if current_name.lower() == header_name.lower():
-                existing_name = current_name
-                break
-
         playlist_value = str(value).strip()
-
+        existing_name = next(
+            (
+                current_name
+                for current_name in profile["added_headers"]
+                if current_name.casefold() == header_name.casefold()
+            ),
+            None,
+        )
         if not playlist_value:
-            # Blank playlist metadata is missing information, not an override.
-            # Keep a useful profile default when one exists; otherwise omit the
-            # empty header instead of sending e.g. -H "Origin: ".
             if emit_logs and existing_name is not None:
                 log(
                     f"Playlist {header_name} is blank → "
                     f"keeping profile default",
                     level="WARN",
                 )
-
             continue
-
-        if existing_name is not None:
-            existing_value = str(headers[existing_name]).strip()
-
-            if emit_logs and existing_value != playlist_value:
-                log(
-                    "Playlist/profile header conflict : "
-                    f"{header_name} differs between profile default "
-                    f"and playlist metadata; using playlist metadata",
-                    level="WARN",
-                )
-
-            del headers[existing_name]
-
-        headers[header_name] = value
-
-    has_user_agent = any(
-        str(name).casefold() == "user-agent"
-        and str(value).strip()
-        for name, value in headers.items()
-    )
-
-    if not has_user_agent:
-        default_user_agent = str(
-            NM3U8DL_PLAYLIST_USER_AGENTS.get("DEFAULT") or ""
-        ).strip()
-
-        if not default_user_agent:
-            raise RuntimeError(
-                'Missing DEFAULT user-agent profile'
+        if (
+            emit_logs
+            and existing_name is not None
+            and str(profile["added_headers"][existing_name]).strip() != playlist_value
+        ):
+            log(
+                "Playlist/profile header conflict : "
+                f"{header_name} differs between profile default "
+                f"and playlist metadata; using playlist metadata",
+                level="WARN",
             )
+        filtered_headers[header_name] = value
 
-        headers["User-Agent"] = default_user_agent
-
-    return headers
+    return source_discovery.build_effective_probe_headers(
+        provider,
+        filtered_headers,
+        base_headers=profile["added_headers"],
+        default_user_agent=NM3U8DL_PLAYLIST_USER_AGENTS.get("DEFAULT"),
+    )
 
 
 def get_nm3u8dl_ascii_safe_request_headers(
@@ -7084,78 +6254,50 @@ def get_nm3u8dl_ascii_safe_request_headers(
     *,
     emit_logs: bool = False,
 ) -> dict:
-    safe_headers = {
+    original = {
         str(name): str(value)
         for name, value in (headers or {}).items()
         if str(name).strip()
     }
-
-    for header_name in list(safe_headers):
-        if header_name.lower() != "user-agent":
-            continue
-
-        original_user_agent = str(safe_headers[header_name]).strip()
-        ascii_user_agent = (
-            original_user_agent
-            .encode("ascii", errors="ignore")
-            .decode("ascii")
-            .strip()
+    safe_headers = source_transport.ascii_safe_request_headers(original)
+    if emit_logs:
+        original_ua_name = next(
+            (name for name in original if name.casefold() == "user-agent"),
+            None,
         )
-
-        if ascii_user_agent == original_user_agent:
-            continue
-
-        if ascii_user_agent:
-            if emit_logs:
-                log(
-                    "N_m3u8DL User-Agent contains non-ASCII characters → "
-                    "using ASCII-safe value",
-                    level="WARN",
-                )
-
-            safe_headers[header_name] = ascii_user_agent
-
-        else:
-            if emit_logs:
-                log(
-                    "N_m3u8DL User-Agent contains no ASCII-safe characters → "
-                    "omitting User-Agent",
-                    level="WARN",
-                )
-
-            del safe_headers[header_name]
-
+        safe_ua_name = next(
+            (name for name in safe_headers if name.casefold() == "user-agent"),
+            None,
+        )
+        if original_ua_name is not None:
+            original_ua = str(original[original_ua_name]).strip()
+            safe_ua = (
+                str(safe_headers[safe_ua_name]).strip()
+                if safe_ua_name is not None
+                else ""
+            )
+            if safe_ua != original_ua:
+                if safe_ua:
+                    log(
+                        "N_m3u8DL User-Agent contains non-ASCII characters → "
+                        "using ASCII-safe value",
+                        level="WARN",
+                    )
+                else:
+                    log(
+                        "N_m3u8DL User-Agent contains no ASCII-safe characters → "
+                        "omitting User-Agent",
+                        level="WARN",
+                    )
     return safe_headers
 
 
-_NM3U8DL_FAILOVER_FINGERPRINT_HEADERS = (
-    "Cookie",
-    "Authorization",
-    "Referer",
-    "Origin",
-)
-
-
-def _nm3u8dl_fingerprint_header_value(headers: dict, wanted_name: str) -> str:
-    wanted = str(wanted_name or "").strip().casefold()
-    for name, value in (headers or {}).items():
-        if str(name).strip().casefold() == wanted:
-            return str(value or "").strip()
-    return ""
-
-
 def get_nm3u8dl_stream_fingerprint(candidate: Optional[dict]) -> str:
-    """Return the draft-one effective-stream identity used only for failover."""
+    """Return the shared effective playback/session fingerprint used by failover."""
     if not candidate:
         return ""
 
-    # Fingerprint contract: the URL reached by the normal manifest probe, not
-    # the exposed playlist URL. If the probe did not establish a final manifest
-    # URL, do not silently substitute another identity component.
-    final_manifest_url = str(
-        candidate.get("manifest_final_url") or ""
-    ).strip()
-
+    final_manifest_url = str(candidate.get("manifest_final_url") or "").strip()
     if not final_manifest_url:
         return ""
 
@@ -7169,24 +6311,63 @@ def get_nm3u8dl_stream_fingerprint(candidate: Optional[dict]) -> str:
         except Exception:
             effective_headers = dict(candidate.get("headers") or {})
 
-    payload = {
-        "final_manifest_url": final_manifest_url,
-        "headers": {
-            header_name.casefold(): _nm3u8dl_fingerprint_header_value(
-                effective_headers,
-                header_name,
-            )
-            for header_name in _NM3U8DL_FAILOVER_FINGERPRINT_HEADERS
-        },
-    }
-
-    serialized = json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
+    return source_playback.playback_fingerprint(
+        final_manifest_url,
+        effective_headers,
     )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def get_nm3u8dl_stream_route_fingerprint(candidate: Optional[dict]) -> str:
+    """Identify one exposed playback request before redirects."""
+    if not candidate:
+        return ""
+
+    stream_url = str(candidate.get("stream_url") or "").strip()
+    if not stream_url:
+        return ""
+
+    effective_headers = dict(candidate.get("effective_headers") or {})
+    if not effective_headers:
+        try:
+            effective_headers = get_nm3u8dl_effective_headers(
+                candidate.get("headers") or {},
+                emit_logs=False,
+            )
+        except Exception:
+            effective_headers = dict(candidate.get("headers") or {})
+
+    return source_playback.playback_fingerprint(
+        stream_url,
+        effective_headers,
+    )
+
+
+def get_nm3u8dl_launch_stream_url(candidate: Optional[dict]) -> str:
+    """Launch the same validated manifest endpoint that quality probing used."""
+    if not candidate:
+        return ""
+
+    stream_url = str(candidate.get("stream_url") or "").strip()
+    final_url = str(candidate.get("manifest_final_url") or "").strip()
+    final_url_type = _get_nm3u8dl_stream_type_from_url(final_url)
+    validated_stream_type = str(
+        candidate.get("stream_type") or ""
+    ).strip().upper()
+
+    # A redirect target can be an extensionless manifest endpoint. The probe has
+    # already classified and validated it, so do not fall back to the exposed
+    # wrapper URL merely because the final URL lacks .m3u8/.mpd.
+    if (
+        final_url
+        and bool(candidate.get("manifest_reachable", False))
+        and (
+            final_url_type in ("HLS", "DASH")
+            or validated_stream_type in ("HLS", "DASH")
+        )
+    ):
+        return final_url
+
+    return stream_url
 
 
 def get_nm3u8dl_manual_feed_signature(candidate: Optional[dict]) -> Optional[dict]:
@@ -7276,6 +6457,16 @@ def _nm3u8dl_mark_bad_fingerprint_candidates(
         if state is not None
         else {}
     ) or {}
+    bad_routes = (
+        getattr(state, "nm3u8dl_bad_stream_routes", {})
+        if state is not None
+        else {}
+    ) or {}
+    bad_literal_ips = (
+        getattr(state, "nm3u8dl_bad_stream_ips", {})
+        if state is not None
+        else {}
+    ) or {}
     manual_excluded_signatures = (
         getattr(state, "nm3u8dl_manual_excluded_feed_signatures", {})
         if state is not None
@@ -7286,10 +6477,15 @@ def _nm3u8dl_mark_bad_fingerprint_candidates(
         candidate.pop("failover_excluded", None)
         candidate.pop("failover_exclusion_reason", None)
         candidate.pop("stream_fingerprint", None)
+        candidate.pop("stream_route_fingerprint", None)
 
         fingerprint = get_nm3u8dl_stream_fingerprint(candidate)
         if fingerprint:
             candidate["stream_fingerprint"] = fingerprint
+
+        route_fingerprint = get_nm3u8dl_stream_route_fingerprint(candidate)
+        if route_fingerprint:
+            candidate["stream_route_fingerprint"] = route_fingerprint
 
         manual_signature = get_nm3u8dl_manual_feed_signature(candidate)
         manual_signature_key = (
@@ -7298,10 +6494,23 @@ def _nm3u8dl_mark_bad_fingerprint_candidates(
             else ""
         )
 
+        candidate_literal_ip = _get_nm3u8dl_candidate_literal_ip(candidate)
+
         if manual_signature_key and manual_signature_key in manual_excluded_signatures:
             candidate["failover_excluded"] = True
             candidate["failover_exclusion_reason"] = (
                 "manually rejected feed signature during this recording"
+            )
+        elif candidate_literal_ip and candidate_literal_ip in bad_literal_ips:
+            candidate["failover_excluded"] = True
+            candidate["failover_exclusion_reason"] = (
+                f"literal IP {candidate_literal_ip} failed 2 consecutive downloader "
+                "attempts during this recording"
+            )
+        elif route_fingerprint and route_fingerprint in bad_routes:
+            candidate["failover_excluded"] = True
+            candidate["failover_exclusion_reason"] = (
+                "redirecting source repeatedly failed across changing playback sessions"
             )
         elif fingerprint and fingerprint in bad_fingerprints:
             candidate["failover_excluded"] = True
@@ -7512,6 +6721,7 @@ def _nm3u8dl_handle_playlist_stream_failure(
         return "rescan"
 
     probations = state.nm3u8dl_failover_probations
+    route_fingerprint = get_nm3u8dl_stream_route_fingerprint(source)
 
     if fingerprint in probations:
         first_failure = str(
@@ -7522,7 +6732,51 @@ def _nm3u8dl_handle_playlist_stream_failure(
             "marked_ts": time.time(),
             "first_failure": first_failure,
             "second_failure": str(failure_type),
+            "route_fingerprint": route_fingerprint,
+            "stream_url": str(source.get("stream_url") or "").strip(),
+            "manifest_final_url": str(
+                source.get("manifest_final_url") or ""
+            ).strip(),
         }
+
+        literal_ip_quarantined_now = False
+        literal_ip = _get_nm3u8dl_candidate_literal_ip(source)
+        if literal_ip and literal_ip not in state.nm3u8dl_bad_stream_ips:
+            state.nm3u8dl_bad_stream_ips[literal_ip] = {
+                "marked_ts": time.time(),
+                "stream_url": str(source.get("stream_url") or "").strip(),
+                "manifest_final_url": str(
+                    source.get("manifest_final_url") or ""
+                ).strip(),
+                "failed_fingerprint": fingerprint,
+                "reason": "literal_ip_failed_2_of_2",
+            }
+            literal_ip_quarantined_now = True
+
+        route_quarantined_now = False
+        if route_fingerprint and not literal_ip:
+            failed_route_fingerprints = {
+                bad_fingerprint
+                for bad_fingerprint, metadata
+                in state.nm3u8dl_bad_stream_fingerprints.items()
+                if str(
+                    (metadata or {}).get("route_fingerprint") or ""
+                ).strip() == route_fingerprint
+            }
+            if (
+                len(failed_route_fingerprints) >= 2
+                and route_fingerprint not in state.nm3u8dl_bad_stream_routes
+            ):
+                state.nm3u8dl_bad_stream_routes[route_fingerprint] = {
+                    "marked_ts": time.time(),
+                    "stream_url": str(source.get("stream_url") or "").strip(),
+                    "failed_fingerprints": tuple(
+                        sorted(failed_route_fingerprints)
+                    ),
+                    "reason": "rotating_redirect_failures",
+                }
+                route_quarantined_now = True
+
         probations.pop(fingerprint, None)
         state.nm3u8dl_failover_retry_source = None
         state.nm3u8dl_failover_waiting_for_alternative = True
@@ -7539,6 +6793,20 @@ def _nm3u8dl_handle_playlist_stream_failure(
             "stream marked EXCLUDED; full playlist rescan required.",
             level="WARN",
         )
+        if literal_ip_quarantined_now:
+            log(
+                f"STREAM_FAILOVER literal-IP quarantine → {literal_ip} failed 2/2; "
+                "all playlist candidates resolving to this IP are excluded for "
+                "the rest of the recording.",
+                level="WARN",
+            )
+        if route_quarantined_now:
+            log(
+                "STREAM_FAILOVER redirector quarantine → original source "
+                "produced 2 distinct playback fingerprints that each failed 2/2; "
+                "this exposed source route is excluded for the rest of the recording.",
+                level="WARN",
+            )
         return "rescan"
 
     probations[fingerprint] = {
@@ -7564,30 +6832,7 @@ def _nm3u8dl_handle_playlist_stream_failure(
 
 
 def _parse_nm3u8dl_frame_rate(value) -> float:
-    if value is None:
-        return 0.0
-
-    text = str(value).strip()
-
-    if not text:
-        return 0.0
-
-    try:
-        if "/" in text:
-            numerator_text, denominator_text = text.split("/", 1)
-            numerator = float(numerator_text)
-            denominator = float(denominator_text)
-
-            if denominator == 0:
-                return 0.0
-
-            return numerator / denominator
-
-        return float(text)
-
-    except (TypeError, ValueError):
-        return 0.0
-
+    return source_quality.parse_frame_rate(value)
 
 def _normalize_nm3u8dl_video_scan_type(value) -> str:
     return source_selection.normalize_video_scan_type(value)
@@ -7632,6 +6877,8 @@ def _get_nm3u8dl_selection_policy(
     allow_unknown_expiry: Optional[bool] = None,
 ) -> SelectionPolicy:
     profile = get_nm3u8dl_playlist_profile()
+    group_name = NM3U8DL_PLAYLIST_GROUP.strip().upper()
+    provider = NM3U8DL_PLAYLIST_GROUP_PROFILES.get(group_name, "")
     if upgrade_min_remaining_min is None:
         upgrade_min_remaining_min = NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN
     if allow_unknown_expiry is None:
@@ -7639,7 +6886,8 @@ def _get_nm3u8dl_selection_policy(
             profile.get("allow_unknown_expiry", False)
         )
 
-    return SelectionPolicy(
+    return shared_selection_policy_for_provider(
+        provider,
         mandatory_min_remaining_sec=int(
             NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN * 60
         ),
@@ -7661,6 +6909,31 @@ def get_nm3u8dl_candidate_quality_rank(candidate: dict):
     return source_selection.candidate_quality_rank(
         SourceCandidate.from_mapping(candidate),
         _get_nm3u8dl_selection_policy(),
+    )
+
+
+def _nm3u8dl_quality_upgrade_cutoff_reached(
+    source: Optional[dict],
+    profile: Optional[dict] = None,
+) -> bool:
+    """Return whether this run is already at its configured quality ceiling."""
+    if not source:
+        return False
+
+    if profile is None:
+        profile = get_nm3u8dl_playlist_profile()
+
+    cutoff_applies = (
+        get_nm3u8dl_playlist_lifecycle() == "EVENT"
+        or bool(profile.get("quality_upgrade_1080p50_ceiling", False))
+    )
+    if not cutoff_applies:
+        return False
+
+    target_fps = float(profile.get("quality_upgrade_target_fps", 50))
+    return (
+        _nm3u8dl_video_resolution_class(source) >= 1080
+        and _nm3u8dl_ranking_motion_fps(source) >= target_fps
     )
 
 
@@ -7691,122 +6964,10 @@ def get_nm3u8dl_join_candidate(
 
 
 def format_nm3u8dl_candidate_quality(candidate: dict) -> str:
-    """Render Resolution | FPS/P-I | Bitrate with per-value provenance."""
-    fps = float(candidate.get("video_fps") or 0.0)
-    width = int(candidate.get("video_width") or 0)
-    height = int(candidate.get("video_height") or 0)
-    bitrate = int(candidate.get("video_bitrate_bps") or 0)
-
-    scan_type = _normalize_nm3u8dl_video_scan_type(
-        candidate.get("video_scan_type")
-    )
-
-    if not _nm3u8dl_has_quality_evidence(candidate):
-        return "unknown"
-
-    def _source_labels(*source_values):
-        labels = []
-
-        source_name_map = {
-            "manifest": "manifest",
-            "ffprobe": "FFprobe",
-            "stream": "FFprobe",
-            "format": "FFprobe",
-            "sps": "SPS",
-            "h264-picture": "picture",
-            "idet": "idet",
-            "sample": "FFmpeg sample",
-        }
-
-        for source_value in source_values:
-            for raw_part in re.split(
-                r"[+,]",
-                str(source_value or ""),
-            ):
-                raw_part = raw_part.strip()
-                if not raw_part:
-                    continue
-
-                label = source_name_map.get(
-                    raw_part.casefold(),
-                    raw_part,
-                )
-
-                if label not in labels:
-                    labels.append(label)
-
-        return labels
-
-    def _with_sources(text, *source_values):
-        labels = _source_labels(*source_values)
-
-        if not labels:
-            return text
-
-        # Manifest is the normal source, so hide it only when it is the
-        # sole provenance. Keep it visible when another source contributed.
-        if labels == ["manifest"]:
-            return text
-
-        return f"{text} [{', '.join(labels)}]"
-
-    resolution_text = (
-        f"{width}x{height}"
-        if width > 0 and height > 0
-        else "resolution UNKNOWN"
-    )
-    resolution_text = _with_sources(
-        resolution_text,
-        candidate.get("video_resolution_source"),
-    )
-
-    if fps > 0:
-        display_fps = (
-            _nm3u8dl_comparable_motion_fps(candidate)
-            if scan_type == "interlaced"
-            else fps
-        )
-
-        fps_text = f"{display_fps:.3f}".rstrip("0").rstrip(".")
-
-        if scan_type == "interlaced":
-            fps_text = f"{fps_text}i"
-        elif scan_type == "progressive":
-            fps_text = f"{fps_text}p"
-        else:
-            fps_text = f"{fps_text} fps (P/I UNKNOWN)"
-
-        fps_text = _with_sources(
-            fps_text,
-            candidate.get("video_fps_source"),
-            (
-                candidate.get("video_scan_type_source")
-                if scan_type
-                else ""
-            ),
-        )
-    else:
-        fps_text = "fps UNKNOWN"
-
-    if bitrate > 0:
-        bitrate_text = f"{int(round(bitrate / 1000.0))} Kbps"
-
-        if str(candidate.get("video_bitrate_source") or "") == "sample":
-            bitrate_text = "~" + bitrate_text
-
-        bitrate_text = _with_sources(
-            bitrate_text,
-            candidate.get("video_bitrate_source"),
-        )
-    else:
-        bitrate_text = "bitrate UNKNOWN"
-
-    return " | ".join(
-        (
-            resolution_text,
-            fps_text,
-            bitrate_text,
-        )
+    """Use the shared quality/evidence formatter."""
+    return source_quality.format_candidate_quality(
+        candidate,
+        motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
     )
 
 
@@ -7814,847 +6975,35 @@ def _parse_nm3u8dl_hls_manifest_quality(
     manifest_text: str,
     manifest_url: str = "",
 ) -> Optional[dict]:
-    qualities = []
-
-    manifest_lines = [
-        raw_line.strip()
-        for raw_line in manifest_text.splitlines()
-    ]
-
-    for index, line in enumerate(manifest_lines):
-
-        if not line.startswith("#EXT-X-STREAM-INF:"):
-            continue
-
-        attributes = line.split(":", 1)[1]
-
-        resolution_match = re.search(
-            r'(?:^|,)\s*RESOLUTION=(\d+)x(\d+)',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        frame_rate_match = re.search(
-            r'(?:^|,)\s*FRAME-RATE=([0-9.]+)',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        average_bandwidth_match = re.search(
-            r'(?:^|,)\s*AVERAGE-BANDWIDTH=(\d+)',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        bandwidth_match = re.search(
-            r'(?:^|,)\s*BANDWIDTH=(\d+)',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        codecs_match = re.search(
-            r'(?:^|,)\s*CODECS="([^"]+)"',
-            attributes,
-            re.IGNORECASE,
-        )
-
-        width = int(resolution_match.group(1)) if resolution_match else 0
-        height = int(resolution_match.group(2)) if resolution_match else 0
-        fps = (
-            _parse_nm3u8dl_frame_rate(frame_rate_match.group(1))
-            if frame_rate_match
-            else 0.0
-        )
-
-        bitrate = 0
-        advertised_bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else 0
-        average_bandwidth = (
-            int(average_bandwidth_match.group(1))
-            if average_bandwidth_match
-            else 0
-        )
-        codecs = str(codecs_match.group(1) if codecs_match else "").strip()
-
-        if average_bandwidth > 0:
-            bitrate = average_bandwidth
-        elif advertised_bandwidth > 0:
-            bitrate = advertised_bandwidth
-
-        variant_uri = ""
-
-        for following_line in manifest_lines[index + 1:]:
-            if not following_line:
-                continue
-
-            if following_line.startswith("#"):
-                break
-
-            variant_uri = following_line
-            break
-
-        variant_url = (
-            urljoin(manifest_url, variant_uri)
-            if variant_uri
-            else ""
-        )
-        variant_expiry = (
-            get_nm3u8dl_auth_expiry(variant_url)
-            if variant_url
-            else None
-        )
-
-        qualities.append({
-            "quality_known": bool(
-                fps > 0
-                or (width > 0 and height > 0)
-                or bitrate > 0
-            ),
-            "video_fps": fps,
-            "video_width": width,
-            "video_height": height,
-            "video_scan_type": "",
-            "video_scan_type_source": "",
-            "video_bitrate_bps": bitrate,
-            "manifest_expiry": variant_expiry,
-            "manifest_variant_url": variant_url,
-            "_hls_bandwidth_bps": advertised_bandwidth,
-            "_hls_average_bandwidth_bps": average_bandwidth,
-            "_hls_codecs": codecs,
-        })
-
-    if not qualities:
-        return None
-
-    return max(qualities, key=_nm3u8dl_video_quality_rank)
+    return source_quality.parse_hls_manifest_quality(
+        manifest_text,
+        manifest_url,
+        motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+        expiry_parser=get_nm3u8dl_auth_expiry,
+    )
 
 
 def _inspect_nm3u8dl_hls_manifest_drm(manifest_text: str) -> dict:
-    """Identify HLS encryption that needs an external DRM/decryption key."""
-    result = {
-        "drm_protected": False,
-        "drm_key_required": False,
-        "drm_detail": "",
-    }
-
-    for raw_line in str(manifest_text or "").splitlines():
-        line = raw_line.strip()
-
-        if not line.startswith(("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")):
-            continue
-
-        attributes = line.split(":", 1)[1]
-
-        method_match = re.search(
-            r'(?:^|,)\s*METHOD=([^,]+)',
-            attributes,
-            re.IGNORECASE,
-        )
-        method = (
-            method_match.group(1).strip().strip('\"')
-            if method_match
-            else ""
-        )
-
-        if not method or method.upper() == "NONE":
-            continue
-
-        result["drm_protected"] = True
-
-        keyformat_match = re.search(
-            r'(?:^|,)\s*KEYFORMAT=(?:"([^"]*)"|([^,]*))',
-            attributes,
-            re.IGNORECASE,
-        )
-        keyformat = (
-            (
-                keyformat_match.group(1)
-                or keyformat_match.group(2)
-                or ""
-            ).strip()
-            if keyformat_match
-            else "identity"
-        ) or "identity"
-
-        uri_match = re.search(
-            r'(?:^|,)\s*URI=(?:"([^"]*)"|([^,]*))',
-            attributes,
-            re.IGNORECASE,
-        )
-        key_uri = (
-            (
-                uri_match.group(1)
-                or uri_match.group(2)
-                or ""
-            ).strip()
-            if uri_match
-            else ""
-        )
-
-        # Only ordinary HLS AES-128 with an identity key URI is self-contained.
-        # SAMPLE-AES/cbcs still requires an external decryption key/path even
-        # when KEYFORMAT is omitted/defaults to identity and a URI is present.
-        if (
-            method.upper() == "AES-128"
-            and keyformat.casefold() == "identity"
-            and key_uri
-        ):
-            continue
-
-        result["drm_key_required"] = True
-        result["drm_detail"] = (
-            f"HLS {method} ({keyformat})"
-            if keyformat
-            else f"HLS {method}"
-        )
-        return result
-
-    return result
+    """Use the shared recorder/Coordinator HLS DRM interpretation."""
+    return source_quality.inspect_hls_manifest_drm(manifest_text)
 
 
 def _inspect_nm3u8dl_dash_manifest_drm(manifest_text: str) -> dict:
-    """Identify DASH ContentProtection that requires a decryption key."""
-    result = {
-        "drm_protected": False,
-        "drm_key_required": False,
-        "drm_detail": "",
-    }
-
-    try:
-        root = ET.fromstring(manifest_text)
-    except ET.ParseError:
-        return result
-
-    for element in root.iter():
-        if element.tag.rsplit("}", 1)[-1] != "ContentProtection":
-            continue
-
-        scheme = str(
-            element.attrib.get("schemeIdUri") or ""
-        ).strip()
-        value = str(
-            element.attrib.get("value") or ""
-        ).strip()
-
-        detail = value or scheme or "ContentProtection"
-
-        result["drm_protected"] = True
-        result["drm_key_required"] = True
-        result["drm_detail"] = f"DASH {detail}"
-        return result
-
-    return result
-
-
-def _dash_template_substitute(
-    template: str,
-    *,
-    representation_id: str,
-    bandwidth: int,
-    number: Optional[int] = None,
-    time_value: Optional[int] = None,
-) -> str:
-    """Resolve the standard DASH SegmentTemplate identifiers we need here."""
-    value = str(template or "")
-    if not value:
-        return ""
-
-    escaped_dollar = "\x00DASH_DOLLAR\x00"
-    value = value.replace("$$", escaped_dollar)
-
-    values = {
-        "RepresentationID": str(representation_id or ""),
-        "Bandwidth": int(bandwidth or 0),
-        "Number": number,
-        "Time": time_value,
-    }
-
-    unresolved = False
-
-    def replace_token(match):
-        nonlocal unresolved
-        name = match.group(1)
-        width_text = match.group(3)
-        token_value = values.get(name)
-
-        if token_value is None or (name == "RepresentationID" and not token_value):
-            unresolved = True
-            return match.group(0)
-
-        if name == "RepresentationID":
-            return str(token_value)
-
-        numeric_value = int(token_value)
-        if width_text:
-            return f"{numeric_value:0{int(width_text)}d}"
-        return str(numeric_value)
-
-    value = re.sub(
-        r"\$(RepresentationID|Bandwidth|Number|Time)(%0(\d+)d)?\$",
-        replace_token,
-        value,
-    )
-    value = value.replace(escaped_dollar, "$")
-
-    if unresolved or re.search(r"\$[^$]+\$", value):
-        return ""
-
-    return value
-
-
-def _parse_nm3u8dl_iso8601_datetime_timestamp(value: str) -> Optional[float]:
-    """Parse an MPD UTC timestamp without adding a third-party dependency."""
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return float(parsed.timestamp())
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def _parse_nm3u8dl_iso8601_duration_seconds(value: str) -> float:
-    """Parse the ISO-8601 duration subset used by DASH MPD timing fields."""
-    text = str(value or "").strip().upper()
-    if not text:
-        return 0.0
-    match = re.fullmatch(
-        r"P(?:(?P<days>[0-9]+(?:\.[0-9]+)?)D)?"
-        r"(?:T(?:(?P<hours>[0-9]+(?:\.[0-9]+)?)H)?"
-        r"(?:(?P<minutes>[0-9]+(?:\.[0-9]+)?)M)?"
-        r"(?:(?P<seconds>[0-9]+(?:\.[0-9]+)?)S)?)?",
-        text,
-    )
-    if not match:
-        return 0.0
-    values = {
-        name: float(match.group(name) or 0.0)
-        for name in ("days", "hours", "minutes", "seconds")
-    }
-    return (
-        values["days"] * 86400.0
-        + values["hours"] * 3600.0
-        + values["minutes"] * 60.0
-        + values["seconds"]
-    )
+    """Use the shared recorder/Coordinator DASH DRM interpretation."""
+    return source_quality.inspect_dash_manifest_drm(manifest_text)
 
 
 def _parse_nm3u8dl_dash_manifest_quality(
     manifest_text: str,
     manifest_url: str = "",
 ) -> Optional[dict]:
-    root = ET.fromstring(manifest_text)
-    qualities = []
-
-    mpd_is_dynamic = str(root.attrib.get("type") or "").strip().casefold() == "dynamic"
-    mpd_availability_start_ts = _parse_nm3u8dl_iso8601_datetime_timestamp(
-        root.attrib.get("availabilityStartTime") or ""
-    )
-    mpd_publish_ts = _parse_nm3u8dl_iso8601_datetime_timestamp(
-        root.attrib.get("publishTime") or ""
-    )
-    mpd_suggested_delay_sec = _parse_nm3u8dl_iso8601_duration_seconds(
-        root.attrib.get("suggestedPresentationDelay") or ""
+    """Use the shared mature/Coordinator DASH manifest parser."""
+    return source_quality.parse_dash_manifest_quality(
+        manifest_text,
+        manifest_url,
+        motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
     )
 
-    def local_name(tag: str) -> str:
-        return tag.rsplit("}", 1)[-1]
-
-    def element_context_expiry(
-        element,
-        *,
-        excluded_child_names=(),
-    ) -> Optional[int]:
-        values = [str(value) for value in element.attrib.values()]
-
-        if element.text:
-            values.append(str(element.text))
-
-        excluded = {str(name) for name in excluded_child_names}
-
-        for child in element:
-            if local_name(child.tag) in excluded:
-                continue
-            values.append(ET.tostring(child, encoding="unicode"))
-
-        expiries = []
-        for value in values:
-            expiries.extend(_extract_nm3u8dl_auth_expiries(value))
-        return min(expiries) if expiries else None
-
-    parent_map = {
-        child: parent
-        for parent in root.iter()
-        for child in parent
-    }
-
-    def element_chain(element):
-        chain = []
-        current = element
-        while current is not None:
-            chain.append(current)
-            current = parent_map.get(current)
-        return list(reversed(chain))
-
-    def first_child(element, name: str):
-        for child in element:
-            if local_name(child.tag) == name:
-                return child
-        return None
-
-    def resolve_base_urls(element) -> List[str]:
-        # DASH BaseURL is hierarchical and each level may expose alternatives.
-        # Preserve every valid path in document order instead of discarding all
-        # but the first BaseURL at each level.
-        base_urls = [str(manifest_url or "").strip()]
-
-        for node in element_chain(element):
-            node_base_texts = []
-
-            for child in node:
-                if local_name(child.tag) != "BaseURL":
-                    continue
-                base_text = str(child.text or "").strip()
-                if base_text and base_text not in node_base_texts:
-                    node_base_texts.append(base_text)
-
-            if not node_base_texts:
-                continue
-
-            resolved_urls = []
-            for current_base in base_urls:
-                for base_text in node_base_texts:
-                    resolved = urljoin(current_base, base_text)
-                    if resolved and resolved not in resolved_urls:
-                        resolved_urls.append(resolved)
-
-            if resolved_urls:
-                base_urls = resolved_urls
-
-        return base_urls
-
-    def inherited_segment_template(element):
-        attributes = {}
-        timeline = None
-        for node in element_chain(element):
-            template = first_child(node, "SegmentTemplate")
-            if template is None:
-                continue
-            attributes.update(template.attrib)
-            template_timeline = first_child(template, "SegmentTimeline")
-            if template_timeline is not None:
-                timeline = template_timeline
-        return attributes, timeline
-
-    def inherited_segment_list(element):
-        selected = None
-        for node in element_chain(element):
-            segment_list = first_child(node, "SegmentList")
-            if segment_list is not None:
-                selected = segment_list
-        return selected
-
-    def inherited_segment_base(element):
-        selected = None
-        for node in element_chain(element):
-            segment_base = first_child(node, "SegmentBase")
-            if segment_base is not None:
-                selected = segment_base
-        return selected
-
-    def period_start_seconds(element) -> float:
-        for node in reversed(element_chain(element)):
-            if local_name(node.tag) == "Period":
-                return _parse_nm3u8dl_iso8601_duration_seconds(
-                    node.attrib.get("start") or ""
-                )
-        return 0.0
-
-    def live_presentation_time_units(
-        element,
-        *,
-        timescale: int,
-        presentation_time_offset: int,
-    ) -> Optional[int]:
-        if not mpd_is_dynamic or mpd_availability_start_ts is None:
-            return None
-        reference_ts = float(mpd_publish_ts or time.time())
-        if mpd_suggested_delay_sec > 0:
-            reference_ts -= float(mpd_suggested_delay_sec)
-        elapsed_sec = (
-            reference_ts
-            - float(mpd_availability_start_ts)
-            - float(period_start_seconds(element))
-        )
-        if elapsed_sec <= 0:
-            return int(presentation_time_offset)
-        return int(
-            int(presentation_time_offset)
-            + (elapsed_sec * max(1, int(timescale)))
-        )
-
-    def recent_timeline_times(
-        timeline,
-        representation,
-        *,
-        timescale: int,
-        presentation_time_offset: int,
-        limit: int = 3,
-    ):
-        if timeline is None:
-            return []
-
-        entries = [
-            entry
-            for entry in timeline
-            if local_name(entry.tag) == "S"
-        ]
-        if not entries:
-            return []
-
-        recent = []
-        current_time = None
-        live_units = live_presentation_time_units(
-            representation,
-            timescale=timescale,
-            presentation_time_offset=presentation_time_offset,
-        )
-
-        for entry_index, entry in enumerate(entries):
-            duration = int(entry.attrib.get("d") or 0)
-            if duration <= 0:
-                continue
-            if entry.attrib.get("t") is not None:
-                current_time = int(entry.attrib.get("t") or 0)
-            elif current_time is None:
-                current_time = int(presentation_time_offset or 0)
-
-            repeat = int(entry.attrib.get("r") or 0)
-            if repeat >= 0:
-                count = repeat + 1
-            else:
-                next_time = None
-                for next_entry in entries[entry_index + 1:]:
-                    if next_entry.attrib.get("t") is not None:
-                        next_time = int(next_entry.attrib.get("t") or 0)
-                        break
-                if next_time is not None and next_time > current_time:
-                    count = max(1, (next_time - current_time + duration - 1) // duration)
-                elif live_units is not None and live_units > current_time:
-                    count = max(1, (live_units - current_time) // duration)
-                else:
-                    continue
-
-            keep = max(limit + 2, 5)
-            first_recent_index = max(0, int(count) - keep)
-            for repeat_index in range(first_recent_index, int(count)):
-                recent.append(int(current_time + (repeat_index * duration)))
-                if len(recent) > keep:
-                    recent = recent[-keep:]
-
-            current_time += int(count) * duration
-
-        if not recent:
-            return []
-
-        ordered = []
-        for index in (-2, -3, -1, -4, -5):
-            if abs(index) <= len(recent):
-                value = recent[index]
-                if value not in ordered:
-                    ordered.append(value)
-            if len(ordered) >= limit:
-                break
-        return ordered
-
-    def resolve_addressing(representation, representation_id: str, bandwidth: int):
-        def build_route(base_url: str) -> dict:
-            init_url = ""
-            init_range = ""
-            media_urls = []
-            media_ranges = []
-            media_self_contained = False
-
-            template_attrs, timeline = inherited_segment_template(representation)
-            if template_attrs:
-                initialization = _dash_template_substitute(
-                    template_attrs.get("initialization") or "",
-                    representation_id=representation_id,
-                    bandwidth=bandwidth,
-                )
-                if initialization:
-                    init_url = urljoin(base_url, initialization)
-
-                media_template = str(template_attrs.get("media") or "")
-                start_number = int(template_attrs.get("startNumber") or 1)
-                timescale = max(1, int(template_attrs.get("timescale") or 1))
-                presentation_time_offset = int(
-                    template_attrs.get("presentationTimeOffset") or 0
-                )
-                duration = int(template_attrs.get("duration") or 0)
-                if media_template:
-                    if "$Time" in media_template:
-                        time_values = recent_timeline_times(
-                            timeline,
-                            representation,
-                            timescale=timescale,
-                            presentation_time_offset=presentation_time_offset,
-                            limit=3,
-                        )
-                        if not time_values and duration > 0:
-                            live_units = live_presentation_time_units(
-                                representation,
-                                timescale=timescale,
-                                presentation_time_offset=presentation_time_offset,
-                            )
-                            if live_units is not None:
-                                live_index = max(
-                                    0,
-                                    int((live_units - presentation_time_offset) // duration),
-                                )
-                                for offset in (1, 2, 0):
-                                    index = max(0, live_index - offset)
-                                    value = presentation_time_offset + (index * duration)
-                                    if value not in time_values:
-                                        time_values.append(value)
-                            elif not mpd_is_dynamic:
-                                time_values = [
-                                    presentation_time_offset,
-                                    presentation_time_offset + duration,
-                                    presentation_time_offset + (duration * 2),
-                                ]
-                        for time_value in time_values:
-                            media = _dash_template_substitute(
-                                media_template,
-                                representation_id=representation_id,
-                                bandwidth=bandwidth,
-                                number=start_number,
-                                time_value=time_value,
-                            )
-                            if media:
-                                media_urls.append(urljoin(base_url, media))
-                    else:
-                        numbers = []
-                        if duration > 0:
-                            live_units = live_presentation_time_units(
-                                representation,
-                                timescale=timescale,
-                                presentation_time_offset=presentation_time_offset,
-                            )
-                            if live_units is not None:
-                                live_index = max(
-                                    0,
-                                    int((live_units - presentation_time_offset) // duration),
-                                )
-                                current_number = start_number + live_index
-                                for offset in (1, 2, 0):
-                                    value = max(start_number, current_number - offset)
-                                    if value not in numbers:
-                                        numbers.append(value)
-                        if not numbers and not mpd_is_dynamic:
-                            numbers = list(range(start_number, start_number + 3))
-
-                        for number in numbers:
-                            media = _dash_template_substitute(
-                                media_template,
-                                representation_id=representation_id,
-                                bandwidth=bandwidth,
-                                number=number,
-                                time_value=None,
-                            )
-                            if media:
-                                media_urls.append(urljoin(base_url, media))
-
-            if not init_url and not media_urls:
-                segment_list = inherited_segment_list(representation)
-                if segment_list is not None:
-                    initialization = first_child(segment_list, "Initialization")
-                    if initialization is not None:
-                        source_url = str(initialization.attrib.get("sourceURL") or "").strip()
-                        init_url = urljoin(base_url, source_url) if source_url else base_url
-                        init_range = str(initialization.attrib.get("range") or "").strip()
-
-                    segment_pairs = []
-                    for segment_url in segment_list:
-                        if local_name(segment_url.tag) != "SegmentURL":
-                            continue
-                        media = str(segment_url.attrib.get("media") or "").strip()
-                        if not media:
-                            continue
-                        segment_pairs.append((
-                            urljoin(base_url, media),
-                            str(segment_url.attrib.get("mediaRange") or "").strip(),
-                        ))
-
-                    if segment_pairs:
-                        if mpd_is_dynamic:
-                            recent_pairs = []
-                            for index in (-2, -3, -1):
-                                if abs(index) <= len(segment_pairs):
-                                    pair = segment_pairs[index]
-                                    if pair not in recent_pairs:
-                                        recent_pairs.append(pair)
-                            segment_pairs = recent_pairs
-                        else:
-                            segment_pairs = segment_pairs[:3]
-
-                    for media_url, media_range in segment_pairs[:3]:
-                        media_urls.append(media_url)
-                        media_ranges.append(media_range)
-
-            if not init_url and not media_urls:
-                segment_base = inherited_segment_base(representation)
-                if segment_base is not None and base_url:
-                    initialization = first_child(segment_base, "Initialization")
-                    if initialization is not None:
-                        source_url = str(initialization.attrib.get("sourceURL") or "").strip()
-                        init_url = urljoin(base_url, source_url) if source_url else base_url
-                        init_range = str(initialization.attrib.get("range") or "").strip()
-                    media_urls = [base_url]
-                    media_self_contained = True
-
-            if (
-                not init_url
-                and not media_urls
-                and base_url
-                and base_url != str(manifest_url or "").strip()
-            ):
-                media_urls = [base_url]
-                media_self_contained = True
-
-            return {
-                "base_url": base_url,
-                "initialization_url": init_url,
-                "initialization_range": init_range,
-                "media_urls": media_urls,
-                "media_ranges": media_ranges,
-                "media_self_contained": media_self_contained,
-            }
-
-        routes = [
-            build_route(base_url)
-            for base_url in resolve_base_urls(representation)
-            if str(base_url or "").strip()
-        ]
-
-        if not routes:
-            routes = [build_route(str(manifest_url or "").strip())]
-
-        primary = routes[0]
-
-        return {
-            "_dash_representation_id": representation_id,
-            "_dash_representation_bandwidth": int(bandwidth or 0),
-            "_dash_representation_base_url": primary["base_url"],
-            "_dash_representation_base_urls": [
-                route["base_url"]
-                for route in routes
-            ],
-            "_dash_initialization_url": primary["initialization_url"],
-            "_dash_initialization_range": primary["initialization_range"],
-            "_dash_media_urls": list(primary["media_urls"]),
-            "_dash_media_ranges": list(primary["media_ranges"]),
-            "_dash_media_self_contained": bool(
-                primary["media_self_contained"]
-            ),
-            "_dash_resource_routes": routes,
-        }
-
-    for adaptation in root.iter():
-        if local_name(adaptation.tag) != "AdaptationSet":
-            continue
-
-        adaptation_content_type = str(adaptation.attrib.get("contentType") or "").lower()
-        adaptation_mime_type = str(adaptation.attrib.get("mimeType") or "").lower()
-        adaptation_frame_rate = adaptation.attrib.get("frameRate")
-        adaptation_width = int(adaptation.attrib.get("width") or 0)
-        adaptation_height = int(adaptation.attrib.get("height") or 0)
-        adaptation_codecs = str(adaptation.attrib.get("codecs") or "").strip()
-        adaptation_scan_type = _normalize_nm3u8dl_video_scan_type(
-            adaptation.attrib.get("scanType")
-        )
-
-        inherited_expiry = None
-        ancestor = parent_map.get(adaptation)
-        while ancestor is not None:
-            ancestor_expiry = element_context_expiry(
-                ancestor,
-                excluded_child_names=("Period", "AdaptationSet", "Representation"),
-            )
-            inherited_expiry = _merge_nm3u8dl_auth_expiries(
-                inherited_expiry,
-                ancestor_expiry,
-            )
-            ancestor = parent_map.get(ancestor)
-
-        adaptation_expiry = element_context_expiry(
-            adaptation,
-            excluded_child_names=("Representation",),
-        )
-
-        for representation in adaptation:
-            if local_name(representation.tag) != "Representation":
-                continue
-
-            representation_mime_type = str(
-                representation.attrib.get("mimeType")
-                or adaptation_mime_type
-                or ""
-            ).lower()
-            width = int(representation.attrib.get("width") or adaptation_width or 0)
-            height = int(representation.attrib.get("height") or adaptation_height or 0)
-            fps = _parse_nm3u8dl_frame_rate(
-                representation.attrib.get("frameRate") or adaptation_frame_rate
-            )
-            bitrate = int(representation.attrib.get("bandwidth") or 0)
-            representation_id = str(representation.attrib.get("id") or "").strip()
-            codecs = str(
-                representation.attrib.get("codecs")
-                or adaptation_codecs
-                or ""
-            ).strip()
-            video_scan_type = (
-                _normalize_nm3u8dl_video_scan_type(representation.attrib.get("scanType"))
-                or adaptation_scan_type
-            )
-
-            is_video = (
-                adaptation_content_type == "video"
-                or "video" in adaptation_mime_type
-                or "video" in representation_mime_type
-                or (width > 0 and height > 0)
-                or fps > 0
-            )
-            if not is_video:
-                continue
-
-            representation_expiry = element_context_expiry(representation)
-            quality = {
-                "quality_known": bool(
-                    fps > 0 or (width > 0 and height > 0) or bitrate > 0
-                ),
-                "video_fps": fps,
-                "video_width": width,
-                "video_height": height,
-                "video_scan_type": video_scan_type,
-                "video_scan_type_source": "manifest" if video_scan_type else "",
-                "video_bitrate_bps": bitrate,
-                "manifest_expiry": _merge_nm3u8dl_auth_expiries(
-                    inherited_expiry,
-                    adaptation_expiry,
-                    representation_expiry,
-                ),
-                "_dash_codecs": codecs,
-            }
-            quality.update(
-                resolve_addressing(representation, representation_id, bitrate)
-            )
-            qualities.append(quality)
-
-    if not qualities:
-        return None
-
-    return max(qualities, key=_nm3u8dl_video_quality_rank)
 
 def _fetch_nm3u8dl_stream_manifest_text(
     stream_url: str,
@@ -8663,131 +7012,26 @@ def _fetch_nm3u8dl_stream_manifest_text(
     include_final_url: bool = False,
     stop_requested: Optional[Callable[[], bool]] = None,
 ):
-    if _is_nm3u8dl_drmlive_host(stream_url):
-        if stop_requested is not None and stop_requested():
-            raise RuntimeError(
-                "Quality probe cancelled by stop request"
-            )
-
-        curl_user_agent = "OTT Navigator/1.7.1.4"
-        curl_headers = None
-
-        # Preserve the proven HLS behavior. Direct DRMLive DASH wrappers are
-        # different: after IP activation they require the playlist entry's own
-        # headers to redirect to the real signed upstream MPD.
-        if _get_nm3u8dl_stream_type_from_url(stream_url) == "DASH":
-            request_headers = get_nm3u8dl_ascii_safe_request_headers(
-                headers,
-                emit_logs=False,
-            )
-            curl_headers = request_headers
-
-            for name, value in request_headers.items():
-                if str(name).casefold() == "user-agent":
-                    curl_user_agent = str(value)
-                    break
-
-        def fetch_curl_once():
-            return _run_nm3u8dl_curl_get_text(
-                stream_url,
-                curl_user_agent,
-                headers=curl_headers,
-                timeout_sec=(
-                    NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC
-                    + 5
-                ),
-            )
-
-        manifest_text, _, final_url, _ = (
-            _run_nm3u8dl_retryable_http_get(
-                fetch_curl_once,
-                stop_requested=stop_requested,
-            )
+    def on_curl_timeout(error, timeout_sec, source_url):
+        log_timeout_exception(
+            error,
+            "curl",
+            timeout_sec,
+            context="GET",
+            source=source_url,
         )
 
-        if include_final_url:
-            return manifest_text, final_url
-
-        return manifest_text
-
-    request_headers = get_nm3u8dl_ascii_safe_request_headers(
+    manifest_text, final_url = source_transport.fetch_stream_manifest_text(
+        stream_url,
         headers,
-        emit_logs=False,
-    )
-
-    if not any(
-        str(name).casefold() == "user-agent"
-        and str(value).strip()
-        for name, value in request_headers.items()
-    ):
-        request_headers["User-Agent"] = str(
-            NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"]
-        )
-
-    def fetch_urllib_once():
-        request = Request(stream_url, headers=request_headers)
-
-        with urlopen(
-            request,
-            timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-        ) as response:
-            # read1() may return an arbitrarily short prefix (for example only the
-            # XML declaration), which can make a valid DASH MPD look like a
-            # non-manifest. read() fills the bounded 64 KiB sniff unless EOF.
-            read_chunk = response.read
-
-            if stop_requested is not None and stop_requested():
-                raise RuntimeError("Quality probe cancelled by stop request")
-
-            # A bad redirect can point at a large media/file payload instead of a
-            # manifest. One bounded 64 KiB read is enough to reject that response
-            # without downloading the entire file. Real HLS/DASH manifests are still
-            # read completely, in chunks, so normal manifest parsing is unchanged.
-            first_bytes = read_chunk(64 * 1024)
-            first_text = first_bytes.decode(
-                "utf-8-sig",
-                errors="replace",
-            )
-            stripped_first = first_text.lstrip()
-            looks_like_manifest = (
-                stripped_first.startswith("#EXTM3U")
-                or re.search(
-                    r'<(?:[A-Za-z_][\w.-]*:)?MPD\b',
-                    stripped_first,
-                    re.IGNORECASE,
-                )
-                is not None
-            )
-
-            manifest_chunks = [first_bytes]
-
-            if looks_like_manifest:
-                while True:
-                    if stop_requested is not None and stop_requested():
-                        raise RuntimeError("Quality probe cancelled by stop request")
-
-                    chunk = read_chunk(64 * 1024)
-                    if not chunk:
-                        break
-
-                    manifest_chunks.append(chunk)
-
-            manifest_text = b"".join(manifest_chunks).decode(
-                "utf-8-sig",
-                errors="replace",
-            )
-            final_url = str(response.geturl() or stream_url).strip()
-
-        return manifest_text, final_url
-
-    manifest_text, final_url = _run_nm3u8dl_retryable_http_get(
-        fetch_urllib_once,
+        default_user_agent=NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"],
         stop_requested=stop_requested,
+        urlopen_fn=urlopen,
+        subprocess_runner=subprocess.run,
+        timeout_callback=on_curl_timeout,
     )
-
     if include_final_url:
         return manifest_text, final_url
-
     return manifest_text
 
 
@@ -8798,64 +7042,30 @@ def _fetch_nm3u8dl_hls_child_with_master_cookie_session(
     *,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> str:
-    """Fetch an HLS child after first establishing cookies on its master."""
-    if stop_requested is not None and stop_requested():
-        raise RuntimeError("Quality probe cancelled by stop request")
-
+    """Use the shared master-cookie child-fetch mechanic."""
     request_headers = get_nm3u8dl_ascii_safe_request_headers(
         headers,
         emit_logs=False,
     )
-
     if not any(
-        str(name).casefold() == "user-agent"
-        and str(value).strip()
+        str(name).casefold() == "user-agent" and str(value).strip()
         for name, value in request_headers.items()
     ):
         request_headers["User-Agent"] = str(
             NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"]
         )
-
-    cookie_jar = CookieJar()
-    opener = build_opener(HTTPCookieProcessor(cookie_jar))
-
-    master_request = Request(master_url, headers=request_headers)
-    with opener.open(
-        master_request,
-        timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-    ) as master_response:
-        # The body is not needed here; opening the response is enough for the
-        # CookieJar to consume Set-Cookie before the child request. Read a small
-        # amount so HTTP/content errors surface while the response is open.
-        master_response.read(1)
-
-    if stop_requested is not None and stop_requested():
-        raise RuntimeError("Quality probe cancelled by stop request")
-
-    child_request = Request(child_url, headers=request_headers)
-    with opener.open(
-        child_request,
-        timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-    ) as child_response:
-        return child_response.read().decode(
-            "utf-8-sig",
-            errors="replace",
-        )
+    return source_transport.fetch_hls_child_with_master_cookie_session(
+        master_url,
+        child_url,
+        request_headers,
+        timeout_sec=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
+        stop_requested=stop_requested,
+    )
 
 
 def _get_nm3u8dl_stream_type_from_url(stream_url: str) -> str:
-    try:
-        path = str(urlparse(str(stream_url or "")).path or "").lower()
-    except Exception:
-        path = str(stream_url or "").lower()
-
-    if path.endswith(".mpd"):
-        return "DASH"
-
-    if path.endswith(".m3u8"):
-        return "HLS"
-
-    return ""
+    """Compatibility wrapper around the shared transport classification rule."""
+    return source_transport.stream_type_from_url(stream_url)
 
 
 def _normalize_nm3u8dl_probe_failure_text(value: str) -> str:
@@ -8986,49 +7196,7 @@ def _sample_nm3u8dl_stream_video_bitrate(
     decryption_key: str = "",
     stream_index: Optional[int] = None,
 ) -> int:
-    """Estimate video bitrate from a short copied-media sample."""
-    command = [
-        "ffmpeg",
-        "-v", "error",
-        "-nostdin",
-    ]
-
-    effective_headers = dict(headers or {})
-    if byte_range:
-        effective_headers["Range"] = f"bytes={byte_range}"
-    if effective_headers:
-        header_blob = "".join(
-            f"{name}: {value}\r\n"
-            for name, value in effective_headers.items()
-        )
-        command.extend([
-            "-headers",
-            header_blob,
-        ])
-
-    if decryption_key:
-        command.extend(["-decryption_key", decryption_key])
-
-    map_value = (
-        f"0:{int(stream_index)}"
-        if stream_index is not None and int(stream_index) >= 0
-        else "0:v:0"
-    )
-
-    command.extend([
-        "-i", stream_url,
-        "-map", map_value,
-        "-c:v", "copy",
-        "-an",
-        "-sn",
-        "-dn",
-        "-t", str(float(NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC)),
-        "-progress", "pipe:2",
-        "-nostats",
-        "-f", "mpegts",
-        "pipe:1",
-    ])
-
+    """Use the shared bitrate sampler with mature external-probe diagnostics."""
     parsed_url = urlparse(stream_url)
     probe_identity = (
         parsed_url.netloc + parsed_url.path
@@ -9036,73 +7204,31 @@ def _sample_nm3u8dl_stream_video_bitrate(
         else "candidate stream"
     )
     timeout_identity = str(timeout_route or probe_identity).strip()
-    invocation = raw_external_start(
-        "ffmpeg",
-        f"candidate bitrate sample | {timeout_identity}",
-    )
-    try:
-        result = subprocess.run(
+
+    def sample_runner(command, timeout):
+        return _run_nm3u8dl_external_capture_redacted(
             command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=float(NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC),
-            check=False,
+            raw_tool="ffmpeg",
+            raw_context=f"candidate bitrate sample | {timeout_identity}",
+            timeout=timeout,
+            secret_values=(decryption_key,),
         )
-    except subprocess.TimeoutExpired as error:
-        raw_external_write(
-            invocation,
-            getattr(error, "stderr", None),
-            "stderr",
+
+    try:
+        return source_quality.sample_stream_video_bitrate(
+            stream_url,
+            headers,
+            sample_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC,
+            timeout_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC,
+            byte_range=byte_range,
+            decryption_key=decryption_key,
+            stream_index=stream_index,
+            runner=sample_runner,
         )
-        raw_external_end(invocation, status="timeout")
-        log_timeout_exception(
-            error,
-            "ffmpeg",
-            NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC,
-            context=f"candidate bitrate sample | {timeout_identity}",
-        )
+    except Exception:
+        # Preserve mature behavior: bitrate sampling is optional evidence and
+        # must never make the candidate probe fail.
         return 0
-    except Exception as error:
-        raw_external_end(
-            invocation,
-            status=f"exception {type(error).__name__}",
-        )
-        return 0
-
-    stderr_text = str(result.stderr or "")
-    raw_external_write(invocation, stderr_text, "stderr")
-    raw_external_end(invocation, returncode=result.returncode)
-
-    if result.returncode != 0:
-        return 0
-
-    total_size = 0
-    out_time_us = 0
-
-    for line in stderr_text.splitlines():
-        key, separator, value = line.partition("=")
-        if not separator:
-            continue
-
-        try:
-            if key == "total_size":
-                total_size = max(total_size, int(value))
-            elif key == "out_time_us":
-                out_time_us = max(out_time_us, int(value))
-        except (TypeError, ValueError):
-            continue
-
-    if total_size <= 0 or out_time_us <= 0:
-        return 0
-
-    sampled_bitrate = int(
-        (float(total_size) * 8.0 * 1_000_000.0)
-        / float(out_time_us)
-    )
-
-    return sampled_bitrate if sampled_bitrate > 0 else 0
-
 
 def _parse_nm3u8dl_idet_scan_type(stderr_text: str) -> str:
     """Return progressive/interlaced only when idet evidence is conclusive."""
@@ -9290,6 +7416,7 @@ def _run_nm3u8dl_external_capture_redacted(
             command,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -9315,88 +7442,7 @@ def _run_nm3u8dl_external_capture_redacted(
 
 
 def _get_nm3u8dl_dash_resource_routes(quality: dict) -> List[dict]:
-    """Return DASH representation routes, selected route first when known."""
-    routes = []
-
-    for original_index, route in enumerate(quality.get("_dash_resource_routes") or []):
-        if not isinstance(route, dict):
-            continue
-        normalized = {
-            "_route_index": int(original_index),
-            "base_url": str(route.get("base_url") or "").strip(),
-            "initialization_url": str(
-                route.get("initialization_url") or ""
-            ).strip(),
-            "initialization_range": str(
-                route.get("initialization_range") or ""
-            ).strip(),
-            "media_urls": [
-                str(value or "").strip()
-                for value in (route.get("media_urls") or [])
-                if str(value or "").strip()
-            ],
-            "media_ranges": list(route.get("media_ranges") or []),
-            "media_self_contained": bool(
-                route.get("media_self_contained", False)
-            ),
-        }
-        if normalized not in routes:
-            routes.append(normalized)
-
-    if not routes:
-        routes.append({
-            "_route_index": 0,
-            "base_url": str(
-                quality.get("_dash_representation_base_url") or ""
-            ).strip(),
-            "initialization_url": str(
-                quality.get("_dash_initialization_url") or ""
-            ).strip(),
-            "initialization_range": str(
-                quality.get("_dash_initialization_range") or ""
-            ).strip(),
-            "media_urls": [
-                str(value or "").strip()
-                for value in (quality.get("_dash_media_urls") or [])
-                if str(value or "").strip()
-            ],
-            "media_ranges": list(quality.get("_dash_media_ranges") or []),
-            "media_self_contained": bool(
-                quality.get("_dash_media_self_contained", False)
-            ),
-        })
-
-    try:
-        selected_index = int(quality.get("_dash_selected_route_index"))
-    except Exception:
-        selected_index = -1
-
-    selected_route = next(
-        (
-            route
-            for route in routes
-            if int(route.get("_route_index", -1)) == selected_index
-        ),
-        None,
-    )
-    if selected_route is not None:
-        routes = [selected_route] + [
-            route
-            for route in routes
-            if route is not selected_route
-        ]
-
-    return routes
-
-
-def _nm3u8dl_single_byte_range(byte_range: str = "") -> str:
-    """Reduce a DASH byte range to one byte for redirect/effective-URL probing."""
-    range_text = str(byte_range or "").strip()
-    match = re.fullmatch(r"(\d+)\s*-\s*(\d+)?", range_text)
-    if match:
-        start = match.group(1)
-        return f"{start}-{start}"
-    return "0-0"
+    return source_transport.dash_resource_routes(quality)
 
 
 def _build_nm3u8dl_http_request_headers(
@@ -9404,77 +7450,11 @@ def _build_nm3u8dl_http_request_headers(
     *,
     byte_range: str = "",
 ) -> dict:
-    request_headers = get_nm3u8dl_ascii_safe_request_headers(
+    return source_transport.build_resource_request_headers(
         headers,
-        emit_logs=False,
+        default_user_agent=NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"],
+        byte_range=byte_range,
     )
-    if not any(
-        str(name).casefold() == "user-agent" and str(value).strip()
-        for name, value in request_headers.items()
-    ):
-        request_headers["User-Agent"] = str(
-            NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"]
-        )
-    if byte_range:
-        request_headers["Range"] = f"bytes={byte_range}"
-    return request_headers
-
-
-def _resolve_nm3u8dl_http_resource_final_url(
-    resource_url: str,
-    headers: dict,
-    *,
-    byte_range: str = "",
-    stop_requested: Optional[Callable[[], bool]] = None,
-) -> str:
-    """Follow one media-resource GET and return the final effective URL."""
-    request_headers = _build_nm3u8dl_http_request_headers(
-        headers,
-        byte_range=_nm3u8dl_single_byte_range(byte_range),
-    )
-
-    def fetch_once():
-        request = Request(resource_url, headers=request_headers)
-        with urlopen(
-            request,
-            timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-        ) as response:
-            # Read only enough to make the GET real. Servers that ignore Range
-            # are still bounded because the response is closed immediately.
-            response.read(1)
-            return str(response.geturl() or resource_url).strip()
-
-    try:
-        return str(
-            _run_nm3u8dl_retryable_http_get(
-                fetch_once,
-                stop_requested=stop_requested,
-            )
-            or resource_url
-        ).strip()
-    except HTTPError as error:
-        # Some origins reject Range requests even though a normal GET works.
-        if int(getattr(error, "code", 0) or 0) != 416:
-            raise
-
-    request_headers = _build_nm3u8dl_http_request_headers(headers)
-
-    def fetch_without_range_once():
-        request = Request(resource_url, headers=request_headers)
-        with urlopen(
-            request,
-            timeout=NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC,
-        ) as response:
-            response.read(1)
-            return str(response.geturl() or resource_url).strip()
-
-    return str(
-        _run_nm3u8dl_retryable_http_get(
-            fetch_without_range_once,
-            stop_requested=stop_requested,
-        )
-        or resource_url
-    ).strip()
 
 
 def _resolve_nm3u8dl_selected_dash_resource_route(
@@ -9483,67 +7463,15 @@ def _resolve_nm3u8dl_selected_dash_resource_route(
     *,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> dict:
-    """Resolve one usable selected-representation resource across BaseURL alternatives."""
-    routes = _get_nm3u8dl_dash_resource_routes(quality)
-    failures = []
-
-    for route in routes:
-        route_index = int(route.get("_route_index", 0) or 0)
-        media_urls = list(route.get("media_urls") or [])
-        media_ranges = list(route.get("media_ranges") or [])
-        resource_candidates = []
-
-        for index, media_url in enumerate(media_urls[:3]):
-            resource_candidates.append((
-                str(media_url or "").strip(),
-                (
-                    str(media_ranges[index] or "").strip()
-                    if index < len(media_ranges)
-                    else ""
-                ),
-            ))
-
-        if not resource_candidates and route.get("initialization_url"):
-            resource_candidates.append((
-                str(route.get("initialization_url") or "").strip(),
-                str(route.get("initialization_range") or "").strip(),
-            ))
-
-        for request_url, request_range in resource_candidates:
-            if not request_url:
-                continue
-
-            try:
-                final_url = _resolve_nm3u8dl_http_resource_final_url(
-                    request_url,
-                    headers,
-                    byte_range=request_range,
-                    stop_requested=stop_requested,
-                )
-                return {
-                    "route_index": route_index,
-                    "request_url": request_url,
-                    "final_url": final_url,
-                    "resource_expiry": _merge_nm3u8dl_auth_expiries(
-                        get_nm3u8dl_auth_expiry(request_url),
-                        get_nm3u8dl_auth_expiry(final_url),
-                    ),
-                    "failure": "",
-                }
-            except Exception as error:
-                if stop_requested is not None and stop_requested():
-                    raise
-                failure = _describe_nm3u8dl_probe_exception(error)
-                if failure:
-                    failures.append(failure)
-
-    return {
-        "route_index": None,
-        "request_url": "",
-        "final_url": "",
-        "resource_expiry": None,
-        "failure": next((value for value in failures if value), ""),
-    }
+    return source_transport.resolve_selected_dash_resource_route(
+        quality,
+        headers,
+        default_user_agent=NM3U8DL_PLAYLIST_USER_AGENTS["DEFAULT"],
+        expiry_parser=get_nm3u8dl_auth_expiry,
+        stop_requested=stop_requested,
+        urlopen_fn=urlopen,
+        error_describer=_describe_nm3u8dl_probe_exception,
+    )
 
 
 def _fetch_nm3u8dl_binary_resource(
@@ -10057,6 +7985,11 @@ def _detect_nm3u8dl_dash_selected_representation_scan_type(
                     sample_headers,
                     scan_type_cache=None,
                     timeout_route=timeout_route,
+                    effective_stream_url=str(
+                        quality.get("manifest_final_url")
+                        or candidate.get("manifest_final_url")
+                        or ""
+                    ).strip(),
                     decryption_key=key_value,
                 )
                 if idet_scan_type:
@@ -10097,6 +8030,43 @@ def _detect_nm3u8dl_dash_selected_representation_scan_type(
             scan_type_cache["results"][cache_key] = result
         return result
 
+def _nm3u8dl_literal_ip_host(stream_url: str) -> str:
+    """Return a normalized literal IPv4/IPv6 host, or an empty string."""
+    try:
+        hostname = urlparse(str(stream_url or "")).hostname
+    except ValueError:
+        return ""
+
+    if not hostname:
+        return ""
+
+    try:
+        return str(ipaddress.ip_address(hostname))
+    except ValueError:
+        return ""
+
+
+def _nm3u8dl_url_has_literal_ip_host(stream_url: str) -> bool:
+    return bool(_nm3u8dl_literal_ip_host(stream_url))
+
+
+def _get_nm3u8dl_candidate_literal_ip(candidate: Optional[dict]) -> str:
+    """Return the literal IP used by the candidate's effective playback route."""
+    if not candidate:
+        return ""
+
+    for field_name in (
+        "selected_media_final_url",
+        "manifest_final_url",
+        "stream_url",
+    ):
+        literal_ip = _nm3u8dl_literal_ip_host(candidate.get(field_name) or "")
+        if literal_ip:
+            return literal_ip
+
+    return ""
+
+
 def _detect_nm3u8dl_stream_scan_type_with_idet(
     stream_url: str,
     headers: dict,
@@ -10104,9 +8074,21 @@ def _detect_nm3u8dl_stream_scan_type_with_idet(
     stream_index: Optional[int] = None,
     scan_type_cache: Optional[dict] = None,
     timeout_route: str = "",
+    effective_stream_url: str = "",
     decryption_key: str = "",
 ) -> str:
     """Final P/I fallback using decoded frames from the targeted input."""
+    # The FFmpeg input can be a hostname wrapper that redirects to a literal-IP
+    # endpoint. Check both the command input and the already-known effective
+    # manifest/media URL; checking only stream_url misses exactly that case.
+    # Keep the short bitrate/FFprobe work, but never pay the 90-second IDet
+    # timeout once the effective playback route is known to be a literal IP.
+    if (
+        _nm3u8dl_url_has_literal_ip_host(stream_url)
+        or _nm3u8dl_url_has_literal_ip_host(effective_stream_url)
+    ):
+        return ""
+
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -10211,29 +8193,6 @@ def _ffprobe_nm3u8dl_stream_quality(
     decryption_key: str = "",
     target_quality: Optional[dict] = None,
 ) -> Optional[dict]:
-    command = ["ffprobe", "-v", "error"]
-
-    if headers:
-        header_blob = "".join(
-            f"{name}: {value}\r\n"
-            for name, value in headers.items()
-        )
-        command.extend(["-headers", header_blob])
-
-    if decryption_key:
-        command.extend(["-decryption_key", decryption_key])
-
-    command.extend([
-        "-select_streams", "v",
-        "-show_entries",
-        (
-            "stream=index,codec_name,width,height,avg_frame_rate,r_frame_rate,"
-            "bit_rate,field_order:format=bit_rate"
-        ),
-        "-of", "json",
-        stream_url,
-    ])
-
     parsed_url = urlparse(stream_url)
     probe_identity = (
         parsed_url.netloc + parsed_url.path
@@ -10241,113 +8200,47 @@ def _ffprobe_nm3u8dl_stream_quality(
         else "candidate stream"
     )
     timeout_identity = str(timeout_route or probe_identity).strip()
-    result = _run_nm3u8dl_external_capture_redacted(
-        command,
-        raw_tool="ffprobe",
-        raw_context=f"candidate quality probe | {timeout_identity}",
-        timeout=NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC,
-        secret_values=(decryption_key,),
-    )
 
-    stdout = (result.stdout or "").strip()
-    if not stdout:
-        raise RuntimeError(_summarize_nm3u8dl_ffprobe_failure(result))
-
-    data = json.loads(stdout)
-    format_bitrate = int((data.get("format") or {}).get("bit_rate") or 0)
-    qualities = []
-
-    for stream in data.get("streams") or []:
-        width = int(stream.get("width") or 0)
-        height = int(stream.get("height") or 0)
-        fps = _parse_nm3u8dl_frame_rate(stream.get("avg_frame_rate"))
-        if fps <= 0:
-            fps = _parse_nm3u8dl_frame_rate(stream.get("r_frame_rate"))
-
-        stream_bitrate = int(stream.get("bit_rate") or 0)
-        bitrate = stream_bitrate or format_bitrate
-        bitrate_source = (
-            "stream" if stream_bitrate > 0
-            else "format" if format_bitrate > 0
-            else ""
+    def ffprobe_runner(command, timeout):
+        return _run_nm3u8dl_external_capture_redacted(
+            command,
+            raw_tool="ffprobe",
+            raw_context=f"candidate quality probe | {timeout_identity}",
+            timeout=timeout,
+            secret_values=(decryption_key,),
         )
 
-        field_order = str(stream.get("field_order") or "").strip().casefold()
-        if field_order == "progressive":
-            scan_type = "progressive"
-        elif field_order in {"tt", "bb", "tb", "bt"}:
-            scan_type = "interlaced"
-        else:
-            scan_type = ""
-
-        qualities.append({
-            "quality_known": bool(
-                fps > 0 or (width > 0 and height > 0) or bitrate > 0
-            ),
-            "video_fps": fps,
-            "video_width": width,
-            "video_height": height,
-            "video_scan_type": scan_type,
-            "video_scan_type_source": "ffprobe" if scan_type else "",
-            "video_bitrate_bps": bitrate,
-            "video_bitrate_source": bitrate_source,
-            "_ffprobe_stream_index": int(stream.get("index") or 0),
-            "_ffprobe_codec_name": str(stream.get("codec_name") or "").strip(),
-        })
-
-    if not qualities:
-        raise RuntimeError(_summarize_nm3u8dl_ffprobe_failure(result))
-
-    target = target_quality or {}
-    target_width = int(target.get("video_width") or 0)
-    target_height = int(target.get("video_height") or 0)
-    target_fps = float(target.get("video_fps") or 0.0)
-
-    matched_qualities = []
-    for item in qualities:
-        if target_width > 0 and target_height > 0:
-            if (
-                int(item.get("video_width") or 0) != target_width
-                or int(item.get("video_height") or 0) != target_height
-            ):
-                continue
-        if target_fps > 0:
-            item_fps = float(item.get("video_fps") or 0.0)
-            if item_fps <= 0 or abs(item_fps - target_fps) > 0.05:
-                continue
-        matched_qualities.append(item)
-
-    best_quality = max(
-        matched_qualities or qualities,
-        key=_nm3u8dl_video_quality_rank,
-    )
-    best_quality["_ffprobe_target_match_count"] = (
-        len(matched_qualities) if target_quality else len(qualities)
-    )
-
-    if (
-        sample_missing_bitrate
-        and int(best_quality.get("video_bitrate_bps") or 0) <= 0
-    ):
-        sampled_bitrate = _sample_nm3u8dl_stream_video_bitrate(
+    def bitrate_sample(stream_index: int) -> int:
+        return _sample_nm3u8dl_stream_video_bitrate(
             stream_url,
             headers,
             timeout_route=timeout_identity,
             decryption_key=decryption_key,
-            stream_index=int(best_quality.get("_ffprobe_stream_index") or 0),
+            stream_index=stream_index,
         )
-        if sampled_bitrate > 0:
-            best_quality["video_bitrate_bps"] = sampled_bitrate
-            best_quality["video_bitrate_source"] = "sample"
-            best_quality["quality_known"] = True
 
-    return best_quality
+    return source_quality.probe_stream_quality_ffprobe(
+        stream_url,
+        headers,
+        timeout_sec=NM3U8DL_QUALITY_FFPROBE_TIMEOUT_SEC,
+        target_quality=target_quality,
+        motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+        decryption_key=decryption_key,
+        sample_missing_bitrate=sample_missing_bitrate,
+        bitrate_sample_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_SEC,
+        bitrate_sample_timeout_sec=NM3U8DL_QUALITY_BITRATE_SAMPLE_TIMEOUT_SEC,
+        bitrate_sample_callback=(bitrate_sample if sample_missing_bitrate else None),
+        failure_describer=_summarize_nm3u8dl_ffprobe_failure,
+        runner=ffprobe_runner,
+    )
+
 
 def _probe_nm3u8dl_candidate_quality(
     candidate: dict,
     stop_requested: Optional[Callable[[], bool]] = None,
     scan_type_cache: Optional[dict] = None,
     timeout_playlist_urls: Optional[List[str]] = None,
+    excluded_literal_ips: Optional[set] = None,
 ) -> dict:
     probe_started = time.monotonic()
 
@@ -10396,6 +8289,8 @@ def _probe_nm3u8dl_candidate_quality(
         "drm_key_missing": False,
         "drm_detail": "",
         "drm_inspection_failure": "",
+        "hls_variant_probe_status": "",
+        "hls_variant_probe_failure": "",
         "access_blocked": False,
         "access_block_kind": "",
         "access_block_http_status": None,
@@ -10412,6 +8307,11 @@ def _probe_nm3u8dl_candidate_quality(
     }
 
     errors = []
+    excluded_literal_ips = {
+        str(value or "").strip()
+        for value in (excluded_literal_ips or set())
+        if str(value or "").strip()
+    }
 
     try:
         effective_headers = get_nm3u8dl_effective_headers(
@@ -10428,6 +8328,20 @@ def _probe_nm3u8dl_candidate_quality(
         errors.append(
             quality["header_preparation_failure"]
         )
+
+    direct_literal_ip = _nm3u8dl_literal_ip_host(candidate.get("stream_url") or "")
+    if direct_literal_ip and direct_literal_ip in excluded_literal_ips:
+        quality["manifest_final_url"] = str(candidate.get("stream_url") or "").strip()
+        quality["failover_excluded"] = True
+        quality["failover_exclusion_reason"] = (
+            f"literal IP {direct_literal_ip} failed 2 consecutive downloader attempts "
+            "during this recording"
+        )
+        quality["probe_duration_sec"] = round(
+            time.monotonic() - probe_started,
+            6,
+        )
+        return quality
 
     manifest_quality = None
 
@@ -10449,154 +8363,88 @@ def _probe_nm3u8dl_candidate_quality(
         if final_manifest_type:
             quality["stream_type"] = final_manifest_type
 
+        final_literal_ip = _nm3u8dl_literal_ip_host(final_manifest_url)
+        if final_literal_ip and final_literal_ip in excluded_literal_ips:
+            quality["manifest_reachable"] = True
+            quality["failover_excluded"] = True
+            quality["failover_exclusion_reason"] = (
+                f"literal IP {final_literal_ip} failed 2 consecutive downloader attempts "
+                "during this recording"
+            )
+            quality["probe_duration_sec"] = round(
+                time.monotonic() - probe_started,
+                6,
+            )
+            return quality
+
         redirected_expiry = get_nm3u8dl_auth_expiry(
             final_manifest_url
         )
 
-        if redirected_expiry is not None:
-            quality["manifest_expiry"] = redirected_expiry
+        def fetch_child_text(variant_url: str) -> str:
+            return _fetch_nm3u8dl_stream_manifest_text(
+                variant_url,
+                effective_headers,
+                stop_requested=stop_requested,
+            )
 
-        stripped_manifest = manifest_text.lstrip()
+        def fetch_child_with_master_session(
+            master_url: str,
+            variant_url: str,
+        ) -> str:
+            return _fetch_nm3u8dl_hls_child_with_master_cookie_session(
+                master_url,
+                variant_url,
+                effective_headers,
+                stop_requested=stop_requested,
+            )
 
-        if stripped_manifest.startswith("#EXTM3U"):
-            quality["manifest_reachable"] = True
-            quality["stream_type"] = "HLS"
-            manifest_quality = _parse_nm3u8dl_hls_manifest_quality(
+        def on_child_error(error: BaseException, variant_url: str) -> None:
+            child_timeout_route = _format_candidate_timeout_route(
+                playlist_urls_for_timeout,
+                variant_url,
+            )
+            log_timeout_exception(
+                error,
+                "HTTP",
+                (
+                    NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC + 5
+                    if _is_nm3u8dl_drmlive_host(variant_url)
+                    else NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC
+                ),
+                context=(
+                    "HLS variant check | "
+                    f"{child_timeout_route}"
+                ),
+            )
+
+        def resolve_dash_resource(quality_evidence: dict):
+            return _resolve_nm3u8dl_selected_dash_resource_route(
+                quality_evidence,
+                effective_headers,
+                stop_requested=stop_requested,
+            )
+
+        inspection, manifest_quality, _resource_route = (
+            source_quality.inspect_manifest_probe_evidence(
                 manifest_text,
                 final_manifest_url,
+                has_decryption_keys=bool(candidate.get("keys") or []),
+                motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+                manifest_expiry=redirected_expiry,
+                expiry_parser=get_nm3u8dl_auth_expiry,
+                fetch_child=fetch_child_text,
+                fetch_child_with_master_session=fetch_child_with_master_session,
+                child_hls_validator=lambda value: str(value).lstrip().startswith(
+                    "#EXTM3U"
+                ),
+                child_error_describer=_describe_nm3u8dl_probe_exception,
+                child_error_callback=on_child_error,
+                resolve_dash_resource=resolve_dash_resource,
+                stop_requested=stop_requested,
             )
-
-            quality.update(
-                _inspect_nm3u8dl_hls_manifest_drm(
-                    manifest_text
-                )
-            )
-
-            # A master playlist can look healthy while encryption is declared
-            # only in its child media playlist. For an unkeyed candidate, inspect
-            # the selected child before allowing the source to become launchable.
-            if (
-                not (candidate.get("keys") or [])
-                and not quality.get("drm_key_required")
-                and manifest_quality
-            ):
-                variant_url = str(
-                    manifest_quality.get("manifest_variant_url")
-                    or ""
-                ).strip()
-
-                if variant_url:
-                    variant_text = ""
-                    child_error = None
-
-                    try:
-                        variant_text = (
-                            _fetch_nm3u8dl_stream_manifest_text(
-                                variant_url,
-                                effective_headers,
-                                stop_requested=stop_requested,
-                            )
-                        )
-                    except HTTPError as error:
-                        child_error = error
-
-                        # Proven production case: the HLS master sets an
-                        # authorization cookie that the child requires. urllib
-                        # urlopen() calls do not retain that response cookie, so
-                        # retry the master -> child sequence in one CookieJar.
-                        if getattr(error, "code", None) == 403:
-                            try:
-                                variant_text = (
-                                    _fetch_nm3u8dl_hls_child_with_master_cookie_session(
-                                        final_manifest_url,
-                                        variant_url,
-                                        effective_headers,
-                                        stop_requested=stop_requested,
-                                    )
-                                )
-                                child_error = None
-                            except Exception as retry_error:
-                                child_error = retry_error
-                    except Exception as error:
-                        child_timeout_route = _format_candidate_timeout_route(
-                            playlist_urls_for_timeout,
-                            variant_url,
-                        )
-                        log_timeout_exception(
-                            error,
-                            "HTTP",
-                            (
-                                NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC + 5
-                                if _is_nm3u8dl_drmlive_host(variant_url)
-                                else NM3U8DL_QUALITY_HTTP_TIMEOUT_SEC
-                            ),
-                            context=(
-                                "HLS child DRM inspection | "
-                                f"{child_timeout_route}"
-                            ),
-                        )
-                        child_error = error
-
-                    if variant_text:
-                        if not variant_text.lstrip().startswith("#EXTM3U"):
-                            quality["drm_inspection_failure"] = (
-                                "HLS child DRM inspection returned a "
-                                "non-HLS response"
-                            )
-                        else:
-                            variant_drm = (
-                                _inspect_nm3u8dl_hls_manifest_drm(
-                                    variant_text
-                                )
-                            )
-
-                            quality["drm_protected"] = bool(
-                                quality.get("drm_protected")
-                                or variant_drm.get("drm_protected")
-                            )
-
-                            if variant_drm.get("drm_key_required"):
-                                quality["drm_key_required"] = True
-                                quality["drm_detail"] = str(
-                                    variant_drm.get("drm_detail")
-                                    or ""
-                                )
-                    elif child_error is not None:
-                        quality["drm_inspection_failure"] = (
-                            "HLS child DRM inspection failed — "
-                            + _describe_nm3u8dl_probe_exception(
-                                child_error
-                            )
-                        )
-
-        elif re.search(
-            r'<(?:[A-Za-z_][\w.-]*:)?MPD\b',
-            stripped_manifest,
-            re.IGNORECASE,
-        ):
-            quality["manifest_reachable"] = True
-            quality["stream_type"] = "DASH"
-            manifest_quality = _parse_nm3u8dl_dash_manifest_quality(
-                manifest_text,
-                final_manifest_url,
-            )
-            quality.update(
-                _inspect_nm3u8dl_dash_manifest_drm(
-                    manifest_text
-                )
-            )
-        else:
-            quality["manifest_probe_failure"] = (
-                "response was not a recognizable HLS/DASH manifest"
-            )
-
-        if manifest_quality:
-            manifest_quality["manifest_expiry"] = (
-                _merge_nm3u8dl_auth_expiries(
-                    manifest_quality.get("manifest_expiry"),
-                    redirected_expiry,
-                )
-            )
+        )
+        quality.update(inspection)
 
     except Exception as error:
         log_timeout_exception(
@@ -10644,83 +8492,22 @@ def _probe_nm3u8dl_candidate_quality(
             if redirected_expiry is not None:
                 quality["manifest_expiry"] = redirected_expiry
 
-            if status_code == 403 and error_type.lower() == "geo-blocked":
-                quality["access_blocked"] = True
-                quality["access_block_kind"] = "confirmed_geo"
-                quality["access_block_http_status"] = 403
-
-                country = (
-                    str(response_headers.get("Country") or "").strip()
-                    if response_headers is not None
-                    else ""
-                )
-
-                quality["geo_country"] = country or None
-
-            elif (
-                status_code == 403
-                and NM3U8DL_PLAYLIST_GROUP.strip().upper()
-                in ("FANCODE", "JIO_STAR_SPORTS")
-            ):
-                # FanCode and JIO Star Sports can return a plain HTTP 403 when
-                # access changes with VPN/route. Treat it as actionable for these
-                # groups only; do not claim confirmed geo because the response
-                # gives no such proof.
-                quality["access_blocked"] = True
-                quality["access_block_kind"] = "vpn_route_suspected"
-                quality["access_block_http_status"] = 403
-
-            elif status_code in (450, 451):
-                # Jio/Fastly can return HTTP 450 or 451 for a source that becomes
-                # immediately reachable after changing VPN/route. Treat either
-                # as actionable access blocking, but do not claim confirmed geo.
-                quality["access_blocked"] = True
-                quality["access_block_kind"] = "vpn_route_suspected"
-                quality["access_block_http_status"] = int(status_code)
+            access = source_transport.classify_http_access_error(
+                error,
+                source_group=NM3U8DL_PLAYLIST_GROUP,
+                provider=SHARED_PLAYLIST_GROUP_PROFILES.get(
+                    NM3U8DL_PLAYLIST_GROUP.strip().upper(),
+                    "",
+                ),
+            )
+            quality["access_blocked"] = bool(access.get("blocked"))
+            quality["access_block_kind"] = str(access.get("kind") or "")
+            quality["access_block_http_status"] = access.get("http_status")
+            quality["geo_country"] = access.get("geo_country")
 
         errors.append(
             f"manifest probe failed ({type(error).__name__})"
         )
-
-    if manifest_quality:
-        quality.update(manifest_quality)
-        quality["quality_source"] = "manifest"
-
-        if float(quality.get("video_fps") or 0.0) > 0:
-            quality["video_fps_source"] = "manifest"
-
-        if (
-            int(quality.get("video_width") or 0) > 0
-            or int(quality.get("video_height") or 0) > 0
-        ):
-            quality["video_resolution_source"] = "manifest"
-
-        if int(quality.get("video_bitrate_bps") or 0) > 0:
-            quality["video_bitrate_source"] = "manifest"
-
-        if quality.get("stream_type") == "DASH":
-            resource_route = _resolve_nm3u8dl_selected_dash_resource_route(
-                quality,
-                effective_headers,
-                stop_requested=stop_requested,
-            )
-
-            if resource_route.get("final_url"):
-                quality["selected_media_final_url"] = str(
-                    resource_route.get("final_url") or ""
-                ).strip()
-                quality["resource_expiry"] = _merge_nm3u8dl_auth_expiries(
-                    quality.get("resource_expiry"),
-                    resource_route.get("resource_expiry"),
-                )
-
-                route_index = resource_route.get("route_index")
-                if route_index is not None:
-                    quality["_dash_selected_route_index"] = int(route_index)
-            elif resource_route.get("failure"):
-                quality["resource_probe_failure"] = str(
-                    resource_route.get("failure") or ""
-                ).strip()
 
     probe_stream_url = str(
         quality.get("manifest_variant_url")
@@ -10731,17 +8518,20 @@ def _probe_nm3u8dl_candidate_quality(
         quality.get("manifest_final_url") or probe_stream_url,
     )
 
-    # EVENT policy: event streams are treated as progressive.
-    # This deliberately prevents DASH/HLS P/I probing, including idet.
-    # LINEAR_TV is completely unchanged and continues through the existing
-    # manifest/SPS/picture/FFprobe/idet P/I detection path below.
-    event_lifecycle = (
-        NM3U8DL_SOURCE_MODE == "playlist"
-        and get_nm3u8dl_playlist_lifecycle() == "EVENT"
+    # Lifecycle quality policy is shared with Inspect/Watch.
+    lifecycle = (
+        get_nm3u8dl_playlist_lifecycle()
+        if NM3U8DL_SOURCE_MODE == "playlist"
+        else ""
     )
-    if event_lifecycle:
-        quality["video_scan_type"] = "progressive"
-        quality["video_scan_type_source"] = "event-policy"
+    (
+        quality["video_scan_type"],
+        quality["video_scan_type_source"],
+    ) = shared_apply_lifecycle_scan_type_policy(
+        lifecycle,
+        quality.get("video_scan_type"),
+        quality.get("video_scan_type_source"),
+    )
 
     # DASH P/I is independent from ffprobe quality fallback. MPD scanType has
     # already been applied by the parser. Only a missing DASH scan type enters
@@ -10890,77 +8680,14 @@ def _probe_nm3u8dl_candidate_quality(
                 if ffprobe_quality:
                     successful_ffprobe_key = ffprobe_key
                     quality["ffprobe_reachable"] = True
-
-                    ffprobe_fps = float(
-                        ffprobe_quality.get("video_fps") or 0.0
-                    )
-                    if (
-                        not float(quality.get("video_fps") or 0.0)
-                        and ffprobe_fps > 0
-                    ):
-                        quality["video_fps"] = ffprobe_fps
-                        quality["video_fps_source"] = "ffprobe"
-
-                    resolution_filled_from_ffprobe = False
-
-                    for field in (
-                        "video_width",
-                        "video_height",
-                    ):
-                        ffprobe_value = int(
-                            ffprobe_quality.get(field) or 0
-                        )
-                        if not int(quality.get(field) or 0) and ffprobe_value > 0:
-                            quality[field] = ffprobe_value
-                            resolution_filled_from_ffprobe = True
-
-                    if resolution_filled_from_ffprobe:
-                        existing_resolution_source = str(
-                            quality.get("video_resolution_source") or ""
-                        ).strip()
-
-                        if existing_resolution_source == "manifest":
-                            quality["video_resolution_source"] = (
-                                "manifest+ffprobe"
-                            )
-                        else:
-                            quality["video_resolution_source"] = "ffprobe"
-
-                    if not quality.get("video_bitrate_bps"):
-                        ffprobe_bitrate = int(
-                            ffprobe_quality.get("video_bitrate_bps") or 0
-                        )
-                        quality["video_bitrate_bps"] = ffprobe_bitrate
-                        quality["video_bitrate_source"] = str(
-                            ffprobe_quality.get("video_bitrate_source") or ""
-                        )
-
-                    if (
-                        quality.get("stream_type") == "HLS"
-                        and not _normalize_nm3u8dl_video_scan_type(
-                            quality.get("video_scan_type")
-                        )
-                    ):
-                        ffprobe_scan_type = _normalize_nm3u8dl_video_scan_type(
-                            ffprobe_quality.get("video_scan_type")
-                        )
-                        if ffprobe_scan_type:
-                            quality["video_scan_type"] = ffprobe_scan_type
-                            quality["video_scan_type_source"] = "ffprobe"
-
-                    quality["quality_known"] = bool(
-                        quality.get("video_fps")
-                        or (
-                            quality.get("video_width")
-                            and quality.get("video_height")
-                        )
-                        or quality.get("video_bitrate_bps")
-                    )
-
-                    quality["quality_source"] = (
-                        "manifest+ffprobe"
-                        if manifest_quality
-                        else "ffprobe"
+                    quality = source_quality.merge_ffprobe_quality_evidence(
+                        quality,
+                        ffprobe_quality,
+                        include_scan_type=(
+                            quality.get("stream_type") == "HLS"
+                        ),
+                        include_sample_in_quality_source=False,
+                        default_bitrate_source="",
                     )
                     break
 
@@ -11019,6 +8746,11 @@ def _probe_nm3u8dl_candidate_quality(
                 effective_headers,
                 scan_type_cache=scan_type_cache,
                 timeout_route=probe_timeout_route,
+                effective_stream_url=str(
+                    quality.get("selected_media_final_url")
+                    or quality.get("manifest_final_url")
+                    or ""
+                ).strip(),
                 decryption_key=idet_key,
             )
             if idet_scan_type:
@@ -11048,6 +8780,7 @@ def _probe_nm3u8dl_candidate_quality(
     if (
         quality["drm_key_missing"]
         or quality.get("drm_inspection_failure")
+        or quality.get("hls_variant_probe_failure")
     ):
         quality["launchable"] = False
 
@@ -11068,34 +8801,19 @@ def _probe_nm3u8dl_candidate_quality(
 
 
 def _get_nm3u8dl_candidate_probe_identity(candidate: dict) -> tuple:
-    """Return the exact request identity used to share one quality probe."""
-    stream_url = str(candidate.get("stream_url") or "").strip()
-
+    """Use the shared effective-stream quality-probe identity."""
     try:
         identity_headers = get_nm3u8dl_effective_headers(
             candidate.get("headers") or {},
             emit_logs=False,
         )
     except Exception:
-        # If header preparation itself is broken, identical raw request inputs
-        # should still share the same failing probe result.
         identity_headers = dict(candidate.get("headers") or {})
 
-    normalized_headers = tuple(sorted(
-        (
-            str(name or "").strip().casefold(),
-            str(value),
-        )
-        for name, value in identity_headers.items()
-        if str(name or "").strip() and value is not None
-    ))
-
-    # DRM probing is intentionally different for candidates that already
-    # supply decryption keys. Do not share one probe result across keyed and
-    # unkeyed candidates for the same URL/header identity.
-    has_decryption_keys = bool(candidate.get("keys") or [])
-
-    return stream_url, normalized_headers, has_decryption_keys
+    return source_quality.quality_probe_identity(
+        SourceCandidate.from_mapping(candidate),
+        effective_headers=identity_headers,
+    )
 
 
 def enrich_nm3u8dl_candidate_qualities(
@@ -11103,6 +8821,7 @@ def enrich_nm3u8dl_candidate_qualities(
     *,
     stop_requested: Optional[Callable[[], bool]] = None,
     show_progress: bool = True,
+    excluded_literal_ips: Optional[set] = None,
 ) -> bool:
     if not candidates:
         return True
@@ -11119,17 +8838,6 @@ def enrich_nm3u8dl_candidate_qualities(
             total_candidates,
         )
 
-    probe_groups = {}
-
-    for candidate in candidates:
-        probe_identity = _get_nm3u8dl_candidate_probe_identity(candidate)
-        probe_groups.setdefault(probe_identity, []).append(candidate)
-
-    worker_count = min(
-        max(1, int(NM3U8DL_QUALITY_PROBE_WORKERS)),
-        len(probe_groups),
-    )
-
     # One scan-local cache lets duplicate playlist routes share one P/I result
     # when their provider-neutral effective stream identity is the same.
     scan_type_cache = {
@@ -11138,119 +8846,120 @@ def enrich_nm3u8dl_candidate_qualities(
         "results": {},
     }
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {}
+    def representative(grouped_candidates: Sequence[dict]) -> dict:
+        return grouped_candidates[0]
 
-        for grouped_candidates in probe_groups.values():
-            representative = grouped_candidates[0]
-            future = executor.submit(
-                _probe_nm3u8dl_candidate_quality,
-                representative,
-                stop_requested=stop_requested,
-                scan_type_cache=scan_type_cache,
-                timeout_playlist_urls=[
-                    str(candidate.get("playlist_url") or "").strip()
-                    for candidate in grouped_candidates
-                    if str(candidate.get("playlist_url") or "").strip()
-                ],
+    def probe_group(
+        representative_candidate: dict,
+        grouped_candidates: Sequence[dict],
+    ) -> dict:
+        return _probe_nm3u8dl_candidate_quality(
+            representative_candidate,
+            stop_requested=stop_requested,
+            scan_type_cache=scan_type_cache,
+            timeout_playlist_urls=[
+                str(candidate.get("playlist_url") or "").strip()
+                for candidate in grouped_candidates
+                if str(candidate.get("playlist_url") or "").strip()
+            ],
+            excluded_literal_ips=excluded_literal_ips,
+        )
+
+    def failure_result(representative_candidate: dict, error: BaseException) -> dict:
+        return {
+            "quality_known": False,
+            "quality_source": "",
+            "video_fps": 0.0,
+            "video_width": 0,
+            "video_height": 0,
+            "video_scan_type": "",
+            "video_scan_type_source": "",
+            "video_bitrate_bps": 0,
+            "video_bitrate_source": "",
+            "manifest_expiry": None,
+            "resource_expiry": None,
+            "manifest_final_url": "",
+            "selected_media_final_url": "",
+            "resource_probe_failure": "",
+            "manifest_reachable": False,
+            "ffprobe_reachable": False,
+            "launchable": False,
+            "drm_protected": False,
+            "drm_key_required": False,
+            "drm_key_missing": False,
+            "drm_detail": "",
+            "drm_inspection_failure": "",
+            "access_blocked": False,
+            "access_block_kind": "",
+            "access_block_http_status": None,
+            "geo_country": None,
+            "stream_type": _get_nm3u8dl_stream_type_from_url(
+                representative_candidate.get("stream_url") or ""
+            ),
+            "header_preparation_failure": "",
+            "manifest_probe_failure": "",
+            "ffprobe_probe_failure": (
+                f"quality probe failed ({type(error).__name__})"
+            ),
+            "quality_probe_error": (
+                f"quality probe failed ({type(error).__name__})"
+            ),
+            "effective_headers": dict(
+                representative_candidate.get("headers") or {}
+            ),
+            "probe_duration_sec": None,
+        }
+
+    def apply_result(candidate: dict, quality: dict) -> dict:
+        candidate_quality = dict(quality)
+
+        if isinstance(quality.get("effective_headers"), dict):
+            candidate_quality["effective_headers"] = dict(
+                quality["effective_headers"]
             )
-            future_map[future] = grouped_candidates
 
-        completed_candidates = 0
+        url_header_expiry = candidate.get("url_header_expiry")
+        candidate.update(candidate_quality)
 
-        for future in as_completed(future_map):
-            if stop_requested is not None and stop_requested():
-                break
+        if candidate.get("unsupported_drm"):
+            # Keep all probe evidence (quality, redirect, expiry), but never
+            # promote a DRM mode the recorder cannot decrypt into selection.
+            candidate["launchable"] = False
 
-            grouped_candidates = future_map[future]
-            representative = grouped_candidates[0]
+        manifest_expiry = candidate.get("manifest_expiry")
+        resource_expiry = candidate.get("resource_expiry")
+        candidate["expiry"] = _merge_nm3u8dl_auth_expiries(
+            url_header_expiry,
+            manifest_expiry,
+            resource_expiry,
+        )
+        candidate["expiry_source"] = get_nm3u8dl_expiry_source(
+            url_header_expiry,
+            manifest_expiry,
+            resource_expiry,
+        )
+        return candidate
 
-            try:
-                quality = future.result()
-            except Exception as error:
-                quality = {
-                    "quality_known": False,
-                    "quality_source": "",
-                    "video_fps": 0.0,
-                    "video_width": 0,
-                    "video_height": 0,
-                    "video_scan_type": "",
-                    "video_scan_type_source": "",
-                    "video_bitrate_bps": 0,
-                    "video_bitrate_source": "",
-                    "manifest_expiry": None,
-                    "resource_expiry": None,
-                    "manifest_final_url": "",
-                    "selected_media_final_url": "",
-                    "resource_probe_failure": "",
-                    "manifest_reachable": False,
-                    "ffprobe_reachable": False,
-                    "launchable": False,
-                    "drm_protected": False,
-                    "drm_key_required": False,
-                    "drm_key_missing": False,
-                    "drm_detail": "",
-                    "drm_inspection_failure": "",
-                    "access_blocked": False,
-                    "access_block_kind": "",
-                    "access_block_http_status": None,
-                    "geo_country": None,
-                    "stream_type": _get_nm3u8dl_stream_type_from_url(
-                        representative.get("stream_url") or ""
-                    ),
-                    "header_preparation_failure": "",
-                    "manifest_probe_failure": "",
-                    "ffprobe_probe_failure": (
-                        f"quality probe failed ({type(error).__name__})"
-                    ),
-                    "quality_probe_error": (
-                        f"quality probe failed ({type(error).__name__})"
-                    ),
-                    "effective_headers": dict(
-                        representative.get("headers") or {}
-                    ),
-                    "probe_duration_sec": None,
-                }
+    progress_callback = None
+    if show_progress:
+        def progress_callback(completed_candidates: int, total: int):
+            render_dynamic_playlist_progress(
+                "checking matched candidates",
+                completed_candidates,
+                total,
+            )
 
-            for candidate in grouped_candidates:
-                candidate_quality = dict(quality)
-
-                if isinstance(quality.get("effective_headers"), dict):
-                    candidate_quality["effective_headers"] = dict(
-                        quality["effective_headers"]
-                    )
-
-                url_header_expiry = candidate.get("url_header_expiry")
-
-                candidate.update(candidate_quality)
-
-                if candidate.get("unsupported_drm"):
-                    # Keep all probe evidence (quality, redirect, expiry), but never
-                    # promote a DRM mode the recorder cannot decrypt into selection.
-                    candidate["launchable"] = False
-
-                manifest_expiry = candidate.get("manifest_expiry")
-                resource_expiry = candidate.get("resource_expiry")
-
-                candidate["expiry"] = _merge_nm3u8dl_auth_expiries(
-                    url_header_expiry,
-                    manifest_expiry,
-                    resource_expiry,
-                )
-                candidate["expiry_source"] = get_nm3u8dl_expiry_source(
-                    url_header_expiry,
-                    manifest_expiry,
-                    resource_expiry,
-                )
-
-            completed_candidates += len(grouped_candidates)
-
-            if show_progress:
-                render_dynamic_playlist_progress(
-                    "checking matched candidates",
-                    completed_candidates,
-                    total_candidates,
-                )
+    source_quality.run_grouped_quality_probes(
+        candidates,
+        group_key=_get_nm3u8dl_candidate_probe_identity,
+        representative=representative,
+        probe=probe_group,
+        apply_result=apply_result,
+        failure_result=failure_result,
+        max_workers=NM3U8DL_QUALITY_PROBE_WORKERS,
+        progress_callback=progress_callback,
+        stop_requested=stop_requested,
+    )
 
     if stop_requested is not None and stop_requested():
         if show_progress:
@@ -11354,6 +9063,8 @@ def _make_nm3u8dl_candidate_display_row(candidate: dict) -> dict:
         "drm_key_missing",
         "drm_detail",
         "drm_inspection_failure",
+        "hls_variant_probe_status",
+        "hls_variant_probe_failure",
         "access_blocked",
         "access_block_kind",
         "access_block_http_status",
@@ -11457,14 +9168,7 @@ def _nm3u8dl_candidate_identity(candidate: dict) -> str:
 def _nm3u8dl_same_candidate(left: Optional[dict], right: Optional[dict]) -> bool:
     if not left or not right:
         return False
-
-    return (
-        str(left.get("playlist_url") or "")
-        == str(right.get("playlist_url") or "")
-        and int(left.get("matching_entry_index") or 0)
-        == int(right.get("matching_entry_index") or 0)
-        and int(left.get("matching_entry_index") or 0) > 0
-    )
+    return source_selection.same_selection_candidate(left, right)
 
 
 def _nm3u8dl_candidate_status(
@@ -11533,6 +9237,17 @@ def _nm3u8dl_candidate_display_classification(
     if str(candidate.get("drm_inspection_failure") or "").strip():
         return "DRM CHECK FAILED"
 
+    hls_variant_status = str(
+        candidate.get("hls_variant_probe_status") or ""
+    ).strip()
+    if hls_variant_status:
+        return {
+            "hls_variant_unavailable": "HLS VARIANT UNAVAILABLE",
+            "hls_variant_access_failed": "HLS VARIANT ACCESS FAILED",
+            "hls_variant_invalid": "HLS VARIANT INVALID",
+            "hls_variant_check_failed": "HLS VARIANT CHECK FAILED",
+        }.get(hls_variant_status, "HLS VARIANT CHECK FAILED")
+
     return ""
 
 
@@ -11542,84 +9257,12 @@ def _nm3u8dl_nonselection_reason(
     *,
     now_ts: float,
 ) -> str:
-    if not selected_candidate or not candidate.get("launchable", False):
-        return ""
-
-    if _nm3u8dl_same_candidate(candidate, selected_candidate):
-        return ""
-
-    min_remaining_sec = int(
-        NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN * 60
+    return source_selection.selection_nonselection_reason(
+        candidate,
+        selected_candidate,
+        _get_nm3u8dl_selection_policy(),
+        now_ts=now_ts,
     )
-
-    def stable_for_join(item: dict) -> bool:
-        expiry = item.get("expiry")
-        return (
-            expiry is None
-            or float(expiry) - float(now_ts) >= min_remaining_sec
-        )
-
-    if stable_for_join(selected_candidate) and not stable_for_join(candidate):
-        return (
-            "not selected: less than "
-            f"{int(NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN)} min remaining"
-        )
-
-    candidate_preferred = int(
-        candidate.get("preferred_qualifier_score") or 0
-    )
-    selected_preferred = int(
-        selected_candidate.get("preferred_qualifier_score") or 0
-    )
-
-    if candidate_preferred < selected_preferred:
-        return "not selected: less preferred match"
-
-    candidate_video_rank = _nm3u8dl_video_quality_rank(candidate)
-    selected_video_rank = _nm3u8dl_video_quality_rank(selected_candidate)
-
-    if candidate_video_rank < selected_video_rank:
-        if (
-            candidate_video_rank[:-1] == selected_video_rank[:-1]
-            and candidate_video_rank[-1] <= 0
-            and selected_video_rank[-1] > 0
-        ):
-            return "not selected: bitrate unknown"
-        return "not selected: lower quality"
-
-    candidate_expiry = candidate.get("expiry")
-    selected_expiry = selected_candidate.get("expiry")
-
-    if candidate_video_rank == selected_video_rank:
-        prefer_unknown_expiry = bool(
-            get_nm3u8dl_playlist_profile().get(
-                "prefer_unknown_expiry_on_equal_quality",
-                False,
-            )
-        )
-
-        if (
-            candidate_expiry is not None
-            and selected_expiry is not None
-            and float(candidate_expiry) < float(selected_expiry)
-        ):
-            return "not selected: expires sooner"
-
-        if candidate_expiry is None and selected_expiry is not None:
-            if not prefer_unknown_expiry:
-                return "not selected: expiry unknown"
-
-        if candidate_expiry is not None and selected_expiry is None:
-            if prefer_unknown_expiry:
-                return (
-                    "not selected: equal quality; "
-                    "unknown-expiry source preferred"
-                )
-
-        return "not selected: equivalent alternative"
-
-    return "not selected: another candidate ranked higher"
-
 
 def _nm3u8dl_not_working_reason(candidate: dict) -> str:
     unsupported_drm = str(
@@ -11641,6 +9284,20 @@ def _nm3u8dl_not_working_reason(candidate: dict) -> str:
 
     if drm_inspection_failure:
         return f"DRM CHECK FAILED — {drm_inspection_failure}"
+
+    hls_variant_failure = str(
+        candidate.get("hls_variant_probe_failure") or ""
+    ).strip()
+    if hls_variant_failure:
+        classification = _nm3u8dl_candidate_display_classification(
+            candidate,
+            status="NOT WORKING",
+        )
+        return (
+            f"{classification} — {hls_variant_failure}"
+            if classification
+            else hls_variant_failure
+        )
 
     header_reason = str(
         candidate.get("header_preparation_failure") or ""
@@ -11836,6 +9493,171 @@ def _format_nm3u8dl_candidate_display_details(
     return text
 
 
+def _identity_runtime_candidates(
+    *,
+    selected_candidate: Optional[dict],
+    candidates: Optional[List[dict]] = None,
+    history_scan: Optional[dict] = None,
+    source_results: Optional[List[dict]] = None,
+) -> List[dict]:
+    """Build sanitized worker-owned candidate decisions for Coordinator display."""
+    raw_candidates: List[dict] = []
+
+    if candidates:
+        raw_candidates.extend(dict(item) for item in candidates if isinstance(item, dict))
+
+    if not raw_candidates and isinstance(history_scan, dict):
+        raw_candidates.extend(
+            dict(item)
+            for item in (history_scan.get("candidates") or [])
+            if isinstance(item, dict)
+        )
+
+    if not raw_candidates:
+        for result in source_results or []:
+            if not isinstance(result, dict):
+                continue
+            raw_candidates.extend(
+                dict(item)
+                for item in (result.get("candidate_rows") or [])
+                if isinstance(item, dict)
+            )
+
+    if not raw_candidates and selected_candidate:
+        raw_candidates.append(dict(selected_candidate))
+
+    now_ts = time.time()
+    result_rows: List[dict] = []
+    seen = set()
+
+    for candidate in raw_candidates:
+        row_key = (
+            str(candidate.get("playlist_url") or ""),
+            int(candidate.get("matching_entry_index") or 0),
+            str(candidate.get("stream_url") or ""),
+            str(candidate.get("entry_title") or ""),
+            str(candidate.get("tvg_name") or ""),
+            str(candidate.get("group_title") or ""),
+        )
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+
+        status = _nm3u8dl_candidate_status(
+            candidate,
+            selected_candidate=selected_candidate,
+            now_ts=now_ts,
+        )
+        classification = _nm3u8dl_candidate_display_classification(
+            candidate,
+            status=status,
+        )
+        selection_reason = ""
+        if status == "WORKING":
+            selection_reason = _nm3u8dl_nonselection_reason(
+                candidate,
+                selected_candidate,
+                now_ts=now_ts,
+            )
+        elif status not in ("SELECTED",):
+            selection_reason = _format_nm3u8dl_candidate_display_details(
+                candidate,
+                status=status,
+                selected_candidate=selected_candidate,
+                now_ts=now_ts,
+                include_classification=False,
+            )
+
+        result_rows.append({
+            "playlist_url": str(candidate.get("playlist_url") or ""),
+            "matching_entry_index": int(candidate.get("matching_entry_index") or 0),
+            "stream_url": str(candidate.get("stream_url") or ""),
+            "entry_title": str(candidate.get("entry_title") or ""),
+            "tvg_name": str(candidate.get("tvg_name") or ""),
+            "group_title": str(candidate.get("group_title") or ""),
+            "status": status,
+            "classification": classification,
+            "selected": bool(
+                selected_candidate
+                and _nm3u8dl_same_candidate(candidate, selected_candidate)
+            ),
+            "selection_reason": selection_reason,
+            "quality": (
+                format_nm3u8dl_candidate_quality(candidate)
+                if _nm3u8dl_has_quality_evidence(candidate)
+                else "unknown"
+            ),
+            "video_width": int(candidate.get("video_width") or 0),
+            "video_height": int(candidate.get("video_height") or 0),
+            "video_fps": float(candidate.get("video_fps") or 0.0),
+            "video_scan_type": str(candidate.get("video_scan_type") or ""),
+            "video_resolution_source": str(candidate.get("video_resolution_source") or ""),
+            "video_fps_source": str(candidate.get("video_fps_source") or ""),
+            "video_scan_type_source": str(candidate.get("video_scan_type_source") or ""),
+            "video_bitrate_bps": int(candidate.get("video_bitrate_bps") or 0),
+            "video_bitrate_source": str(candidate.get("video_bitrate_source") or ""),
+            "expiry": candidate.get("expiry"),
+            "expiry_source": str(candidate.get("expiry_source") or ""),
+            "launchable": bool(candidate.get("launchable", False)),
+        })
+
+    return result_rows
+
+
+def _publish_identity_runtime_status(
+    state: RecorderState,
+    worker_state: str,
+    *,
+    selected_candidate: Optional[dict] = None,
+    candidates: Optional[List[dict]] = None,
+    history_scan: Optional[dict] = None,
+    source_results: Optional[List[dict]] = None,
+    reason: str = "",
+) -> None:
+    callback = getattr(state, "identity_status_callback", None)
+    request = getattr(state, "identity_launch_request", None)
+    if callback is None or request is None:
+        return
+
+    rows = _identity_runtime_candidates(
+        selected_candidate=selected_candidate,
+        candidates=candidates,
+        history_scan=history_scan,
+        source_results=source_results,
+    )
+    selected_row = next(
+        (dict(row) for row in rows if row.get("selected")),
+        None,
+    )
+    source_count = len({
+        str(row.get("playlist_url") or "")
+        for row in rows
+        if str(row.get("playlist_url") or "")
+    })
+
+    try:
+        callback({
+            "worker_state": str(worker_state or "").strip().upper(),
+            "current_candidate": (
+                selected_row
+                if str(worker_state or "").strip().upper()
+                in {"SELECTED", "RECORDING"}
+                else None
+            ),
+            "candidates": rows,
+            "target_names": [target.name for target in request.target_intents],
+            "source_count": source_count,
+            "recording_started_at": state.stats.get("process_start"),
+            "reason": str(reason or ""),
+        })
+    except Exception as error:
+        log(
+            "Identity runtime status publish failed; recording continues "
+            f"({type(error).__name__}: {error})",
+            level="WARN",
+        )
+
+
 def get_nm3u8dl_access_block_playlist_urls(
     source_results: List[dict]
 ) -> List[str]:
@@ -12019,6 +9841,16 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
         "nm3u8dl_bad_stream_fingerprints",
         {},
     ) or {}
+    bad_routes = getattr(
+        state,
+        "nm3u8dl_bad_stream_routes",
+        {},
+    ) or {}
+    bad_literal_ips = getattr(
+        state,
+        "nm3u8dl_bad_stream_ips",
+        {},
+    ) or {}
     probations = getattr(
         state,
         "nm3u8dl_failover_probations",
@@ -12026,12 +9858,21 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
     ) or {}
 
     excluded_count = len(bad_fingerprints)
+    route_count = len(bad_routes)
+    literal_ip_count = len(bad_literal_ips)
     probation_count = len(probations)
 
-    if excluded_count <= 0 and probation_count <= 0:
+    if (
+        excluded_count <= 0
+        and route_count <= 0
+        and literal_ip_count <= 0
+        and probation_count <= 0
+    ):
         return False
 
     bad_fingerprints.clear()
+    bad_routes.clear()
+    bad_literal_ips.clear()
     probations.clear()
     state.nm3u8dl_failover_retry_source = None
     state.nm3u8dl_failover_waiting_for_alternative = False
@@ -12047,7 +9888,9 @@ def _nm3u8dl_reset_failover_for_access_environment_change(
 
     log(
         "Access/VPN environment change confirmed → stream-failover state reset; "
-        f"{excluded_count} excluded fingerprint(s) and "
+        f"{excluded_count} excluded fingerprint(s), "
+        f"{route_count} redirector quarantine(s), "
+        f"{literal_ip_count} literal-IP quarantine(s), and "
         f"{probation_count} one-failure probation(s) cleared. "
         "Previously excluded streams are eligible for fresh evaluation.",
         level="WARN",
@@ -12076,6 +9919,8 @@ def _nm3u8dl_confirm_access_change_and_reset_failover(
         and previous_snapshot
         and (
             getattr(state, "nm3u8dl_bad_stream_fingerprints", {})
+            or getattr(state, "nm3u8dl_bad_stream_routes", {})
+            or getattr(state, "nm3u8dl_bad_stream_ips", {})
             or getattr(state, "nm3u8dl_failover_probations", {})
         )
     ):
@@ -12680,10 +10525,33 @@ def log_nm3u8dl_playlist_scan_results(
         if candidate_row.get("failover_excluded", False)
     ]
     if excluded_rows:
+        def excluded_identity(candidate_row: dict) -> str:
+            route_fingerprint = str(
+                candidate_row.get("stream_route_fingerprint") or ""
+            ).strip()
+            stream_fingerprint = str(
+                candidate_row.get("stream_fingerprint") or ""
+            ).strip()
+            reason = str(
+                candidate_row.get("failover_exclusion_reason") or ""
+            ).strip()
+
+            if (
+                reason.startswith("redirecting source repeatedly failed")
+                and route_fingerprint
+            ):
+                return "route:" + route_fingerprint
+            if stream_fingerprint:
+                return "stream:" + stream_fingerprint
+            if route_fingerprint:
+                return "route:" + route_fingerprint
+            return ""
+
         excluded_fingerprints = {
-            str(candidate_row.get("stream_fingerprint") or "").strip()
+            identity
             for candidate_row in excluded_rows
-            if str(candidate_row.get("stream_fingerprint") or "").strip()
+            for identity in (excluded_identity(candidate_row),)
+            if identity
         }
         excluded_unique = len(excluded_fingerprints)
         excluded_entries = len(excluded_rows)
@@ -13393,6 +11261,8 @@ def _playlist_history_candidate_json(
         "manifest_probe_failure": candidate.get("manifest_probe_failure") or "",
         "resource_probe_failure": candidate.get("resource_probe_failure") or "",
         "ffprobe_probe_failure": candidate.get("ffprobe_probe_failure") or "",
+        "hls_variant_probe_status": candidate.get("hls_variant_probe_status") or "",
+        "hls_variant_probe_failure": candidate.get("hls_variant_probe_failure") or "",
         "quality_probe_error": candidate.get("quality_probe_error") or "",
         "preferred_qualifier_score": int(
             candidate.get("preferred_qualifier_score") or 0
@@ -13654,8 +11524,7 @@ def record_playlist_history_scan(
 def _playlist_history_master_paths(state: RecorderState):
     start_ts = float(state.playlist_history_started_ts or state.start_time)
     month_key = datetime.fromtimestamp(start_ts).strftime("%Y-%m")
-    root_dir = os.path.abspath(os.path.dirname(FINAL_FILE) or os.curdir)
-    history_dir = os.path.join(root_dir, "playlist_history")
+    history_dir = PLAYLIST_HISTORY_DIR
     base = f"playlist_history_{state.playlist_history_machine}_{month_key}"
     return (
         history_dir,
@@ -13867,6 +11736,51 @@ def finalize_playlist_history(state: RecorderState) -> bool:
     return True
 
 
+def _identity_worker_match_definitions(
+    state: Optional[RecorderState],
+    *,
+    playlist_url: Optional[str] = None,
+) -> Optional[tuple]:
+    request = getattr(state, "identity_launch_request", None)
+    if request is None:
+        return None
+
+    contexts = target_match_contexts_for_recovery_playlist(
+        request.target_intents,
+        playlist_url or "",
+    )
+    default_mode = get_nm3u8dl_playlist_match_mode()
+    return tuple(
+        source_matching.make_match_definition(
+            mode=match_mode or default_mode,
+            primary=intent.primary,
+            required=intent.required,
+            rejected=intent.rejected,
+            preferred=intent.preferred,
+            match_all=intent.match_all,
+        )
+        for intent, match_mode in contexts
+    )
+
+
+def _identity_worker_candidate_matches(
+    state: Optional[RecorderState],
+    candidate: dict,
+) -> bool:
+    identity_key = str(
+        getattr(state, "identity_feed_key", None) or ""
+    ).strip()
+    request = getattr(state, "identity_launch_request", None)
+    if not identity_key or request is None:
+        return True
+
+    identity = derive_feed_identity(
+        SourceCandidate.from_mapping(candidate),
+        request.provider,
+    )
+    return identity.serialized == identity_key
+
+
 def resolve_nm3u8dl_playlist_source(
     *,
     include_candidate_pool: bool = False,
@@ -13895,6 +11809,15 @@ def resolve_nm3u8dl_playlist_source(
     allow_unknown_expiry = bool(
         profile.get("allow_unknown_expiry", False)
     )
+
+    if (
+        playlist_urls_override is None
+        and state is not None
+        and state.identity_launch_request is not None
+    ):
+        playlist_urls_override = list(
+            state.identity_launch_request.recovery_playlist_urls
+        )
 
     if playlist_urls_override is None:
         playlist_urls = get_nm3u8dl_playlist_urls()
@@ -14124,8 +12047,15 @@ def resolve_nm3u8dl_playlist_source(
 
                 continue
 
+            worker_match_definitions = _identity_worker_match_definitions(
+                state,
+                playlist_url=playlist_url,
+            )
+            if worker_match_definitions == ():
+                continue
             entries = find_nm3u8dl_playlist_entries(
-                playlist_text
+                playlist_text,
+                match_definitions=worker_match_definitions,
             )
 
             playlist_candidates = []
@@ -14437,17 +12367,37 @@ def resolve_nm3u8dl_playlist_source(
     # bad stream or has become a new eligible fingerprint.
     failover_fingerprint_check_active = bool(
         state is not None
-        and getattr(state, "nm3u8dl_bad_stream_fingerprints", {})
+        and (
+            getattr(state, "nm3u8dl_bad_stream_fingerprints", {})
+            or getattr(state, "nm3u8dl_bad_stream_ips", {})
+        )
     )
-    probe_candidates = [
-        candidate
-        for candidate in candidates
+    quarantined_routes = (
+        getattr(state, "nm3u8dl_bad_stream_routes", {})
+        if state is not None
+        else {}
+    ) or {}
+
+    probe_candidates = []
+    for candidate in candidates:
+        route_fingerprint = get_nm3u8dl_stream_route_fingerprint(candidate)
+        if (
+            route_fingerprint
+            and route_fingerprint in quarantined_routes
+        ):
+            candidate["stream_route_fingerprint"] = route_fingerprint
+            candidate["failover_excluded"] = True
+            candidate["failover_exclusion_reason"] = (
+                "redirecting source repeatedly failed across changing playback sessions"
+            )
+            continue
+
         if (
             failover_fingerprint_check_active
             or candidate.get("expiry") is None
             or candidate["expiry"] > selection_now
-        )
-    ]
+        ):
+            probe_candidates.append(candidate)
 
     if show_progress:
         finish_dynamic_playlist_progress(
@@ -14460,10 +12410,24 @@ def resolve_nm3u8dl_playlist_source(
         probe_candidates,
         stop_requested=scan_stop_requested,
         show_progress=show_progress,
+        excluded_literal_ips=set(
+            (
+                getattr(state, "nm3u8dl_bad_stream_ips", {})
+                if state is not None
+                else {}
+            ) or {}
+        ),
     )
 
     if not candidate_scan_completed:
         raise RuntimeError("Playlist scan cancelled by stop request")
+
+    if state is not None and state.identity_feed_key:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if _identity_worker_candidate_matches(state, candidate)
+        ]
 
     selection_now = time.time()
 
@@ -14476,7 +12440,7 @@ def resolve_nm3u8dl_playlist_source(
 
     _nm3u8dl_mark_bad_fingerprint_candidates(
         state,
-        probe_candidates,
+        candidates,
     )
 
     authorization_candidates = [
@@ -15101,7 +13065,35 @@ def resolve_nm3u8dl_launch_source(
             set_terminal_activity_context(None)
             return None
 
-        if direct_retry_source is not None:
+        if state.identity_initial_source is not None:
+            set_terminal_activity_context(
+                new_terminal_activity("coordinator_selected_startup_source")
+            )
+            source = dict(state.identity_initial_source)
+            state.identity_initial_source = None
+            retained_source_label = "Coordinator-selected startup source"
+            log(
+                "Using Coordinator-selected startup source; "
+                "no new playlist scan."
+            )
+            log(
+                f"Coordinator source        : "
+                f"{source.get('playlist_url') or 'unknown'}"
+            )
+            fingerprint = str(
+                source.get("stream_fingerprint")
+                or get_nm3u8dl_stream_fingerprint(source)
+                or ""
+            ).strip()
+            if fingerprint:
+                source["stream_fingerprint"] = fingerprint
+            _nm3u8dl_set_running_stream_identity(state, source)
+            state.nm3u8dl_renewal_rollover_requested = False
+            state.nm3u8dl_rollover_reason = None
+            set_terminal_activity_context(None)
+            return source
+
+        elif direct_retry_source is not None:
             set_terminal_activity_context(
                 new_terminal_activity("stream_failover_direct_retry")
             )
@@ -15271,6 +13263,14 @@ def resolve_nm3u8dl_launch_source(
                     error,
                     "source_results",
                     [],
+                )
+                _publish_identity_runtime_status(
+                    state,
+                    "WAITING_FOR_SOURCE",
+                    selected_candidate=None,
+                    history_scan=getattr(error, "history_scan", None),
+                    source_results=source_results,
+                    reason=str(error),
                 )
                 source_errors = getattr(
                     error,
@@ -15726,15 +13726,16 @@ def resolve_nm3u8dl_launch_source(
             #        f"{int(profile.get('quality_upgrade_min_remaining_min', 15))} "
             #        f"minutes when expiry is known"
             #    )
-            event_quality_cutoff_reached = (
-                get_nm3u8dl_playlist_lifecycle() == "EVENT"
-                and _nm3u8dl_video_resolution_class(source) >= 1080
-                and running_motion_fps >= quality_upgrade_target_fps
+            quality_upgrade_cutoff_reached = (
+                _nm3u8dl_quality_upgrade_cutoff_reached(
+                    source,
+                    profile,
+                )
             )
 
             if (
                 quality_upgrade_profile_enabled
-                and not event_quality_cutoff_reached
+                and not quality_upgrade_cutoff_reached
             ):
                 log(
                     f"Quality upgrade check  : every "
@@ -15753,11 +13754,11 @@ def resolve_nm3u8dl_launch_source(
 
             elif (
                 quality_upgrade_profile_enabled
-                and event_quality_cutoff_reached
+                and quality_upgrade_cutoff_reached
             ):
                 log(
                     f"Quality upgrade check   : disabled "
-                    f"(event already at "
+                    f"(already at configured ceiling: "
                     f"{int(source.get('video_width') or 0)}x"
                     f"{int(source.get('video_height') or 0)} "
                     f"{running_motion_fps:g} fps)"
@@ -16034,6 +14035,16 @@ def get_nm3u8dl_part_a(
     if source is None:
         return None
 
+    _publish_identity_runtime_status(
+        state,
+        "SELECTED",
+        selected_candidate=source,
+        candidates=source.get("_candidate_pool"),
+        history_scan=source.get("_history_scan"),
+        source_results=source.get("source_results"),
+        reason="source selected for recorder launch",
+    )
+
     headers = get_nm3u8dl_effective_headers(
         source["headers"],
         emit_logs=True,
@@ -16049,9 +14060,13 @@ def get_nm3u8dl_part_a(
         headers,
     )
 
+    launch_stream_url = get_nm3u8dl_launch_stream_url(source)
+    if not launch_stream_url:
+        raise RuntimeError("Selected source has no launchable stream URL")
+
     parts = [
         "N_m3u8DL-RE",
-        f'"{source["stream_url"]}"',
+        f'"{launch_stream_url}"',
     ]
 
     for name, value in headers.items():
@@ -16480,18 +14495,19 @@ def monitor_nm3u8dl_playlist_renewal(
     # full quality rank.
     # quality_upgrade_enabled = quality_upgrade_profile_enabled
     
-    # EVENT quality cutoff:
-    # keep looking until 1080p50 is reached, then stop quality-upgrade scans.
-    # LINEAR_TV keeps its existing behavior unchanged.
-    event_quality_cutoff_reached = (
-        get_nm3u8dl_playlist_lifecycle() == "EVENT"
-        and _nm3u8dl_video_resolution_class(running_source) >= 1080
-        and running_motion_fps >= quality_upgrade_target_fps
+    # Event streams and explicitly configured linear-TV groups can define
+    # 1080p50 as the useful ceiling. Once reached, do not spend periodic scans
+    # looking for a quality level the recorder will never prefer.
+    quality_upgrade_cutoff_reached = (
+        _nm3u8dl_quality_upgrade_cutoff_reached(
+            running_source,
+            profile,
+        )
     )
 
     quality_upgrade_enabled = (
         quality_upgrade_profile_enabled
-        and not event_quality_cutoff_reached
+        and not quality_upgrade_cutoff_reached
     )
 
     target_quality_recovery_attempt = (
@@ -18671,6 +16687,7 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                errors="replace",
                 bufsize=1,
                 cwd=CHUNKS_DIR,
                 env=popen_env
@@ -18917,6 +16934,28 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 },
             )
 
+
+        _publish_identity_runtime_status(
+            state,
+            "RECORDING",
+            selected_candidate=state.nm3u8dl_running_source,
+            candidates=(
+                state.nm3u8dl_running_source.get("_candidate_pool")
+                if state.nm3u8dl_running_source
+                else None
+            ),
+            history_scan=(
+                state.nm3u8dl_running_source.get("_history_scan")
+                if state.nm3u8dl_running_source
+                else None
+            ),
+            source_results=(
+                state.nm3u8dl_running_source.get("source_results")
+                if state.nm3u8dl_running_source
+                else None
+            ),
+            reason="recorder output file appeared",
+        )
 
         # Start nm3u8dl file growth monitoring thread (events only)
         state.nm3u8dl_event_queue = queue.SimpleQueue()
@@ -19453,6 +17492,7 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         log_good_beep("recording_end_ok")
         beep_good(state)
         log(f"Max duration reached {format_current_duration_for_log(state)} → stopping loop.")
+        state.normal_terminal_reason = "duration_reached"
         state.stop_flag = True
         #return backoff_sec # # DO NOT return yet — we still want to accept the last chunk and write concat_list.txt
 
@@ -19491,6 +17531,7 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
             "N_m3u8DL explicit live-end confirmed → "
             "stopping overall recorder after final chunk."
         )
+        state.normal_terminal_reason = "live_stream_ended"
         state.stop_flag = True
 
     if (
@@ -19822,10 +17863,14 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
 
 def write_summary_log(state, dur, finalized=True):
     """
-    Write summary log next to FINAL_FILE.
+    Write the persistent recording log under recorder_logs/recording_logs.
     """
     try:
-        summary_path = os.path.splitext(FINAL_FILE)[0] + "_log.log"
+        os.makedirs(RECORDING_LOGS_DIR, exist_ok=True)
+        summary_path = os.path.join(
+            RECORDING_LOGS_DIR,
+            os.path.basename(os.path.splitext(FINAL_FILE)[0] + "_log.log"),
+        )
         total_runtime = 0.0
         if state.stats["process_start"] and state.stats["process_end"]:
             total_runtime = state.stats["process_end"] - state.stats["process_start"]
@@ -20121,14 +18166,21 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
     Format: "YYYY-MM-DD HH:MM" in local time.
     """
     if not SCHEDULE_START:
-        # Manual start (no scheduling)
+        # Manual start (no scheduling). Capture the session start once here so
+        # the live header, runtime state, Coordinator, and final summary agree.
         mode = "manual"
-        now = datetime.now()
+        state.start_time = time.time()
+        state.stats["process_start"] = state.start_time
+        now = datetime.fromtimestamp(state.start_time)
         if RUN_DURATION_MIN is not None:
             end_time = now + timedelta(minutes=RUN_DURATION_MIN)
             log(f"RECORDING ENGINE  : {selected_engine.name}")
             log(f"Recording mode    : {mode}")
             log(f"Base name         : {BASE_NAME}")
+            log(
+                "Recording start   : "
+                + datetime.fromtimestamp(state.start_time).strftime("%Y-%m-%d %H:%M:%S")
+            )
             for line in selected_engine.summary_lines():
                 log(line)
             log(f"Planned duration  : {RUN_DURATION_MIN} minutes")
@@ -20137,6 +18189,10 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
             log(f"RECORDING ENGINE  : {selected_engine.name}")
             log(f"Recording mode    : {mode}")
             log(f"Base name         : {BASE_NAME}")
+            log(
+                "Recording start   : "
+                + datetime.fromtimestamp(state.start_time).strftime("%Y-%m-%d %H:%M:%S")
+            )
             for line in selected_engine.summary_lines():
                 log(line)
             log("Planned duration  : until stopped")
@@ -20278,8 +18334,9 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
     init_termcap()
     init_raw_external_capture()
     
-    state.start_time = time.time()
-    state.stats["process_start"] = state.start_time
+    if not state.stats["process_start"]:
+        state.start_time = time.time()
+        state.stats["process_start"] = state.start_time
     state.original_duration_min = (float(RUN_DURATION_MIN) if RUN_DURATION_MIN is not None else None)
     state.deadline_ts = (state.start_time + RUN_DURATION_MIN * 60) if RUN_DURATION_MIN is not None else None
     state.original_deadline_ts = state.deadline_ts
@@ -20413,22 +18470,102 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
 def main(state: RecorderState, engine: RecorderEngine):
     orchestrate_recording(state, engine)
 
-# ==============================================================================
-# Entrypoint
-# ==============================================================================
+def _apply_identity_launch_request(
+    request: IdentityLaunchRequest,
+) -> dict:
+    global SCHEDULE_START
+    global RUN_DURATION_MIN
+    global BASE_NAME
+    global NM3U8DL_PLAYLIST_GROUP
+    global NM3U8DL_PLAYLIST_PRIMARY_PHRASES
+    global NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS
+    global NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS
+    global NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS
+    global NM3U8DL_PLAYLIST_MATCH_ALL
 
-if __name__ == "__main__":
+    candidate = request.selected_candidate
+    derived_identity = derive_feed_identity(candidate, request.provider)
+    if derived_identity.serialized != request.identity_key:
+        raise RuntimeError(
+            "Coordinator-selected startup source no longer matches "
+            "the assigned canonical identity"
+        )
+
+    group_name = request.selected_source_group.strip().upper()
+    if group_name not in NM3U8DL_PLAYLIST_GROUP_PROFILES:
+        raise RuntimeError(
+            f"Identity worker source group {group_name!r} has no recorder profile"
+        )
+
+    first_intent = request.target_intents[0]
+    SCHEDULE_START = None
+    RUN_DURATION_MIN = request.recording_duration_min
+    BASE_NAME = request.base_name
+    NM3U8DL_PLAYLIST_GROUP = group_name
+    # These globals keep existing summaries/compatibility wrappers meaningful.
+    # Actual identity-worker matching uses every frozen tied target intent above.
+    NM3U8DL_PLAYLIST_PRIMARY_PHRASES = first_intent.primary
+    NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = first_intent.required
+    NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = first_intent.rejected
+    NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = first_intent.preferred
+    NM3U8DL_PLAYLIST_MATCH_ALL = first_intent.match_all
+
+    source = candidate.to_mapping()
+    source["_candidate_pool"] = [
+        candidate_item.to_mapping()
+        for candidate_item in request.initial_candidate_pool
+    ]
+    source.setdefault("source_results", [])
+    source.setdefault("source_errors", [])
+    source.setdefault("playlist_group", group_name)
+    source.setdefault(
+        "match_description",
+        "Coordinator-selected identity launch",
+    )
+    source.setdefault("playlist_source_count", 0)
+    source.setdefault("candidate_count", 1)
+    return source
+
+
+def run_recorder_process(
+    *,
+    identity_launch_request: Optional[IdentityLaunchRequest] = None,
+    identity_status_callback: Optional[Callable[[dict], None]] = None,
+) -> RecorderProcessOutcome:
+    global FINAL_FILE
+    global CHUNKS_DIR
+    global LIST_FILE
+
+    initial_source = None
+    if identity_launch_request is not None:
+        initial_source = _apply_identity_launch_request(
+            identity_launch_request
+        )
+
     osSleep = None
     if os.name == "nt":
         osSleep = WindowsInhibitor()
         osSleep.inhibit()
     try:
         selected_engine = resolve_engine(DOWNLOAD_MODE)
-        state = RecorderState()
+        state = RecorderState(
+            identity_launch_request=identity_launch_request,
+            identity_initial_source=initial_source,
+            identity_feed_key=(
+                identity_launch_request.identity_key
+                if identity_launch_request is not None
+                else None
+            ),
+            identity_status_callback=identity_status_callback,
+        )
         signal.signal(signal.SIGINT, make_signal_handler(state))
 
         run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        FINAL_FILE = f"{BASE_NAME}_{run_ts}.mkv"
+        os.makedirs(RECORDING_OUTPUT_DIR, exist_ok=True)
+        FINAL_FILE = os.path.join(
+            RECORDING_OUTPUT_DIR,
+            f"{BASE_NAME}_{run_ts}.mkv",
+        )
 
         final_base = os.path.splitext(FINAL_FILE)[0]
         CHUNKS_DIR = f"{final_base}_chunks"
@@ -20437,7 +18574,30 @@ if __name__ == "__main__":
 
         wait_until_start(state, selected_engine)
         main(state, selected_engine)
+
+        if state.manual_stop_requested:
+            return RecorderProcessOutcome(
+                status="manual_stopped",
+                reason="Ctrl-C requested by user",
+            )
+        if state.normal_terminal_reason:
+            return RecorderProcessOutcome(
+                status="ended",
+                reason=state.normal_terminal_reason,
+            )
+        return RecorderProcessOutcome(
+            status="error",
+            reason="recorder stopped without a normal terminal reason",
+        )
     finally:
         if osSleep:
             osSleep.uninhibit()
+
+
+# ==============================================================================
+# Entrypoint
+# ==============================================================================
+
+if __name__ == "__main__":
+    run_recorder_process()
 

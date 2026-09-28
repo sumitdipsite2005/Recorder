@@ -97,11 +97,16 @@ class SourceCandidate:
     expiry: Optional[float] = None
     expiry_source: str = ""
     quality_known: bool = False
+    quality_source: str = ""
     video_fps: float = 0.0
+    video_fps_source: str = ""
     video_width: int = 0
     video_height: int = 0
+    video_resolution_source: str = ""
     video_bitrate_bps: int = 0
+    video_bitrate_source: str = ""
     video_scan_type: str = ""
+    video_scan_type_source: str = ""
     final_stream_url: str = ""
     launchable: bool = False
     probe_status: str = "unprobed"
@@ -134,11 +139,16 @@ class SourceCandidate:
             "expiry",
             "expiry_source",
             "quality_known",
+            "quality_source",
             "video_fps",
+            "video_fps_source",
             "video_width",
             "video_height",
+            "video_resolution_source",
             "video_bitrate_bps",
+            "video_bitrate_source",
             "video_scan_type",
+            "video_scan_type_source",
             "final_stream_url",
             "launchable",
             "probe_status",
@@ -172,11 +182,16 @@ class SourceCandidate:
             expiry=(float(value["expiry"]) if value.get("expiry") is not None else None),
             expiry_source=str(value.get("expiry_source") or ""),
             quality_known=bool(value.get("quality_known")),
+            quality_source=str(value.get("quality_source") or ""),
             video_fps=float(value.get("video_fps") or 0.0),
+            video_fps_source=str(value.get("video_fps_source") or ""),
             video_width=int(value.get("video_width") or 0),
             video_height=int(value.get("video_height") or 0),
+            video_resolution_source=str(value.get("video_resolution_source") or ""),
             video_bitrate_bps=int(value.get("video_bitrate_bps") or 0),
+            video_bitrate_source=str(value.get("video_bitrate_source") or ""),
             video_scan_type=str(value.get("video_scan_type") or ""),
+            video_scan_type_source=str(value.get("video_scan_type_source") or ""),
             final_stream_url=str(
                 value.get("final_stream_url")
                 or value.get("manifest_final_url")
@@ -215,11 +230,16 @@ class SourceCandidate:
                 "expiry": self.expiry,
                 "expiry_source": self.expiry_source,
                 "quality_known": self.quality_known,
+                "quality_source": self.quality_source,
                 "video_fps": self.video_fps,
+                "video_fps_source": self.video_fps_source,
                 "video_width": self.video_width,
                 "video_height": self.video_height,
+                "video_resolution_source": self.video_resolution_source,
                 "video_bitrate_bps": self.video_bitrate_bps,
+                "video_bitrate_source": self.video_bitrate_source,
                 "video_scan_type": self.video_scan_type,
+                "video_scan_type_source": self.video_scan_type_source,
                 "final_stream_url": self.final_stream_url,
                 "launchable": self.launchable,
                 "probe_status": self.probe_status,
