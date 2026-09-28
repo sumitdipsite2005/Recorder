@@ -282,7 +282,8 @@ def _header_lines(
         window = snapshot.coordinator_window
         lines.append("Coordinator")
         lines.append(f"  Status    : {window.status}")
-        lines.append(f"  Started   : {window.active_from:%Y-%m-%d %H:%M:%S}")
+        start_label = "Starts" if window.status == "WAITING" else "Started"
+        lines.append(f"  {start_label:<9}: {window.active_from:%Y-%m-%d %H:%M:%S}")
         lines.append(
             "  End       : "
             + (
@@ -857,6 +858,15 @@ def render_dashboard(
                     f"| Sources: {source_count_text} | PID {pid_text}"
                 )
 
+    if (
+        snapshot.coordinator_window is not None
+        and snapshot.coordinator_window.status == "WAITING"
+    ):
+        if snapshot.config_messages:
+            lines.append("")
+            lines.extend(snapshot.config_messages)
+        return "\n".join(lines)
+
     lines.append("")
     lines.append("=" * 88)
     lines.append(
@@ -1353,6 +1363,20 @@ def watch_status_text(
         f"Watching | Last scan {last_scan} | "
         f"Next scan {_format_countdown(next_refresh_monotonic - time.monotonic())} "
         "| r=record | i=info | F5=refresh | Ctrl+C=exit"
+    )
+
+def coordinator_wait_status_text(
+    start_time: datetime,
+    *,
+    now: Optional[datetime] = None,
+) -> str:
+    current = now or datetime.now()
+    remaining = max(0, int((start_time - current).total_seconds()))
+    hours, remainder = divmod(remaining, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return (
+        f"[WAIT] Waiting for start time {start_time:%Y-%m-%d %H:%M:%S} "
+        f"(remaining {hours:02d}:{minutes:02d}:{seconds:02d})..."
     )
 
 
