@@ -276,7 +276,6 @@ def run_once(
     target_views = config_state.target_views(
         now,
         coordinator_active=(window.status == "ACTIVE"),
-        coordinator_active_from=window.active_from,
     )
     raw = config_state.raw_config or {}
     failed_source_keys: Set[Tuple[str, str, str]] = set()
