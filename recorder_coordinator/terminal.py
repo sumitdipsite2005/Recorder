@@ -1388,8 +1388,8 @@ COORDINATOR_NOTIFICATION_VOLUME = 0.75
 
 
 def _coordinator_sound_path(filename: str) -> Path:
-    """Resolve one optional Coordinator WAV beside the repo scripts."""
-    return Path(__file__).resolve().parent.parent / filename
+    """Resolve one optional Coordinator WAV from the repo Sounds folder."""
+    return Path(__file__).resolve().parent.parent / "Sounds" / filename
 
 
 def _coordinator_notification_sound_path() -> Path:
