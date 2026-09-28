@@ -1,6 +1,6 @@
 # Recorder
 
-Personal live-stream recording system with playlist discovery, source probing, identity-based coordination, automatic worker launch, recovery, and terminal monitoring.
+Live-stream recording system with playlist discovery, source probing, identity-based coordination, automatic worker launch, recovery, and terminal monitoring.
 
 The current Recorder workflow is designed to support unattended event recording: the Coordinator watches configured playlist sources, discovers canonical stream identities, and can automatically launch one recording worker per eligible identity.
 
