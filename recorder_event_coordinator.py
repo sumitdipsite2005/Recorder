@@ -380,11 +380,11 @@ def next_watch_sleep_seconds(
 
 
 def _coordinator_live_status_text(
-    snapshot: DashboardSnapshot,
+    snapshot: Optional[DashboardSnapshot],
     last_scan_wall_time: Optional[float],
     next_refresh_monotonic: float,
 ) -> str:
-    window = snapshot.coordinator_window
+    window = snapshot.coordinator_window if snapshot is not None else None
     if window is not None and window.status == "WAITING":
         return coordinator_wait_status_text(window.active_from)
     return watch_status_text(last_scan_wall_time, next_refresh_monotonic)
@@ -941,7 +941,8 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 record_choices = ()
                 watch_text = ""
                 if not during_scan and next_refresh_monotonic > 0:
-                    watch_text = watch_status_text(
+                    watch_text = _coordinator_live_status_text(
+                        previous,
                         last_scan_wall_time,
                         next_refresh_monotonic,
                     )
@@ -1151,7 +1152,8 @@ def run(config_path: Path, *, once: bool = False) -> int:
                             dashboard_has_transient = False
                             if next_refresh_monotonic > 0:
                                 set_live_status_line(
-                                    watch_status_text(
+                                    _coordinator_live_status_text(
+                                        previous,
                                         last_scan_wall_time,
                                         next_refresh_monotonic,
                                     )
@@ -1309,7 +1311,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     force_refresh = False
                     set_live_status_line(
                         _coordinator_live_status_text(
-                            snapshot,
+                            previous,
                             last_scan_wall_time,
                             next_refresh_monotonic,
                         )
@@ -1514,7 +1516,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     and not sound_menu_open
                 ):
                     set_live_status_line(
-                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                        _coordinator_live_status_text(
+                            previous,
+                            last_scan_wall_time,
+                            next_refresh_monotonic,
+                        )
                     )
                 continue
 
@@ -1527,7 +1533,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 if normalized in {"i", "info", "__esc__", "esc", "cancel"}:
                     info_menu_open = False
                     watch_text = (
-                        watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                        _coordinator_live_status_text(
+                            previous,
+                            last_scan_wall_time,
+                            next_refresh_monotonic,
+                        )
                         if next_refresh_monotonic > 0
                         else ""
                     )
@@ -1636,7 +1646,11 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 )
             elif next_refresh_monotonic > 0:
                 set_live_status_line(
-                    watch_status_text(last_scan_wall_time, next_refresh_monotonic)
+                    _coordinator_live_status_text(
+                        previous,
+                        last_scan_wall_time,
+                        next_refresh_monotonic,
+                    )
                 )
 
     except KeyboardInterrupt:
