@@ -1698,6 +1698,60 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertIn("Quality : 1920x1080 | 25p | 5000 Kbps",rendered)
         self.assertEqual(rendered.count("[ON] Asian Games"),2)
 
+    def test_failed_row_stays_in_last_known_quality_group(self):
+        working=sony_candidate(
+            playlist="https://one/list",
+            source_name="one",
+        )
+        previously_working=sony_candidate(
+            playlist="https://two/list",
+            source_name="two",
+        )
+        first=snapshot([working,previously_working])
+        display_quality_registry=coordinator_terminal.update_display_quality_registry(
+            {},
+            first,
+        )
+
+        failed=replace(
+            previously_working,
+            quality_known=False,
+            video_width=0,
+            video_height=0,
+            video_fps=0.0,
+            video_bitrate_bps=0,
+            video_scan_type="",
+            launchable=False,
+            probe_status="probe_failed",
+            reason="probe failed",
+        )
+        current=snapshot([working,failed])
+        rendered=coord.render_dashboard(
+            current,
+            (),
+            display_quality_registry=display_quality_registry,
+        )
+
+        self.assertEqual(rendered.count("Quality : "),1)
+        self.assertIn("Quality : 1920x1080 | 50p | 5000 Kbps",rendered)
+        self.assertIn("[OFF] PROBE FAILED",rendered)
+        self.assertNotIn("Quality : no working candidate",rendered)
+
+    def test_never_known_failed_row_keeps_no_working_candidate_group(self):
+        failed=sony_candidate(
+            launchable=False,
+            status="probe_failed",
+            reason="probe failed",
+        )
+        rendered=coord.render_dashboard(
+            snapshot([failed]),
+            (),
+            display_quality_registry={},
+        )
+
+        self.assertIn("Quality : no working candidate",rendered)
+        self.assertIn("[OFF] PROBE FAILED",rendered)
+
     def test_single_quality_group_does_not_show_best_marker(self):
         snap=snapshot([sony_candidate()])
         rendered=coord.render_dashboard(snap,())
