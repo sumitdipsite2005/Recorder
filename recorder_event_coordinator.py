@@ -706,6 +706,20 @@ def _auto_launch_succeeded(
     return any(status == "LAUNCHED" for _identity_key, status, _detail in outcomes)
 
 
+def _play_scan_ready_sound(
+    events: Sequence[ChangeEvent],
+    sound_state: SoundSnoozeState,
+    *,
+    auto_launch_succeeded: bool,
+) -> None:
+    """Play scan notification only after the refreshed terminal is fully drawn."""
+    sys.stdout.flush()
+    if auto_launch_succeeded:
+        play_launch_sound(sound_state)
+    else:
+        beep(events, sound_state)
+
+
 def _command_reader(
     command_queue: "queue.Queue[str]",
     stop_event: threading.Event,
@@ -1410,11 +1424,6 @@ def run(config_path: Path, *, once: bool = False) -> int:
                                     f"{'; '.join(event.details)}"
                                 ),
                             )
-                        if auto_launch_succeeded:
-                            play_launch_sound(sound_state)
-                        else:
-                            beep(events, sound_state)
-
                     dashboard_has_transient = (
                         _has_visible_transient(snapshot, terminal_events)
                         if meaningful
@@ -1428,8 +1437,20 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 ):
                     clear_live_status_line()
                     print("Identity Coordinator schedule complete.")
+                    if meaningful:
+                        _play_scan_ready_sound(
+                            events,
+                            sound_state,
+                            auto_launch_succeeded=auto_launch_succeeded,
+                        )
                     return 0
                 if once:
+                    if meaningful:
+                        _play_scan_ready_sound(
+                            events,
+                            sound_state,
+                            auto_launch_succeeded=auto_launch_succeeded,
+                        )
                     return 0
 
                 last_scan_wall_time = time.time()
@@ -1443,6 +1464,12 @@ def run(config_path: Path, *, once: bool = False) -> int:
                 set_live_status_line(
                     watch_status_text(last_scan_wall_time, next_refresh_monotonic)
                 )
+                if meaningful:
+                    _play_scan_ready_sound(
+                        events,
+                        sound_state,
+                        auto_launch_succeeded=auto_launch_succeeded,
+                    )
 
             timeout = max(
                 0.1,
