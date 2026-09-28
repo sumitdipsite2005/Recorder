@@ -129,6 +129,9 @@ NM3U8DL_PLAYLIST_PRIMARY_PHRASES = _dynamic_user_config["NM3U8DL_PLAYLIST_PRIMAR
 NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = _dynamic_user_config["NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS"]
 NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = _dynamic_user_config["NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS"]
 NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = _dynamic_user_config["NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS"]
+# Coordinator identity launches can intentionally use MATCH ALL with no primary
+# phrases. Direct recorder runs keep the historical default of False.
+NM3U8DL_PLAYLIST_MATCH_ALL = False
 NM3U8DL_PLAYLIST_GROUP = _dynamic_user_config["NM3U8DL_PLAYLIST_GROUP"]
 NM3U8DL_PLAYLIST_GROUPS = _dynamic_user_config["NM3U8DL_PLAYLIST_GROUPS"]
 SCHEDULE_START = _dynamic_user_config["SCHEDULE_START"]
@@ -4615,6 +4618,7 @@ def _get_nm3u8dl_match_definition():
         required=NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS,
         rejected=NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS,
         preferred=NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS,
+        match_all=NM3U8DL_PLAYLIST_MATCH_ALL,
     )
 
 
@@ -18477,6 +18481,7 @@ def _apply_identity_launch_request(
     global NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS
     global NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS
     global NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS
+    global NM3U8DL_PLAYLIST_MATCH_ALL
 
     candidate = request.selected_candidate
     derived_identity = derive_feed_identity(candidate, request.provider)
@@ -18503,6 +18508,7 @@ def _apply_identity_launch_request(
     NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = first_intent.required
     NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = first_intent.rejected
     NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = first_intent.preferred
+    NM3U8DL_PLAYLIST_MATCH_ALL = first_intent.match_all
 
     source = candidate.to_mapping()
     source["_candidate_pool"] = [
