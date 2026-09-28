@@ -54,7 +54,11 @@ from recorder_coordinator.launch import (
     build_identity_launch_plan,
     build_manual_launch_plan,
 )
-from recorder_runtime.registry import IdentityLaunchBlocked, IdentityRegistryStore
+from recorder_runtime.registry import (
+    IdentityLaunchBlocked,
+    IdentityRegistryStore,
+    MAX_ACTIVE_IDENTITY_WORKERS,
+)
 from recorder_coordinator.worker import launch_identity_worker
 from recorder_coordinator.models import (
     ChangeEvent,
@@ -682,6 +686,17 @@ def _launch_all_identities(
     return tuple(outcomes)
 
 
+def _active_worker_limit_blocked(
+    outcomes: Sequence[Tuple[str, str, str]],
+) -> bool:
+    """Return True when an Auto launch was suppressed by the shared worker ceiling."""
+    return any(
+        status == "SUPPRESSED"
+        and "active recording limit reached" in str(detail or "").casefold()
+        for _identity_key, status, detail in outcomes
+    )
+
+
 def _command_reader(
     command_queue: "queue.Queue[str]",
     stop_event: threading.Event,
@@ -856,6 +871,7 @@ def run(config_path: Path, *, once: bool = False) -> int:
     next_refresh_monotonic = 0.0
     last_scan_wall_time: Optional[float] = None
     dashboard_has_transient = False
+    active_worker_limit_blocked_previous = False
     sound_state = SoundSnoozeState()
     info_menu_open = False
     sound_menu_open = False
@@ -1257,6 +1273,19 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     log_path=log_path,
                     registry_transition_callback=capture_launch_registry_transition,
                 )
+                active_worker_limit_blocked = _active_worker_limit_blocked(
+                    auto_launch_outcomes
+                )
+                if (
+                    active_worker_limit_blocked
+                    and not active_worker_limit_blocked_previous
+                ):
+                    snapshot.config_messages = tuple(snapshot.config_messages) + (
+                        "ACTIVE WORKER LIMIT REACHED — "
+                        f"{MAX_ACTIVE_IDENTITY_WORKERS}/{MAX_ACTIVE_IDENTITY_WORKERS}",
+                    )
+                active_worker_limit_blocked_previous = active_worker_limit_blocked
+
                 if auto_launch_outcomes:
                     try:
                         fresh_registry_entries = _registry_entries_snapshot(
