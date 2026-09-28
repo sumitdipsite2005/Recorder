@@ -116,8 +116,12 @@ class CoordinatorConfigState:
         now: datetime,
         *,
         coordinator_active: bool = True,
-        coordinator_active_from: Optional[datetime] = None,
     ) -> Tuple[TargetView, ...]:
+        coordinator_active_from = (
+            self.coordinator_schedule_start
+            if self.coordinator_schedule_start is not None
+            else self.coordinator_actual_activation
+        )
         return tuple(
             target_view(
                 target,
