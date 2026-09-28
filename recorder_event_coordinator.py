@@ -78,6 +78,7 @@ from recorder_coordinator.snapshot import (
 )
 from recorder_coordinator.terminal import (
     beep,
+    play_launch_sound,
     clear_dashboard_terminal,
     clear_live_status_line,
     render_coordinator_controls,
@@ -697,6 +698,13 @@ def _active_worker_limit_blocked(
     )
 
 
+def _auto_launch_succeeded(
+    outcomes: Sequence[Tuple[str, str, str]],
+) -> bool:
+    """Return True when at least one ALL_IDENTITIES worker launched this scan."""
+    return any(status == "LAUNCHED" for _identity_key, status, _detail in outcomes)
+
+
 def _command_reader(
     command_queue: "queue.Queue[str]",
     stop_event: threading.Event,
@@ -1273,6 +1281,9 @@ def run(config_path: Path, *, once: bool = False) -> int:
                     log_path=log_path,
                     registry_transition_callback=capture_launch_registry_transition,
                 )
+                auto_launch_succeeded = _auto_launch_succeeded(
+                    auto_launch_outcomes
+                )
                 active_worker_limit_blocked = _active_worker_limit_blocked(
                     auto_launch_outcomes
                 )
@@ -1387,7 +1398,10 @@ def run(config_path: Path, *, once: bool = False) -> int:
                                     f"{'; '.join(event.details)}"
                                 ),
                             )
-                        beep(events, sound_state)
+                        if auto_launch_succeeded:
+                            play_launch_sound(sound_state)
+                        else:
+                            beep(events, sound_state)
 
                     dashboard_has_transient = (
                         _has_visible_transient(snapshot, terminal_events)
