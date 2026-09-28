@@ -181,5 +181,4 @@ cython_debug/
 .cursorindexingignore
 
 # Local recorder sound files
-alarm.wav
-happy_notification.wav
+sounds/*.wav
