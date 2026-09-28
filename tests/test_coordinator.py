@@ -1923,7 +1923,7 @@ class SnapshotAndChangeTests(unittest.TestCase):
         self.assertEqual(len(target_lines),1)
         self.assertIn("Asian Games | MANUAL | ACTIVE until stopped",target_lines[0])
         self.assertIn("Search: Presidents cup",target_lines[0])
-        self.assertIn("exclude: (TAM OR Tamil)",target_lines[0])
+        self.assertNotIn("exclude:",target_lines[0])
         self.assertIn("prefer: (ENG OR English)",target_lines[0])
         self.assertIn("Sources: SONYLIV_EVENTS",target_lines[0])
         self.assertNotIn("Mode         :",rendered)
