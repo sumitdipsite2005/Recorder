@@ -283,7 +283,7 @@ def _header_lines(
         lines.append("Coordinator")
         lines.append(f"  Status    : {window.status}")
         start_label = "Starts" if window.status == "WAITING" else "Started"
-        lines.append(f"  {start_label:<9}: {window.active_from:%Y-%m-%d %H:%M:%S}")
+        lines.append(f"  {start_label:<10}: {window.active_from:%Y-%m-%d %H:%M:%S}")
         lines.append(
             "  End       : "
             + (
