@@ -1,112 +1,265 @@
-# Recorder
+# Recorder — Inspect · Watch · Record · Auto
 
-Live-stream recording system with playlist discovery, source probing, identity-based coordination, automatic worker launch, recovery, and terminal monitoring.
+[![Recorder Tests](https://github.com/sumitdipsite2005/Recorder/actions/workflows/tests.yml/badge.svg)](https://github.com/sumitdipsite2005/Recorder/actions/workflows/tests.yml)
 
-The current Recorder workflow is designed to support unattended event recording: the Coordinator watches configured playlist sources, discovers canonical stream identities, and can automatically launch one recording worker per eligible identity.
+**A terminal-first live-stream recording system that discovers sources, inspects their quality and usability, watches logical event identities, and launches resilient recording workers automatically or on demand.**
 
-## Main components
+Recorder started as a mature dynamic recording engine. The project now adds an identity-aware **Inspect / Watch / Record / Auto** layer around that engine, turning playlist discovery into an unattended recording workflow rather than a one-shot recording command.
 
-- `record_dynamic.py` — mature dynamic recorder. Handles source selection, recording, renewal, recovery, quality upgrades, alarms, validation, logging, and finalization.
-- `recorder_event_coordinator.py` — terminal Coordinator for discovering identities and launching/managing identity workers.
-- `recorder_identity_worker.py` — worker entry point for one identity-bound recording session.
-- `recorder_coordinator/` — Coordinator configuration, acquisition, snapshot, launch, worker, and terminal logic.
-- `recorder_runtime/` — runtime paths, registry ownership, identity status, sound state, and launch contracts.
-- `recorder_source/` — shared playlist parsing, matching, identity, probing, quality, transport, and source-selection logic.
-- `tests/` and `checkpoint0_tests/` — regression and safety coverage.
+## Inspect → Watch → Record → Auto
 
-## Coordinator modes
+| Stage | What Recorder does |
+| --- | --- |
+| **Inspect** | Acquires configured playlists, matches relevant entries, resolves candidate sources, probes quality and availability, and groups equivalent feeds into canonical identities. |
+| **Watch** | Continuously refreshes those identities in the Coordinator dashboard, preserving useful state while sources appear, disappear, fail probing, recover, or change quality. |
+| **Record** | Launches one identity-bound worker through the mature dynamic recorder, with source selection, renewal, failover/recovery, quality upgrades, validation, logging, and finalization. |
+| **Auto** | Under **ALL_IDENTITIES**, automatically starts newly eligible identities while the Coordinator continues watching for more. |
 
-Targets use one of two identity policies:
+The same Coordinator can also keep targets in **MANUAL** mode, where discovered identities are visible but recording starts only when the user selects one.
 
-- **MANUAL** — qualifying identities appear in the dashboard and are launched by the user.
-- **ALL_IDENTITIES** — qualifying identities are launched automatically.
+## What makes it more than a recorder
 
-Both policies share the same identity registry. A canonical identity can only be owned by one active worker in a Coordinator session.
+Recorder separates **what is being recorded** from the individual playlist URL that happens to carry it at a particular moment.
 
-The active identity-worker ceiling is **20 total workers** across MANUAL and ALL_IDENTITIES.
+A provider may expose several URLs for the same event or feed. Recorder derives a stable identity, groups equivalent candidates together, evaluates the available choices, and gives that identity a single worker owner. This allows the system to reason about the recording as a continuing event rather than as one fragile URL.
 
-## User configuration
+Key capabilities include:
 
-Runtime configuration is kept outside the repository in:
+- **Playlist and source discovery** across configured source groups.
+- **Candidate inspection and probing** for resolution, FPS, bitrate, scan type, availability, and other source evidence where known.
+- **Canonical identity derivation** so equivalent source rows can be treated as one logical feed.
+- **Quality grouping** with remembered display placement when a previously known source temporarily fails probing.
+- **MANUAL and ALL_IDENTITIES policies** in the same Coordinator.
+- **Duplicate prevention** through a shared identity registry.
+- **Automatic worker launch** for newly eligible identities.
+- **20-worker shared active ceiling** across MANUAL and ALL_IDENTITIES ownership.
+- **Source renewal, failover, recovery, and controlled quality upgrades** through the mature dynamic recorder.
+- **Runtime status tracking** for Coordinator-launched workers.
+- **Terminal controls and transient notifications** without requiring a GUI.
+- **Optional refresh and launch sounds**, including snooze control.
+- **Regression and safety coverage** exercised by GitHub Actions.
 
-`recorder_dynamic_user_config.py`
+## Architecture
 
-On the supported Windows/macOS setup, Recorder resolves the normal OneDrive Recorder configuration location automatically. A different Coordinator config can be supplied explicitly:
+```text
+Configured targets
+       │
+       ▼
+Playlist acquisition / source discovery
+       │
+       ▼
+Matching + probing + quality evidence
+       │
+       ▼
+Canonical feed identity
+       │
+       ▼
+Identity Coordinator
+   ┌───────────────┐
+   │ MANUAL        │  user chooses Record
+   │ ALL_IDENTITIES│  eligible identities auto-launch
+   └───────────────┘
+       │
+       ▼
+Shared identity registry
+       │
+       ▼
+Identity-bound worker
+       │
+       ▼
+Dynamic recorder
+       │
+       ├─ source selection
+       ├─ recording
+       ├─ authorization / source renewal
+       ├─ failover and recovery
+       ├─ quality upgrade
+       ├─ validation / alarms
+       └─ finalization
+```
+
+A canonical identity can have only one active owner. The registry covers workers in **LAUNCHING**, **RECORDING**, and **WAITING_FOR_SOURCE** states, so MANUAL and automatic launches cannot accidentally create duplicate active recordings for the same identity.
+
+## Coordinator dashboard
+
+The Coordinator is the main Inspect / Watch interface. It presents the system as a live terminal dashboard rather than a GUI.
+
+It shows:
+
+- **ACTIVE RECORDINGS**
+- **ALL IDENTITIES** targets
+- **MANUAL** targets
+- canonical identities and their current state
+- quality groups and candidate source rows
+- working / failed probe state
+- source freshness and update information
+- worker / registry status
+- meaningful change notifications
+
+The dashboard also exposes runtime controls for manual recording selection, information, sound control, refresh, and exit.
+
+## Unattended recording workflow
+
+A typical automatic workflow is:
+
+```text
+Start Coordinator
+      ↓
+Watch configured event playlists
+      ↓
+Discover a new qualifying identity
+      ↓
+Inspect and rank its candidate sources
+      ↓
+Claim identity ownership atomically
+      ↓
+Launch one worker
+      ↓
+Record / renew / recover as required
+      ↓
+Continue watching for additional identities
+```
+
+If the 20-worker active ceiling is reached, remaining identities stay watched instead of being incorrectly marked as failed.
+
+## Mature recording engine
+
+`record_dynamic.py` remains the recording engine underneath the Coordinator workflow.
+
+Its responsibilities include:
+
+- dynamic source selection
+- downloader orchestration
+- source and authorization renewal
+- controlled source rollover
+- quality upgrades
+- failover and recovery
+- stall and failure handling
+- alarms and runtime controls
+- chunk/media validation
+- logging and playlist history
+- recording duration management
+- cleanup and finalization
+
+The Coordinator does not replace those protections. It discovers and owns identities, then launches the same mature recording path for the selected identity.
+
+## Project structure
+
+```text
+record_dynamic.py
+    Mature dynamic recording engine.
+
+recorder_event_coordinator.py
+    Inspect / Watch Coordinator and launch orchestration.
+
+recorder_identity_worker.py
+    Entry point for one identity-bound recording worker.
+
+recorder_coordinator/
+    Acquisition, configuration, launch planning, snapshots,
+    dashboard presentation, and worker orchestration.
+
+recorder_source/
+    Shared discovery, manifest handling, matching, identity,
+    probing, quality, transport, and source-selection logic.
+
+recorder_runtime/
+    Identity registry, worker status, runtime paths,
+    launch contracts, sound state, and terminal hosting.
+
+tests/
+checkpoint0_tests/
+    Regression and safety coverage.
+```
+
+## Identity policies
+
+### MANUAL
+
+The Coordinator discovers and displays qualifying identities, but does not start a worker until the user chooses **Record**.
+
+This is useful for broad observation targets where visibility is desired without automatically recording everything discovered.
+
+### ALL_IDENTITIES
+
+Every newly eligible canonical identity is automatically launched through the same worker path used by MANUAL recording.
+
+Multiple matching identities can appear in one scan. Recorder can launch them as capacity permits while keeping duplicate ownership and the global worker ceiling enforced centrally.
+
+## Configuration
+
+User-maintained runtime configuration is intentionally kept **outside this repository** in:
+
+```text
+recorder_dynamic_user_config.py
+```
+
+On the supported Windows/macOS setup, Recorder resolves the normal OneDrive Recorder configuration location automatically.
+
+A different Coordinator config can be supplied explicitly:
 
 ```bash
 python recorder_event_coordinator.py --config "/path/to/recorder_dynamic_user_config.py"
 ```
 
-To start the Coordinator using the normal configuration location:
+Start the Coordinator with the normal configuration location:
 
 ```bash
 python recorder_event_coordinator.py
 ```
 
-The standalone mature dynamic recorder can be started with:
+Run the standalone dynamic recorder directly:
 
 ```bash
 python record_dynamic.py
 ```
 
-## Coordinator dashboard
+The repository deliberately does not publish live user configuration, signed playback URLs, cookies, or local sound files.
 
-The Coordinator dashboard shows:
+## Optional sounds
 
-- active recordings
-- ALL_IDENTITIES targets
-- MANUAL targets
-- canonical identities
-- quality groups and source rows
-- current probe/working state
-- source and row update information
-- registry/worker state
-- transient change notifications
-
-Useful controls are shown in the terminal footer, including manual recording selection, information, sound control, refresh, and exit.
-
-## Sounds
-
-Optional local Coordinator sounds live in:
+Local Coordinator sounds can be placed at:
 
 ```text
 sounds/refresh.wav
 sounds/launch.wav
 ```
 
-WAV files are intentionally ignored by Git and remain local to each Recorder machine.
+- `refresh.wav` — a meaningful dashboard update is ready to inspect.
+- `launch.wav` — one or more ALL_IDENTITIES workers launched successfully in that scan.
 
-- `refresh.wav` — meaningful dashboard update notification
-- `launch.wav` — successful ALL_IDENTITIES worker-launch notification
+Launch notification takes priority when both conditions happen in the same scan. Both sounds respect the Coordinator sound-snooze control.
 
-Sound notifications respect the Coordinator sound-snooze controls.
+The WAV files are intentionally ignored by Git.
 
-## Tests
+## Testing and CI
 
-GitHub Actions runs on pushes to both `main` and `dev`, and on pull requests.
-
-The CI suite currently runs:
+GitHub Actions runs the regression suite on pushes to `main` and `dev`, and on pull requests.
 
 ```bash
 python -m unittest -v checkpoint0_tests/test_recorder_safety_baseline.py
 python -m unittest discover -s tests -v
 ```
 
-On Windows, the repository also includes:
+Windows users can also run:
 
 ```text
 run_all_tests.bat
 ```
 
+The test suite covers the shared source core, identity derivation, Coordinator behavior, launch planning, registry ownership, runtime status, worker launch, terminal hosting, sound behavior, and architecture boundaries.
+
 ## Branches
 
-- **main** — stable Recorder baseline
-- **dev** — ongoing development and testing
+- **main** — stable Recorder baseline.
+- **dev** — ongoing development and testing.
 
-Normal development should happen on `dev` and be promoted to `main` through a pull request after the regression suite is green.
+Development is normally validated on `dev` and promoted to `main` after the regression suite is green.
 
-## Current project state
+## Project status
 
-The identity-based Coordinator and unattended Auto workflow are implemented and in active use. The completed baseline includes identity discovery, MANUAL and ALL_IDENTITIES policies, duplicate prevention, worker ownership, automatic launch, recovery integration, dashboard monitoring, sound controls, and the shared 20-worker ceiling.
+**Inspect / Watch / Record / Auto is implemented and promoted to the stable baseline.**
 
-Further Recorder improvements can continue on `dev` without changing the stable `main` baseline until they are ready to be promoted.
+The completed system includes source discovery, quality inspection, canonical identity grouping, MANUAL and ALL_IDENTITIES operation, duplicate prevention, shared worker ownership, automatic launches, dashboard monitoring, recovery integration, sound controls, and the shared 20-worker ceiling.
+
+Future work can continue on top of this baseline without changing the completed Inspect / Watch / Record / Auto model.
