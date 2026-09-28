@@ -552,6 +552,23 @@ class ActiveWorkerLimitNotificationTests(unittest.TestCase):
         )
 
 
+class AutoLaunchSoundDecisionTests(unittest.TestCase):
+    def test_multiple_successful_auto_launches_reduce_to_one_scan_sound_decision(self):
+        outcomes=(
+            ("id-1","LAUNCHED","one"),
+            ("id-2","LAUNCHED","two"),
+            ("id-3","LAUNCHED","three"),
+        )
+        self.assertTrue(coord._auto_launch_succeeded(outcomes))
+
+    def test_nonlaunch_outcomes_do_not_trigger_launch_sound_decision(self):
+        outcomes=(
+            ("id-1","SUPPRESSED","blocked"),
+            ("id-2","FAILED","failed"),
+        )
+        self.assertFalse(coord._auto_launch_succeeded(outcomes))
+
+
 class AllIdentitiesLaunchTests(unittest.TestCase):
     def _all_snapshot(self, candidates):
         return snapshot(
@@ -2396,6 +2413,32 @@ class SnapshotAndChangeTests(unittest.TestCase):
         with patch("recorder_coordinator.terminal.winsound") as sound:
             coord.beep((event,),state)
         sound.PlaySound.assert_not_called()
+        sound.Beep.assert_not_called()
+
+    def test_coordinator_sound_files_use_lowercase_sounds_folder(self):
+        refresh_path=coordinator_terminal._coordinator_notification_sound_path()
+        launch_path=coordinator_terminal._coordinator_launch_sound_path()
+        self.assertEqual(refresh_path.parent.name,"sounds")
+        self.assertEqual(refresh_path.name,"refresh.wav")
+        self.assertEqual(launch_path.parent.name,"sounds")
+        self.assertEqual(launch_path.name,"launch.wav")
+
+    def test_launch_sound_is_suppressed_while_snoozed(self):
+        state=coord.SoundSnoozeState()
+        coord.runtime_sound.set_indefinite_sound_snooze(state,"coordinator_run")
+        with patch("recorder_coordinator.terminal.winsound") as sound:
+            coordinator_terminal.play_launch_sound(state)
+        sound.PlaySound.assert_not_called()
+        sound.Beep.assert_not_called()
+
+    def test_launch_sound_prefers_launch_wav(self):
+        with patch("recorder_coordinator.terminal.winsound") as sound, patch(
+            "recorder_coordinator.terminal._coordinator_launch_sound_path"
+        ) as path:
+            path.return_value.is_file.return_value=True
+            path.return_value.__str__.return_value="launch.wav"
+            coordinator_terminal.play_launch_sound()
+        sound.PlaySound.assert_called_once()
         sound.Beep.assert_not_called()
 
     def test_notification_pcm_volume_is_reduced_to_seventy_five_percent(self):
