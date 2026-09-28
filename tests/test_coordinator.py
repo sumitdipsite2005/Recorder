@@ -524,6 +524,34 @@ class ManualRecordLaunchTests(unittest.TestCase):
         )
 
 
+class ActiveWorkerLimitNotificationTests(unittest.TestCase):
+    def test_detects_only_active_worker_capacity_suppression(self):
+        self.assertTrue(
+            coord._active_worker_limit_blocked(
+                (
+                    (
+                        "sony|lane-21|english",
+                        "SUPPRESSED",
+                        "Coordinator active recording limit reached (20/20); "
+                        "new launch blocked",
+                    ),
+                )
+            )
+        )
+        self.assertFalse(
+            coord._active_worker_limit_blocked(
+                (
+                    (
+                        "sony|lane-a|english",
+                        "SUPPRESSED",
+                        "sony|lane-a|english is already RECORDING "
+                        "in the current registry session",
+                    ),
+                )
+            )
+        )
+
+
 class AllIdentitiesLaunchTests(unittest.TestCase):
     def _all_snapshot(self, candidates):
         return snapshot(
