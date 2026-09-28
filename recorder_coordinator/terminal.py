@@ -28,7 +28,12 @@ from .models import (
     POLICY_MANUAL,
     TargetView,
 )
-from .snapshot import candidate_row_key, candidate_state, quality_text
+from .snapshot import (
+    candidate_row_key,
+    candidate_state,
+    candidate_update_key,
+    quality_text,
+)
 
 
 _LIVE_STATUS_ACTIVE = False
@@ -404,11 +409,57 @@ def _quality_evidence_rank(candidate) -> Tuple[object, ...]:
     )
 
 
+def _display_quality_registry_key(
+    identity_key: str,
+    candidate,
+) -> Tuple[object, ...]:
+    """Return the stable row key used only for dashboard quality placement."""
+    return (str(identity_key),) + tuple(candidate_update_key(candidate))
+
+
+def update_display_quality_registry(
+    previous: Mapping[Tuple[object, ...], object],
+    snapshot: DashboardSnapshot,
+) -> Dict[Tuple[object, ...], object]:
+    """Remember the last successfully verified quality for each displayed row."""
+    result = dict(previous)
+    for block in snapshot.blocks.values():
+        identity_key = block.identity.serialized
+        for candidate in block.candidates:
+            if (
+                candidate_state(candidate) == "WORKING"
+                and bool(getattr(candidate, "quality_known", False))
+            ):
+                result[
+                    _display_quality_registry_key(identity_key, candidate)
+                ] = candidate
+    return result
+
+
+def _display_quality_candidate(
+    identity_key: str,
+    candidate,
+    registry: Mapping[Tuple[object, ...], object],
+):
+    """Use remembered quality only to place a currently failed dashboard row."""
+    if (
+        bool(getattr(candidate, "quality_known", False))
+        or candidate_state(candidate) == "WORKING"
+    ):
+        return candidate
+    return registry.get(
+        _display_quality_registry_key(identity_key, candidate),
+        candidate,
+    )
+
+
 def _merge_display_equivalent_quality_groups(
     grouped: Mapping[
         Tuple[object, ...],
         Sequence[Tuple[object, object]],
     ],
+    *,
+    display_candidates: Optional[Mapping[int, object]] = None,
 ) -> Tuple[
     Dict[Tuple[object, ...], List[Tuple[object, object]]],
     Dict[Tuple[object, ...], Tuple[object, ...]],
@@ -424,7 +475,10 @@ def _merge_display_equivalent_quality_groups(
 
     for technical_key, rows in grouped.items():
         representative = max(
-            (candidate for _, candidate in rows),
+            (
+                (display_candidates or {}).get(id(candidate), candidate)
+                for _, candidate in rows
+            ),
             key=_quality_evidence_rank,
         )
         display_key = ("display",) + tuple(_quality_key(representative))
@@ -691,6 +745,9 @@ def render_dashboard(
     registry_entries: Optional[Mapping[str, Mapping[str, object]]] = None,
     runtime_statuses: Optional[Mapping[str, Mapping[str, object]]] = None,
     source_references: Optional[Mapping[str, int]] = None,
+    display_quality_registry: Optional[
+        Mapping[Tuple[object, ...], object]
+    ] = None,
 ) -> str:
     color = _terminal_is_interactive() if use_color is None else bool(use_color)
     identity_events, source_events, quality_events = _event_maps(events)
@@ -888,10 +945,17 @@ def render_dashboard(
                     lines.append(f"    {_secondary_text(detail, color)}")
 
             grouped: Dict[Tuple[object, ...], List[Tuple[object, object]]] = {}
+            display_candidates: Dict[int, object] = {}
             seen_rows = set()
             for source in block.observations.values():
                 for candidate in source.candidates:
-                    key = _quality_group_key(candidate)
+                    display_candidate = _display_quality_candidate(
+                        serialized,
+                        candidate,
+                        display_quality_registry or {},
+                    )
+                    display_candidates[id(candidate)] = display_candidate
+                    key = _quality_group_key(display_candidate)
                     row_identity = (
                         source.source_id,
                         candidate.entry_title,
@@ -906,7 +970,8 @@ def render_dashboard(
                     grouped.setdefault(key, []).append((source, candidate))
 
             grouped, quality_key_aliases = _merge_display_equivalent_quality_groups(
-                grouped
+                grouped,
+                display_candidates=display_candidates,
             )
 
             representatives: Dict[Tuple[object, ...], object] = {}
@@ -930,7 +995,10 @@ def render_dashboard(
                     reverse=True,
                 )
                 representatives[quality_key] = max(
-                    (candidate for _, candidate in rows),
+                    (
+                        display_candidates.get(id(candidate), candidate)
+                        for _, candidate in rows
+                    ),
                     key=_quality_evidence_rank,
                 )
 
