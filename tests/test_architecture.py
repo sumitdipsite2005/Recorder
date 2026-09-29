@@ -65,6 +65,14 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("from recorder_runtime import sound as runtime_sound", recorder)
         self.assertIn("from recorder_runtime import sound as runtime_sound", coordinator)
 
+    def test_recorder_alarm_uses_shared_sounds_directory(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        start=recorder.index("def _resolve_alarm_sound_path()")
+        end=recorder.index("def _shared_alarm_sound_loop(", start)
+        resolver=recorder[start:end]
+        self.assertIn('"sounds"', resolver)
+        self.assertIn("ALARM_SOUND_FILENAME", resolver)
+
     def test_coordinator_config_and_acquisition_have_single_module_owners(self):
         entry=(ROOT/"recorder_event_coordinator.py").read_text(encoding="utf-8")
         config=(ROOT/"recorder_coordinator"/"configuration.py").read_text(encoding="utf-8")
