@@ -270,6 +270,9 @@ recorder_runtime/
     Identity registry, worker status, runtime paths,
     launch contracts, sound state, and terminal hosting.
 
+requirements.txt
+    Pinned Python runtime dependencies used by local setup and CI.
+
 tests/
 checkpoint0_tests/
     Regression and safety coverage.
@@ -338,6 +341,8 @@ Coordinator launch notification takes priority when both Coordinator notificatio
 These optional local sound assets are not included in the repository.
 
 ## Testing and CI
+
+Python dependencies are installed from `requirements.txt`.
 
 GitHub Actions runs the regression suite on pushes to `main` and `dev`, and on pull requests.
 
