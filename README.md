@@ -42,6 +42,20 @@ The Recorder keeps that recording alive when the live-stream environment stops b
 
 The result is not simply a command that downloads a stream. It is an unattended live-recording system designed around the reality that online sources, networks, authorization, quality, and availability can all change while the event itself continues.
 
+## Contents
+
+- [Inspect → Watch → Record → Auto](#inspect--watch--record--auto)
+- [What makes it more than a recorder](#what-makes-it-more-than-a-recorder)
+- [Architecture](#architecture)
+- [Coordinator dashboard](#coordinator-dashboard)
+- [The recording engine — keeping a live recording alive](#the-recording-engine--keeping-a-live-recording-alive)
+- [Project structure](#project-structure)
+- [Configuration](#configuration)
+- [Testing and CI](#testing-and-ci)
+- [Project status](#project-status)
+- [What’s next](#whats-next)
+- [End-user installation status](#end-user-installation-status)
+
 ## Inspect → Watch → Record → Auto
 
 | Stage | What Recorder does |
@@ -162,26 +176,68 @@ Continue watching for additional identities
 
 If the 20-worker active ceiling is reached, remaining identities stay watched instead of being incorrectly marked as failed.
 
-## Mature recording engine
+## The recording engine — keeping a live recording alive
 
-`record_dynamic.py` remains the recording engine underneath the Coordinator workflow.
+The Coordinator solves the problem of **what should be recorded and when it should start**.
 
-Its responsibilities include:
+Once a recording begins, the mature recording engine takes over a different problem: **keeping that recording alive while the source, network, authorization, quality, DRM, and downloader conditions continue to change.**
 
-- dynamic source selection
-- downloader orchestration
-- source and authorization renewal
-- controlled source rollover
-- quality upgrades
-- failover and recovery
-- stall and failure handling
-- alarms and runtime controls
-- chunk/media validation
-- logging and playlist history
-- recording duration management
-- cleanup and finalization
+`record_dynamic.py` is the runtime engine behind Coordinator-launched recordings as well as the standalone dynamic recording workflow.
 
-The Coordinator does not replace those protections. It discovers and owns identities, then launches the same mature recording path for the selected identity.
+A typical recording is not simply:
+
+```text
+open stream
+    ↓
+download until finished
+```
+
+It is closer to:
+
+```text
+Inspect available sources
+        ↓
+Select the best usable candidate
+        ↓
+Start recording
+        ↓
+Continuously monitor recording health
+        ↓
+Source fails?        Authorization changes?
+Quality improves?    Access path changes?
+Downloader stalls?   DRM / license needs resolution?
+        ↓
+Renew / resolve / retry / recover / switch / upgrade
+        ↓
+Validate recorded media
+        ↓
+Continue recording
+        ↓
+Finalize the completed output
+```
+
+The engine already handles substantial runtime behavior, including:
+
+- **Source selection and ranking** across available candidates.
+- **Authorization lifetime handling and renewal** for sources that may expire during a long recording.
+- **DRM-aware recording and ClearKey support** — understand DRM-related source metadata, resolve supported ClearKey license URLs and required keys, distinguish DRM/key failures from ordinary stream failures, and carry the resulting decryption information into the recording workflow using the supported decryption paths.
+- **License and session handling** — preserve the headers, authorization, cookies, and other access context needed not only for the media stream but also for supported license/key acquisition when protected playback requires it.
+- **Failover and recovery** when the active source or downloader stops behaving correctly.
+- **Controlled source rollover** so a replacement source can take over without treating the recording as a completely new job.
+- **Quality upgrades** when a better eligible source becomes available.
+- **Access and VPN recovery** when source availability changes because of the current network path.
+- **Downloader failure and stall handling**, including retry and source-exclusion behavior.
+- **Media and chunk validation** so continued downloading is not mistaken for a healthy recording.
+- **Runtime alarms and controls** for conditions that require user attention.
+- **Playlist-history evidence** for understanding what sources were available and how they behaved over time.
+- **Recording duration, cleanup, and finalization** of the finished media.
+
+The Coordinator does not replace this machinery. It adds discovery, identity awareness, ownership, and automation **around the same recording engine**.
+
+Together, the two parts have distinct responsibilities:
+
+**The Coordinator finds and manages the recordings that should exist.  
+The recording engine does the difficult work of keeping each one alive.**
 
 ## Project structure
 
