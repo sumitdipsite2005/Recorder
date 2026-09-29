@@ -11,6 +11,8 @@
 
 Recorder started as a mature dynamic recording engine. The project now adds an identity-aware **Inspect / Watch / Record / Auto** layer around that engine, turning playlist discovery into an unattended recording workflow rather than a one-shot recording command.
 
+---
+
 ## Why Recorder exists
 
 Recording a live stream sounds simple — until you need the recording to actually survive for hours unattended.
@@ -47,6 +49,8 @@ The Recorder keeps that recording alive when the live-stream environment stops b
 
 The result is not simply a command that downloads a stream. It is an unattended live-recording system designed around the reality that online sources, networks, authorization, quality, and availability can all change while the event itself continues.
 
+---
+
 ## Contents
 
 - [Inspect → Watch → Record → Auto](#inspect--watch--record--auto)
@@ -60,8 +64,11 @@ The result is not simply a command that downloads a stream. It is an unattended 
 - [Configuration](#configuration)
 - [Testing and CI](#testing-and-ci)
 - [Project status](#project-status)
+- [Legal / Responsible Use](#legal--responsible-use)
 - [What’s next](#whats-next)
 - [End-user installation status](#end-user-installation-status)
+
+---
 
 ## Inspect → Watch → Record → Auto
 
@@ -73,6 +80,8 @@ The result is not simply a command that downloads a stream. It is an unattended 
 | **Auto** | Under **ALL_IDENTITIES**, automatically starts newly eligible identities while the Coordinator continues watching for more. |
 
 The same Coordinator can also keep targets in **MANUAL** mode, where discovered identities are visible but recording starts only when the user selects one.
+
+---
 
 ## Identity-aware source coordination
 
@@ -95,6 +104,8 @@ Key capabilities include:
 - **Terminal controls and transient notifications** without requiring a GUI.
 - **Optional refresh and launch sounds**, including snooze control.
 - **Regression and safety coverage** exercised by GitHub Actions.
+
+---
 
 ## Architecture
 
@@ -136,6 +147,8 @@ Dynamic recorder
 ```
 
 A canonical identity can have only one active owner. The registry covers workers in **LAUNCHING**, **RECORDING**, and **WAITING_FOR_SOURCE** states, so MANUAL and automatic launches cannot accidentally create duplicate active recordings for the same identity.
+
+---
 
 ## The recording engine — keeping a live recording alive
 
@@ -200,6 +213,8 @@ Together, the two parts have distinct responsibilities:
 **The Coordinator finds and manages the recordings that should exist.  
 The recording engine does the difficult work of keeping each one alive.**
 
+---
+
 ## Coordinator dashboard
 
 The Coordinator is the main Inspect / Watch interface. It presents the system as a live terminal dashboard rather than a GUI.
@@ -221,6 +236,8 @@ It shows:
 - meaningful change notifications
 
 The dashboard also exposes runtime controls for manual recording selection, information, sound control, refresh, and exit.
+
+---
 
 ## Unattended recording workflow
 
@@ -245,6 +262,8 @@ Continue watching for additional identities
 ```
 
 If the 20-worker active ceiling is reached, remaining identities stay watched instead of being incorrectly marked as failed.
+
+---
 
 ## Project structure
 
@@ -278,6 +297,8 @@ checkpoint0_tests/
     Regression and safety coverage.
 ```
 
+---
+
 ## Identity policies
 
 ### MANUAL
@@ -291,6 +312,8 @@ This is useful for broad observation targets where visibility is desired without
 Every newly eligible canonical identity is automatically launched through the same worker path used by MANUAL recording.
 
 Multiple matching identities can appear in one scan. Recorder can launch them as capacity permits while keeping duplicate ownership and the global worker ceiling enforced centrally.
+
+---
 
 ## Configuration
 
@@ -322,6 +345,8 @@ python record_dynamic.py
 
 The repository deliberately does not publish live user configuration, signed playback URLs, cookies, or local sound files.
 
+---
+
 ## Optional sounds
 
 Recorder and the Coordinator use separate optional local sound files:
@@ -339,6 +364,8 @@ sounds/launch.wav
 Coordinator launch notification takes priority when both Coordinator notification conditions happen in the same scan. Recorder and Coordinator sounds respect their sound-snooze controls.
 
 These optional local sound assets are not included in the repository.
+
+---
 
 ## Testing and CI
 
@@ -359,12 +386,16 @@ run_all_tests.bat
 
 The test suite covers the shared source core, identity derivation, Coordinator behavior, launch planning, registry ownership, runtime status, worker launch, terminal hosting, sound behavior, and architecture boundaries.
 
+---
+
 ## Branches
 
 - **main** — stable Recorder baseline.
 - **dev** — ongoing development and testing.
 
 Development is normally validated on `dev` and promoted to `main` after the regression suite is green.
+
+---
 
 ## Project status
 
@@ -373,6 +404,16 @@ Development is normally validated on `dev` and promoted to `main` after the regr
 Recorder already combines a mature recording engine with source discovery, quality-aware selection, recovery, controlled source changes, duplicate prevention, automatic launches, and live Coordinator monitoring.
 
 That gives the project a stable foundation to build on.
+
+---
+
+## Legal / Responsible Use
+
+Recorder is intended for lawful and authorized recording workflows.
+
+Users are responsible for ensuring that their use complies with applicable laws, service terms, content rights, and access permissions. Nothing in this project grants rights to access, decrypt, copy, record, or distribute content that the user is not otherwise authorized to use.
+
+---
 
 ## What’s next
 
