@@ -364,7 +364,7 @@ sounds/
 
 Coordinator launch notification takes priority when both Coordinator notification conditions happen in the same scan. Recorder and Coordinator sounds respect their sound-snooze controls.
 
-These optional local sound assets are not included in the repository.
+These sound assets are included in the repository under `sounds/`.
 
 ---
 
