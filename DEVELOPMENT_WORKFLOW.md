@@ -37,19 +37,35 @@ The purpose is to preserve detailed iteration while work is in progress without 
 
 `dev` should move to `main` only after the integrated work is considered stable and accepted.
 
-Promotion should happen through a deliberate review step. `main` is not an active development branch.
+Promotion happens through a pull request from `dev` to `main`. `main` is not an active development branch.
+
+For normal promotion, use a regular merge so the accepted commits already present on `dev` remain traceable on `main`. Because GitHub creates a merge commit for that promotion, `dev` may then appear to be one or more commits behind `main` even though it is not missing the promoted product changes. That is expected and should not be "fixed" merely to make the branch counters match.
 
 ## Repository enforcement
 
-GitHub branch protections or repository rules should enforce the important parts of this workflow where practical:
+The following GitHub rulesets are active:
 
-- protect `main` from direct development changes;
-- protect `dev` from substantial direct development changes;
-- require changes to reach protected branches through pull requests;
-- use squash merge for temporary feature/fix/chore branches into `dev`;
-- keep required tests/checks passing before protected-branch integration when those checks are available.
+### Protect main
 
-Repository settings are part of the workflow and should be reviewed if branch structure or CI changes.
+- Targets only the default branch, `main`.
+- Requires changes to reach `main` through a pull request.
+- Requires 0 approving reviews, which keeps the workflow usable for a solo maintainer.
+- Allows merge, squash, or rebase at the GitHub ruleset level.
+- Prevents deletion of `main`.
+- Prevents non-fast-forward history rewrites of `main`.
+
+### Protect dev
+
+- Targets only `dev`.
+- Requires changes to reach `dev` through a pull request.
+- Requires 0 approving reviews.
+- Allows **squash merge only**.
+- Prevents deletion of `dev`.
+- Prevents non-fast-forward history rewrites of `dev`.
+
+Temporary feature/fix/chore branches are intentionally left unrestricted so iterative work can proceed freely there.
+
+When required CI checks are added or changed in the future, the protection rules should be reviewed so protected-branch integration continues to reflect the project's actual validation requirements.
 
 ## Releases and versioning
 
