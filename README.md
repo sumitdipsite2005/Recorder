@@ -306,27 +306,27 @@ That gives the project a stable foundation to build on.
 
 ## What’s next
 
-The next phase is about turning Recorder from a powerful recording system into a more complete recording application.
+Recorder already solves a difficult part of live recording: once a recording is underway, it can inspect alternative sources, choose between them, recover from failures, renew access, perform controlled source changes, and keep recording while the live-stream environment changes around it. The Coordinator extends that further with **Inspect → Watch → Record → Auto**, allowing Recorder to discover and manage multiple live events rather than waiting for the user to start each recording manually.
 
-Today, Recorder can already inspect multiple candidates from dynamic playlists, choose the best usable source, recover from failures, renew access, and move to a better source when conditions change.
+The next phase is about taking that foundation further — both technically and as a product.
 
-Future work will extend that intelligence further:
+- **One Recorder application** — instead of exposing separate recording scripts and workflows, the user should eventually start with a simple choice: **I already have a source**, **Find something to record**, or **Saved channels / sources**. Recorder can then inspect what was provided or discovered and activate the appropriate recording capabilities underneath.
 
-- **One Recorder experience** — instead of exposing separate recording workflows, the user should simply choose what they want to record. Recorder will decide which source-management and recording capabilities are needed underneath.
+- **A graphical Recorder interface** — the current Coordinator already provides a live operational dashboard in the terminal. The longer-term direction is a full application for discovering streams, starting and monitoring recordings, managing saved sources, viewing recording health, and controlling multiple active recordings without requiring terminal interaction for normal use.
 
-- **A graphical Recorder interface** — the current Coordinator already works as a live terminal dashboard. The longer-term direction is a full application where users can search for streams, paste a source, choose saved channels, start recordings, monitor them, and use normal controls without relying primarily on terminal windows.
+- **Fresh playback-session acquisition and Widevine support** — many modern streaming services rely on short-lived manifests, cookies, headers, authorization sessions, and DRM. Future work aims to reduce the amount of playback information that must be obtained manually, while adding support for authorized Widevine-protected playback where required. Depending on the provider, that may involve the existing Widevine proxy handling the session/license exchange or deeper authorized CDM integration.
 
-- **Smarter saved and fixed sources** — the same kind of source comparison and switching that already exists for dynamic playlist candidates should also work across multiple saved or manually configured sources for one logical channel or recording target.
+- **Extend Recorder’s existing source intelligence** — Recorder already compares and switches between candidates discovered through dynamic playlists. The same capability should eventually apply to multiple saved or manually configured sources representing the same logical channel or recording target, allowing Recorder to inspect them, choose the strongest usable source, monitor it, and move to another when necessary.
 
-- **Less manual stream preparation** — where providers use short-lived URLs, cookies, headers, or playback sessions, Recorder should increasingly be able to obtain or refresh that information through supported acquisition paths.
+- **More recording-engine flexibility** — source understanding should come before engine choice. The roadmap expands beyond the current primary N_m3u8DL-RE workflow with broader FFmpeg support and, where appropriate, engines such as yt-dlp or Streamlink. Longer term, Recorder may be able to select or fall back between engines based on source capabilities and runtime conditions.
 
-- **More recording-engine flexibility** — once Recorder understands a source, it should be able to use the most appropriate supported recording engine, including broader FFmpeg workflows and additional engines where they fit.
+- **Less interruption when authorization changes** — today Recorder already has mature authorization-renewal and recovery behavior. Future work goes further by investigating whether fresh URLs, cookies, headers, or session information can be applied to an active recording without restarting the downloader when the underlying engine supports it.
 
-- **Even stronger unattended recording** — future work includes smoother authorization replacement, clearer persistent recording status, and deeper recovery capabilities for long-running recordings.
+- **Deeper recovery after interruptions** — one longer-term goal is to go beyond simply resuming from the live edge. Where a provider exposes a DVR or rewind window, Recorder may eventually be able to identify segments missed during an interruption, recover them, and then continue back toward live.
 
-The long-term direction is simple:
+- **Easier installation for people who just want to use it** — Recorder is currently a source-code project. A future run-only distribution should make installation, configuration, launching, and updating substantially easier without requiring a development environment.
 
-**You choose what you want to record. Recorder handles more and more of the complexity required to find it, understand it, keep it healthy, and complete the recording.**
+The direction is broader than adding individual features. Recorder is gradually moving toward a system where **the user describes what they want to record, while the software handles more of the work required to discover the source, understand it, choose how to record it, keep it healthy, and recover when something goes wrong.**
 
 ### End-user installation status
 
