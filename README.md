@@ -300,9 +300,33 @@ Development is normally validated on `dev` and promoted to `main` after the regr
 
 **Inspect / Watch / Record / Auto is implemented and promoted to the stable baseline.**
 
-The completed system includes source discovery, quality inspection, canonical identity grouping, MANUAL and ALL_IDENTITIES operation, duplicate prevention, shared worker ownership, automatic launches, dashboard monitoring, recovery integration, sound controls, and the shared 20-worker ceiling.
+Recorder already combines a mature recording engine with source discovery, quality-aware selection, recovery, controlled source changes, duplicate prevention, automatic launches, and live Coordinator monitoring.
 
-Future work can continue on top of this baseline without changing the completed Inspect / Watch / Record / Auto model.
+That gives the project a stable foundation to build on.
+
+## What’s next
+
+The next phase is about turning Recorder from a powerful recording system into a more complete recording application.
+
+Today, Recorder can already inspect multiple candidates from dynamic playlists, choose the best usable source, recover from failures, renew access, and move to a better source when conditions change.
+
+Future work will extend that intelligence further:
+
+- **One Recorder experience** — instead of exposing separate recording workflows, the user should simply choose what they want to record. Recorder will decide which source-management and recording capabilities are needed underneath.
+
+- **A graphical Recorder interface** — the current Coordinator already works as a live terminal dashboard. The longer-term direction is a full application where users can search for streams, paste a source, choose saved channels, start recordings, monitor them, and use normal controls without relying primarily on terminal windows.
+
+- **Smarter saved and fixed sources** — the same kind of source comparison and switching that already exists for dynamic playlist candidates should also work across multiple saved or manually configured sources for one logical channel or recording target.
+
+- **Less manual stream preparation** — where providers use short-lived URLs, cookies, headers, or playback sessions, Recorder should increasingly be able to obtain or refresh that information through supported acquisition paths.
+
+- **More recording-engine flexibility** — once Recorder understands a source, it should be able to use the most appropriate supported recording engine, including broader FFmpeg workflows and additional engines where they fit.
+
+- **Even stronger unattended recording** — future work includes smoother authorization replacement, clearer persistent recording status, and deeper recovery capabilities for long-running recordings.
+
+The long-term direction is simple:
+
+**You choose what you want to record. Recorder handles more and more of the complexity required to find it, understand it, keep it healthy, and complete the recording.**
 
 ### End-user installation status
 
