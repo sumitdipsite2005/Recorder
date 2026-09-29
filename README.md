@@ -1,6 +1,11 @@
 # Recorder — Inspect · Watch · Record · Auto
 
 [![Recorder Tests](https://github.com/sumitdipsite2005/Recorder/actions/workflows/tests.yml/badge.svg)](https://github.com/sumitdipsite2005/Recorder/actions/workflows/tests.yml)
+![Language](https://img.shields.io/badge/language-Python-3776AB?logo=python&logoColor=white)
+![Streaming formats](https://img.shields.io/badge/streams-HLS%20%7C%20DASH-0A84FF)
+![DRM](https://img.shields.io/badge/DRM-ClearKey-7B2CBF)
+![Recording engine](https://img.shields.io/badge/engine-N__m3u8DL--RE-555555)
+![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS-5C5C5C)
 
 **A terminal-first live-stream recording system that discovers sources, inspects their quality and usability, watches logical event identities, and launches resilient recording workers automatically or on demand.**
 
