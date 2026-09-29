@@ -50,6 +50,7 @@ The following GitHub rulesets are active:
 - Targets only the default branch, `main`.
 - Requires changes to reach `main` through a pull request.
 - Requires 0 approving reviews, which keeps the workflow usable for a solo maintainer.
+- Requires the `tests` status check from the `recorder-tests` GitHub Actions workflow to pass before merging.
 - Allows merge, squash, or rebase at the GitHub ruleset level.
 - Prevents deletion of `main`.
 - Prevents non-fast-forward history rewrites of `main`.
@@ -59,13 +60,14 @@ The following GitHub rulesets are active:
 - Targets only `dev`.
 - Requires changes to reach `dev` through a pull request.
 - Requires 0 approving reviews.
+- Requires the `tests` status check from the `recorder-tests` GitHub Actions workflow to pass before merging.
 - Allows **squash merge only**.
 - Prevents deletion of `dev`.
 - Prevents non-fast-forward history rewrites of `dev`.
 
 Temporary feature/fix/chore branches are intentionally left unrestricted so iterative work can proceed freely there.
 
-When required CI checks are added or changed in the future, the protection rules should be reviewed so protected-branch integration continues to reflect the project's actual validation requirements.
+The required `tests` check is enforced on both protected branches. If CI jobs or validation requirements change in the future, the rulesets and this document should be reviewed together so the enforced checks continue to match the project's actual test workflow.
 
 ## Releases and versioning
 
