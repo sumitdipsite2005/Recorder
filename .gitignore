@@ -180,7 +180,5 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Local recorder sound files
-sounds/*.wav
 .DS_Store
 recorder_dynamic_user_config*.py

@@ -349,12 +349,13 @@ The repository deliberately does not publish live user configuration, signed pla
 
 ## Optional sounds
 
-Recorder and the Coordinator use separate optional local sound files:
+Recorder and the Coordinator use optional local sound files from the shared `sounds/` folder:
 
 ```text
-alarm.wav
-sounds/refresh.wav
-sounds/launch.wav
+sounds/
+    alarm.wav
+    refresh.wav
+    launch.wav
 ```
 
 - `alarm.wav` — recording-engine alarm sound for serious runtime conditions.
@@ -363,7 +364,7 @@ sounds/launch.wav
 
 Coordinator launch notification takes priority when both Coordinator notification conditions happen in the same scan. Recorder and Coordinator sounds respect their sound-snooze controls.
 
-These optional local sound assets are not included in the repository.
+These sound assets are included in the repository under `sounds/`.
 
 ---
 

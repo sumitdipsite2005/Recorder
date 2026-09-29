@@ -2316,12 +2316,16 @@ def _alarm_beep_fallback_loop(
         stop_event.wait(float(NM3U8DL_ALARM_BEEP_GAP_SEC))
 
 def _resolve_alarm_sound_path() -> Optional[str]:
-    # ALARM_SOUND_FILENAME may be absolute or relative to this script folder.
+    # ALARM_SOUND_FILENAME may be absolute or relative to the shared sounds folder.
     try:
         if os.path.isabs(ALARM_SOUND_FILENAME):
             p = ALARM_SOUND_FILENAME
         else:
-            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ALARM_SOUND_FILENAME)
+            p = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "sounds",
+                ALARM_SOUND_FILENAME,
+            )
     except Exception:
         return None
     return p
