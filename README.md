@@ -4,8 +4,8 @@
 ![Language](https://img.shields.io/badge/language-Python-3776AB?logo=python&logoColor=white)
 ![Streaming formats](https://img.shields.io/badge/streams-HLS%20%7C%20DASH-0A84FF)
 ![DRM](https://img.shields.io/badge/DRM-ClearKey-7B2CBF)
-![Recording engine](https://img.shields.io/badge/engine-N__m3u8DL--RE-555555)
-![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS-5C5C5C)
+![Recording engine](https://img.shields.io/badge/engine-N__m3u8DL--RE-EF6C00)
+![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS-00897B)
 
 **A terminal-first live-stream recording system that discovers sources, inspects their quality and usability, watches logical event identities, and launches resilient recording workers automatically or on demand.**
 
