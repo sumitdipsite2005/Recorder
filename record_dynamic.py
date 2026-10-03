@@ -3944,6 +3944,8 @@ def run_ffmpeg_with_capture(cmd, cwd, tag="FFmpeg"):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
 

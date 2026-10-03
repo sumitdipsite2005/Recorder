@@ -553,6 +553,14 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("merged = merge_auth_expiries(*values)", discovery)
         self.assertNotIn("return min(known) if known else None", discovery)
 
+    def test_ffmpeg_finalization_capture_uses_utf8_stderr_decoding(self):
+        recorder=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
+        start=recorder.index("def run_ffmpeg_with_capture(")
+        end=recorder.index("def start_ffmpeg_to_chunk(", start)
+        helper=recorder[start:end]
+        self.assertIn('encoding="utf-8"', helper)
+        self.assertIn('errors="replace"', helper)
+
     def test_mature_recorder_consumes_shared_policy(self):
         text=(ROOT/"record_dynamic.py").read_text(encoding="utf-8")
         self.assertIn("from recorder_source.policy import",text)
