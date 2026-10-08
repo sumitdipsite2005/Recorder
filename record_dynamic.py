@@ -6045,14 +6045,22 @@ def resolve_nm3u8dl_license_url(
         separators=(",", ":"),
     ).encode("utf-8")
 
+    clean_license_url, license_headers = (
+        source_playlist_headers.split_stream_url_metadata(
+            license_url,
+            policy=source_playlist_headers.MATURE_PLAYLIST_HEADER_POLICY,
+        )
+    )
+    request_headers = {"User-Agent": "curl/8.21.0"}
+    request_headers.update(license_headers)
+    request_headers.update({
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    })
     request = Request(
-        license_url,
+        clean_license_url,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "curl/8.21.0",
-        },
+        headers=request_headers,
         method="POST",
     )
 

@@ -190,7 +190,15 @@ def normalize_playlist_license_key(value: str) -> Tuple[str, ...]:
     if not text:
         return ()
     if not text.startswith("{"):
-        return (text,)
+        if text.lower().startswith(("http://", "https://")) or "," not in text:
+            return (text,)
+        pairs = [pair.strip() for pair in text.split(",")]
+        if not all(
+            re.fullmatch(r"[0-9a-fA-F]{32}:[0-9a-fA-F]{32}", pair)
+            for pair in pairs
+        ):
+            raise RuntimeError("Invalid comma-separated ClearKey KID:KEY list")
+        return tuple(dict.fromkeys(pairs))
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
