@@ -470,6 +470,57 @@ https://edge.drmlive.net/live.mpd
             ("ba8896d605246871ac424878491d86a1:8600d4153034b3cbc852f13ea4b7482c",),
         )
 
+    def test_clearkey_comma_separated_pairs_keep_every_key(self):
+        pairs = tuple(f"{index:032x}:{index + 30:032x}" for index in range(1, 11))
+        self.assertEqual(
+            normalize_playlist_license_key(",".join(pairs)),
+            pairs,
+        )
+        self.assertEqual(
+            normalize_playlist_license_key("  " + pairs[0] + ", " + pairs[1] + "  "),
+            pairs[:2],
+        )
+        self.assertEqual(
+            normalize_playlist_license_key(pairs[0]),
+            (pairs[0],),
+        )
+        self.assertEqual(
+            normalize_playlist_license_key(
+                "https://license.test/get?ids=one,two|Referer=https://site.test/"
+            ),
+            ("https://license.test/get?ids=one,two|Referer=https://site.test/",),
+        )
+        with self.assertRaisesRegex(RuntimeError, "Invalid comma-separated ClearKey"):
+            normalize_playlist_license_key(pairs[0] + ",not-a-key")
+
+    def test_sonuxs_json_keys_are_preserved_when_legacy_fields_null(self):
+        pairs = [f"{index:032x}:{index + 30:032x}" for index in range(1, 6)]
+        source = {
+            "channels": [{
+                "id": "E1HD",
+                "name": "Star Sports 1 HD",
+                "stream_url": "https://cdn.test/star.mpd",
+                "key_id": None,
+                "key": None,
+                "sonuxs": pairs,
+                "cookie": "__hdnea__=test",
+            }],
+        }
+        candidate = parse_playlist_text(json.dumps(source)).candidates[0]
+        self.assertEqual(candidate.keys, tuple(pairs))
+        self.assertEqual(candidate.license_type, "clearkey")
+        self.assertEqual(candidate.headers["Cookie"], "__hdnea__=test")
+
+    def test_sonuxs_does_not_replace_existing_explicit_license_key(self):
+        source = {"channels": [{
+            "name": "A",
+            "stream_url": "https://cdn.test/a.mpd",
+            "license_key": "abc:def",
+            "sonuxs": ["11111111111111111111111111111111:22222222222222222222222222222222"],
+        }]}
+        candidate = parse_playlist_text(json.dumps(source)).candidates[0]
+        self.assertEqual(candidate.keys, ("abc:def",))
+
     def test_effective_probe_headers_use_mature_provider_defaults(self):
         headers = build_effective_probe_headers(
             "SONYLIV",

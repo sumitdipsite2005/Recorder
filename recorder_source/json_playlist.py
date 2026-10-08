@@ -232,6 +232,19 @@ def _entry_lines(
         if key_id and key_value:
             license_key = f"{key_id}:{key_value}"
 
+    if not license_key:
+        sonuxs = _alias_value(
+            record, ("sonuxs",), first_wins=policy.first_record_alias_wins,
+        )
+        if isinstance(sonuxs, (list, tuple)):
+            pairs = [
+                value.strip()
+                for value in sonuxs
+                if isinstance(value, str) and value.strip()
+            ]
+            if pairs:
+                license_key = ",".join(pairs)
+
     if license_key:
         lines.extend([
             "#KODIPROP:inputstream.adaptive.license_type=clearkey",
