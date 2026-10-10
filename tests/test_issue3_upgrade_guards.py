@@ -190,5 +190,158 @@ class IDETConfirmationTests(unittest.TestCase):
         self.detect.assert_not_called()
 
 
+class UpgradeDecisionIntegrationTests(unittest.TestCase):
+    """Exercise the actual upgrade-decision block without recorder startup."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parents[1]
+        tree = ast.parse((root / "record_dynamic.py").read_text(encoding="utf-8"))
+        monitor = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "monitor_nm3u8dl_playlist_renewal"
+        )
+        decision_if = next(
+            node for node in ast.walk(monitor)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "quality_evaluation_due"
+        )
+        harness = ast.parse("def run_decision():\\n    pass\\n".replace("\\n", "\n"))
+        harness.body[0].body = decision_if.body
+        cls.decision_code = compile(
+            ast.fix_missing_locations(harness),
+            str(root / "record_dynamic.py"),
+            "exec",
+        )
+
+    def evaluate(self, current, alternatives, confirm=None, stopped=False):
+        import time as time_module
+        from recorder_source import selection as selection_module
+
+        running = current.to_mapping()
+        candidate_pool = [x.to_mapping() for x in alternatives]
+        logs = []
+        approvals = []
+        state = SimpleNamespace(
+            nm3u8dl_running_source=running,
+            nm3u8dl_pending_source=None,
+            nm3u8dl_rollover_reason=None,
+            nm3u8dl_renewal_rollover_requested=False,
+            stop_flag=False,
+        )
+
+        def pick(running_source, pool, target_fps, min_remaining,
+                 allow_unknown_expiry=False, now_ts=None):
+            return select_quality_upgrade(
+                SourceCandidate.from_mapping(running_source),
+                [SourceCandidate.from_mapping(item) for item in pool],
+                target_fps,
+                SelectionPolicy(
+                    mandatory_min_remaining_sec=900,
+                    upgrade_min_remaining_sec=900,
+                    allow_unknown_expiry=allow_unknown_expiry,
+                ),
+                now_ts=1000,
+            )
+
+        def choose_confirmation(candidate, stop_requested=None):
+            if confirm is None:
+                return "not_required"
+            result = confirm(candidate)
+            if stopped:
+                state.stop_flag = True
+            return result
+
+        env = {
+            "stop_event": SimpleNamespace(is_set=lambda: False),
+            "state": state,
+            "running_source": running,
+            "candidate_pool": candidate_pool,
+            "resolution": {},
+            "check_time": 1000.0,
+            "quality_upgrade_target_fps": 50.0,
+            "quality_min_remaining_min": 15,
+            "allow_unknown_expiry": False,
+            "NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS": 50.0,
+            "source_selection": selection_module,
+            "time": SimpleNamespace(time=lambda: 1000),
+            "get_nm3u8dl_quality_upgrade_selection_decision": pick,
+            "_confirm_nm3u8dl_quality_upgrade_idet": choose_confirmation,
+            "log": lambda message, level="INFO": logs.append(message),
+            "log_quality_upgrade_found": (
+                lambda candidate, check_time: approvals.append(candidate)
+            ),
+            "_nm3u8dl_video_quality_rank": (
+                lambda item: selection_module.video_quality_rank(
+                    item, motion_cap_fps=50
+                )
+            ),
+            "_nm3u8dl_ranking_motion_fps": (
+                lambda item: selection_module.ranking_motion_fps(
+                    item, motion_cap_fps=50
+                )
+            ),
+            "get_nm3u8dl_candidate_quality_rank": (
+                lambda item: (
+                    int(item.get("preferred_qualifier_score") or 0),
+                    *selection_module.video_quality_rank(item, motion_cap_fps=50),
+                )
+            ),
+            "format_nm3u8dl_candidate_quality": (
+                lambda item: item.get("entry_title") or "stream"
+            ),
+            "fmt_hms": lambda seconds: str(seconds),
+        }
+        exec(self.decision_code, env)
+        env["run_decision"]()
+        return state, approvals, logs
+
+    def test_failed_idet_rechecks_alternative_without_switching_to_failed(self):
+        current = source(4_000_000, entry_title="current")
+        first = source(
+            5_200_000, entry_title="failed-idet",
+            video_scan_type_source="idet",
+        )
+        second = source(
+            4_600_000, entry_title="alternative",
+            video_scan_type_source="manifest",
+        )
+        state, approvals, logs = self.evaluate(
+            current, [second, first],
+            confirm=lambda candidate: (
+                "failed" if candidate["entry_title"] == "failed-idet"
+                else "not_required"
+            ),
+        )
+        self.assertEqual(state.nm3u8dl_pending_source["entry_title"], "alternative")
+        self.assertEqual([x["entry_title"] for x in approvals], ["alternative"])
+        self.assertTrue(any("FAILED" in item for item in logs))
+        self.assertTrue(any("alternative candidate" in item for item in logs))
+
+    def test_small_bitrate_gain_keeps_recording(self):
+        current = source(4_380_000, entry_title="current")
+        slight = source(
+            4_478_000, entry_title="slight",
+            video_scan_type_source="manifest",
+        )
+        state, approvals, logs = self.evaluate(current, [slight])
+        self.assertIsNone(state.nm3u8dl_pending_source)
+        self.assertEqual(approvals, [])
+        self.assertTrue(any("less than 10%" in item for item in logs))
+
+    def test_recovery_started_during_confirmation_never_commits_upgrade(self):
+        current = source(4_000_000)
+        alternative = source(
+            4_800_000, video_scan_type_source="idet",
+        )
+        state, approvals, _ = self.evaluate(
+            current, [alternative], confirm=lambda c: "confirmed", stopped=True,
+        )
+        self.assertIsNone(state.nm3u8dl_pending_source)
+        self.assertEqual(approvals, [])
+
+
 if __name__ == "__main__":
     unittest.main()
