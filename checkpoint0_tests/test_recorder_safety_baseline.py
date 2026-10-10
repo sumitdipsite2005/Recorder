@@ -147,6 +147,42 @@ class RecorderSafetyBaselineTests(unittest.TestCase):
         RECORDER.NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = rejected or []
         RECORDER.NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = preferred or []
 
+    def test_tv_playlists_win_exact_ties_before_common(self):
+        tv_url = "https://tv.test/list.m3u"
+        common_url = "https://common.test/list.m3u"
+        with (
+            patch.object(RECORDER, "NM3U8DL_PLAYLIST_GROUP", "SONY_TV"),
+            patch.object(RECORDER, "NM3U8DL_PLAYLIST_GROUPS", {
+                "COMMON": [common_url],
+                "TV": [tv_url],
+            }),
+        ):
+            self.assertEqual(
+                RECORDER.get_nm3u8dl_playlist_urls(),
+                [tv_url, common_url],
+            )
+
+            tv = make_candidate("TV", expiry=4_000_000_000)
+            common = make_candidate("COMMON", expiry=4_000_000_000)
+            tv["playlist_url"] = tv_url
+            common["playlist_url"] = common_url
+
+            self.assertIs(
+                RECORDER.get_nm3u8dl_join_candidate(
+                    [tv, common], now_ts=2_000_000_000,
+                ),
+                tv,
+            )
+
+            # Higher quality must still outrank source-list order.
+            common["video_bitrate_bps"] += 1_000_000
+            self.assertIs(
+                RECORDER.get_nm3u8dl_join_candidate(
+                    [tv, common], now_ts=2_000_000_000,
+                ),
+                common,
+            )
+
     def test_manual_header_and_runtime_status_share_recording_start(self):
         state = RECORDER.RecorderState()
         state.identity_launch_request = SimpleNamespace(
