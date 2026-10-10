@@ -4557,7 +4557,8 @@ def get_nm3u8dl_playlist_urls() -> List[str]:
 
     playlist_urls = []
 
-    for source_group in ("COMMON", source_bucket):
+    # Keep source-specific TV choices first when selection rankings tie.
+    for source_group in (source_bucket, "COMMON"):
         for playlist_source in NM3U8DL_PLAYLIST_GROUPS.get(
             source_group,
             [],
