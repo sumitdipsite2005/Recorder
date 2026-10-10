@@ -115,6 +115,34 @@ def video_quality_rank(
     )
 
 
+
+def bitrate_only_upgrade_below_minimum(
+    running_source: Union[Mapping[str, object], SourceCandidate],
+    alternative: Union[Mapping[str, object], SourceCandidate],
+    *,
+    motion_cap_fps: float,
+    minimum_percent: int = 10,
+) -> bool:
+    """Guard only upgrades where bitrate is the sole video-rank difference.
+
+    Unknown bitrate leaves the mature selection behavior unchanged. Comparing
+    integer products avoids rounding at the exact percentage boundary.
+    """
+    running = _as_candidate(running_source)
+    proposed = _as_candidate(alternative)
+    current_bitrate = int(running.video_bitrate_bps or 0)
+    proposed_bitrate = int(proposed.video_bitrate_bps or 0)
+    if current_bitrate <= 0 or proposed_bitrate <= 0:
+        return False
+
+    current_rank = video_quality_rank(running, motion_cap_fps=motion_cap_fps)
+    proposed_rank = video_quality_rank(proposed, motion_cap_fps=motion_cap_fps)
+    return (
+        current_rank[:-1] == proposed_rank[:-1]
+        and proposed_bitrate > current_bitrate
+        and proposed_bitrate * 100 < current_bitrate * (100 + minimum_percent)
+    )
+
 def candidate_quality_rank(
     candidate: Union[Mapping[str, object], SourceCandidate],
     policy: SelectionPolicy,
