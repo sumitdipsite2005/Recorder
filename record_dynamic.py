@@ -15566,21 +15566,6 @@ def monitor_nm3u8dl_playlist_renewal(
                 candidate_index = upgrade_selection.selected_index
                 proposed_upgrade = remaining_upgrade_candidates[candidate_index]
 
-                if source_selection.bitrate_only_upgrade_below_minimum(
-                    running_source,
-                    proposed_upgrade,
-                    motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
-                    minimum_percent=10,
-                ):
-                    log(
-                        "Quality upgrade bitrate safeguard → REJECTED; "
-                        "bitrate is the only quality difference and the increase "
-                        "is less than 10%; checking other candidates."
-                    )
-                    rejected_upgrade_count += 1
-                    del remaining_upgrade_candidates[candidate_index]
-                    continue
-
                 idet_confirmation = _confirm_nm3u8dl_quality_upgrade_idet(
                     proposed_upgrade,
                     stop_requested=quality_upgrade_cancelled,
@@ -15601,6 +15586,21 @@ def monitor_nm3u8dl_playlist_renewal(
 
                 if idet_confirmation == "confirmed":
                     log("Quality upgrade IDET confirmation → CONFIRMED.")
+
+                if source_selection.bitrate_only_upgrade_below_minimum(
+                    running_source,
+                    proposed_upgrade,
+                    motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+                    minimum_percent=10,
+                ):
+                    log(
+                        "Quality upgrade bitrate safeguard → REJECTED; "
+                        "bitrate is the only quality difference and the increase "
+                        "is less than 10%; checking other candidates."
+                    )
+                    rejected_upgrade_count += 1
+                    del remaining_upgrade_candidates[candidate_index]
+                    continue
 
                 upgrade_candidate = dict(proposed_upgrade)
                 break
