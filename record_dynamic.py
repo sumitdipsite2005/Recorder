@@ -8188,6 +8188,104 @@ def _detect_nm3u8dl_stream_scan_type_with_idet(
                 scan_type_cache["results"][cache_key] = scan_type
         return scan_type
 
+
+def _confirm_nm3u8dl_quality_upgrade_idet(
+    candidate: dict,
+    stop_requested: Optional[Callable[[], bool]] = None,
+) -> str:
+    """Confirm an IDET upgrade on the exact selected media, never its cache.
+
+    Returns not_required, confirmed, failed, inconclusive, or cancelled.
+    This is a quality-upgrade guard, not an access-block classifier.
+    """
+    if str(candidate.get("video_scan_type_source") or "").strip().casefold() != "idet":
+        return "not_required"
+
+    expected = _normalize_nm3u8dl_video_scan_type(
+        candidate.get("video_scan_type")
+    )
+    if not expected:
+        return "inconclusive"
+    if stop_requested is not None and stop_requested():
+        return "cancelled"
+
+    headers = candidate.get("effective_headers")
+    if not isinstance(headers, dict):
+        try:
+            headers = get_nm3u8dl_effective_headers(
+                candidate.get("headers") or {}, emit_logs=False
+            )
+        except Exception:
+            return "inconclusive"
+
+    stream_type = str(candidate.get("stream_type") or "").upper()
+    temp_path = ""
+    if stream_type == "HLS":
+        probe_url = str(
+            candidate.get("manifest_variant_url")
+            or candidate.get("stream_url")
+            or ""
+        ).strip()
+        sample_headers = headers
+        sample_range = ""
+        effective_url = str(
+            candidate.get("selected_media_final_url")
+            or candidate.get("manifest_final_url")
+            or ""
+        ).strip()
+    elif stream_type == "DASH":
+        try:
+            probe_url, sample_headers, sample_range, temp_path = (
+                _prepare_nm3u8dl_selected_dash_media_sample(candidate, headers)
+            )
+        except Exception:
+            return "inconclusive"
+        # Mirror the original DASH IDET probe's selected-representation route.
+        effective_url = str(
+            candidate.get("manifest_final_url")
+            or candidate.get("stream_url")
+            or ""
+        ).strip()
+    else:
+        return "inconclusive"
+
+    try:
+        if stop_requested is not None and stop_requested():
+            return "cancelled"
+        if not probe_url:
+            return "inconclusive"
+        keys = _nm3u8dl_known_media_probe_keys(candidate, candidate, headers)
+        if not keys:
+            return "inconclusive"
+
+        for key in keys:
+            if stop_requested is not None and stop_requested():
+                return "cancelled"
+            observed = _detect_nm3u8dl_stream_scan_type_with_idet(
+                probe_url,
+                sample_headers,
+                scan_type_cache=None,
+                timeout_route=_format_candidate_timeout_route(
+                    [str(candidate.get("playlist_url") or "")],
+                    candidate.get("manifest_final_url") or probe_url,
+                ),
+                effective_stream_url=effective_url,
+                decryption_key=key,
+            )
+            if stop_requested is not None and stop_requested():
+                return "cancelled"
+            if observed:
+                return "confirmed" if observed == expected else "failed"
+        return "inconclusive"
+    except Exception:
+        return "inconclusive"
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
 def _ffprobe_nm3u8dl_stream_quality(
     stream_url: str,
     headers: dict,
@@ -15299,26 +15397,6 @@ def monitor_nm3u8dl_playlist_renewal(
                 )
             )
 
-        targeted_upgrade_candidate = None
-
-        if targeted_access_scan and quality_upgrade_enabled:
-            targeted_upgrade_candidate = (
-                get_nm3u8dl_quality_upgrade_candidate(
-                    running_source,
-                    candidate_pool,
-                    quality_upgrade_target_fps,
-                    quality_min_remaining_min,
-                    allow_unknown_expiry=allow_unknown_expiry,
-                    now_ts=check_time,
-                )
-            )
-
-            if targeted_upgrade_candidate is not None:
-                log_quality_upgrade_found(
-                    targeted_upgrade_candidate,
-                    check_time,
-                )
-
         if targeted_access_scan:
             access_history_changed = process_nm3u8dl_targeted_access_verification(
                 state,
@@ -15334,7 +15412,7 @@ def monitor_nm3u8dl_playlist_renewal(
                 ),
                 running_source=running_source,
                 access_check_interval_sec=access_check_interval_sec,
-                selected_candidate=targeted_upgrade_candidate,
+                selected_candidate=None,
             )
         else:
             confirmed_blocked_urls = (
@@ -15457,21 +15535,79 @@ def monitor_nm3u8dl_playlist_renewal(
         )
 
         if quality_evaluation_due:
-            upgrade_candidate = targeted_upgrade_candidate
+            # Reuse the mature selector on the current scan pool. Rejected
+            # quality candidates are removed only from this upgrade decision.
+            remaining_upgrade_candidates = list(candidate_pool)
+            rejected_upgrade_count = 0
+            upgrade_candidate = None
 
-            if upgrade_candidate is None:
-                upgrade_candidate = (
-                    get_nm3u8dl_quality_upgrade_candidate(
-                        running_source,
-                        candidate_pool,
-                        quality_upgrade_target_fps,
-                        quality_min_remaining_min,
-                        allow_unknown_expiry=allow_unknown_expiry,
-                        now_ts=check_time,
-                    )
+            def quality_upgrade_cancelled():
+                return (
+                    stop_event.is_set()
+                    or state.stop_flag
+                    or state.nm3u8dl_running_source is not running_source
                 )
 
+            while remaining_upgrade_candidates:
+                if quality_upgrade_cancelled():
+                    return
+
+                upgrade_selection = get_nm3u8dl_quality_upgrade_selection_decision(
+                    running_source,
+                    remaining_upgrade_candidates,
+                    quality_upgrade_target_fps,
+                    quality_min_remaining_min,
+                    allow_unknown_expiry=allow_unknown_expiry,
+                    now_ts=time.time(),
+                )
+                if upgrade_selection.selected_index is None:
+                    break
+
+                candidate_index = upgrade_selection.selected_index
+                proposed_upgrade = remaining_upgrade_candidates[candidate_index]
+
+                if source_selection.bitrate_only_upgrade_below_minimum(
+                    running_source,
+                    proposed_upgrade,
+                    motion_cap_fps=NM3U8DL_QUALITY_RANKING_MOTION_CAP_FPS,
+                    minimum_percent=10,
+                ):
+                    log(
+                        "Quality upgrade bitrate safeguard → REJECTED; "
+                        "bitrate is the only quality difference and the increase "
+                        "is less than 10%; checking other candidates."
+                    )
+                    rejected_upgrade_count += 1
+                    del remaining_upgrade_candidates[candidate_index]
+                    continue
+
+                idet_confirmation = _confirm_nm3u8dl_quality_upgrade_idet(
+                    proposed_upgrade,
+                    stop_requested=quality_upgrade_cancelled,
+                )
+                if idet_confirmation == "cancelled" or quality_upgrade_cancelled():
+                    return
+
+                if idet_confirmation in ("failed", "inconclusive"):
+                    log(
+                        f"Quality upgrade IDET confirmation → "
+                        f"{idet_confirmation.upper()}; candidate excluded "
+                        "for this scan; checking other candidates.",
+                        level="WARN",
+                    )
+                    rejected_upgrade_count += 1
+                    del remaining_upgrade_candidates[candidate_index]
+                    continue
+
+                if idet_confirmation == "confirmed":
+                    log("Quality upgrade IDET confirmation → CONFIRMED.")
+
+                upgrade_candidate = dict(proposed_upgrade)
+                break
+
             if upgrade_candidate is not None:
+                if quality_upgrade_cancelled():
+                    return
                 for metadata_key in (
                     "candidate_count",
                     "playlist_source_count",
@@ -15480,16 +15616,19 @@ def monitor_nm3u8dl_playlist_renewal(
                     "source_errors",
                     "source_results",
                 ):
-                    upgrade_candidate[metadata_key] = (
-                        resolution.get(metadata_key)
-                    )
+                    upgrade_candidate[metadata_key] = resolution.get(metadata_key)
 
-                if targeted_upgrade_candidate is None:
-                    log_quality_upgrade_found(
-                        upgrade_candidate,
-                        check_time,
+                if rejected_upgrade_count:
+                    log(
+                        "Quality upgrade decision → alternative candidate "
+                        f"selected after rejecting {rejected_upgrade_count} "
+                        "candidate(s) in this scan."
                     )
+                # This is the first point an upgrade can be reported approved.
+                log_quality_upgrade_found(upgrade_candidate, check_time)
 
+                if quality_upgrade_cancelled():
+                    return
                 state.nm3u8dl_pending_source = upgrade_candidate
                 state.nm3u8dl_rollover_reason = "quality_upgrade"
                 state.nm3u8dl_renewal_rollover_requested = True
@@ -15563,6 +15702,14 @@ def monitor_nm3u8dl_playlist_renewal(
                     f"no usable candidate; current "
                     f"{format_nm3u8dl_candidate_quality(running_source)} "
                     f"continues"
+                )
+                quality_decision_level = "WARN"
+
+            if rejected_upgrade_count:
+                quality_decision = (
+                    f"{rejected_upgrade_count} quality-upgrade candidate(s) "
+                    "rejected by IDET confirmation or the bitrate safeguard; "
+                    "current recording continues"
                 )
                 quality_decision_level = "WARN"
 
