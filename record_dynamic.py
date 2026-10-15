@@ -109,27 +109,29 @@ from recorder_source.policy import (
 )
 
 # User configuration is shared through OneDrive across all recorder machines.
-if sys.platform == "darwin":
+_custom_config_path = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+if _custom_config_path:
+    DYNAMIC_CONFIG_PATH = os.path.abspath(
+        os.path.expanduser(_custom_config_path)
+    )
+    RECORDER_CONFIG_DIR = os.path.dirname(DYNAMIC_CONFIG_PATH)
+elif sys.platform == "darwin":
     RECORDER_CONFIG_DIR = os.path.expanduser(
         "~/Library/CloudStorage/OneDrive-Personal/RECORDER"
     )
+    DYNAMIC_CONFIG_PATH = os.path.join(
+        RECORDER_CONFIG_DIR,
+        "recorder_dynamic_user_config.py",
+    )
 elif os.name == "nt":
-    ONEDRIVE_ROOT = os.environ.get("OneDrive")
-    if not ONEDRIVE_ROOT:
-        raise RuntimeError("Windows OneDrive folder could not be located.")
+    ONEDRIVE_ROOT = os.environ.get("OneDrive") or os.environ.get("USERPROFILE") or tempfile.gettempdir()
     RECORDER_CONFIG_DIR = os.path.join(ONEDRIVE_ROOT, "RECORDER")
+    DYNAMIC_CONFIG_PATH = os.path.join(
+        RECORDER_CONFIG_DIR,
+        "recorder_dynamic_user_config.py",
+    )
 else:
     raise RuntimeError("Unsupported operating system for recorder config location.")
-
-DYNAMIC_CONFIG_PATH = os.path.abspath(
-    os.path.expanduser(
-        os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
-        or os.path.join(
-            RECORDER_CONFIG_DIR,
-            "recorder_dynamic_user_config.py",
-        )
-    )
-)
 
 if not os.path.isfile(DYNAMIC_CONFIG_PATH):
     raise RuntimeError(
