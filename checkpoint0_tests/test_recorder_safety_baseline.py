@@ -54,15 +54,17 @@ def _load_recorder():
     )
 
     old_onedrive = os.environ.get("OneDrive")
+    old_config_path = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
     old_os_name = os.name
     os.environ["OneDrive"] = temp_root.name
+    os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = str(config_path)
     if str(RECORDER_DIR) not in sys.path:
         sys.path.insert(0, str(RECORDER_DIR))
 
     # The production recorder supports Windows/macOS only. The CI/container used
     # for these offline tests is Linux, so emulate only the config-location branch
     # during import. The recorder itself is not modified.
-    if os.name != "nt":
+    if sys.platform != "darwin" and os.name != "nt":
         os.name = "nt"
 
     try:
@@ -74,6 +76,10 @@ def _load_recorder():
             os.environ.pop("OneDrive", None)
         else:
             os.environ["OneDrive"] = old_onedrive
+        if old_config_path is None:
+            os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+        else:
+            os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_config_path
 
     # Keep the TemporaryDirectory alive for as long as the imported module exists.
     module._checkpoint0_temp_root = temp_root
@@ -203,6 +209,7 @@ class RecorderSafetyBaselineTests(unittest.TestCase):
                 "log",
                 side_effect=lambda message="", *args, **kwargs: logged.append(str(message)),
             ),
+            patch.object(RECORDER, "setup_network_guard", return_value=True),
         ):
             RECORDER.wait_until_start(state, engine)
             RECORDER._publish_identity_runtime_status(
