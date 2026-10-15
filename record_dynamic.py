@@ -33,7 +33,6 @@ import ipaddress
 import socket
 import platform
 import queue
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -108,35 +107,54 @@ from recorder_source.policy import (
     selection_policy_for_provider as shared_selection_policy_for_provider,
 )
 
-# User configuration is shared through OneDrive across all recorder machines.
+# User configuration resolution order:
+# 1. Custom path override via RECORDER_DYNAMIC_CONFIG_PATH environment variable (tests/CI)
+# 2. Shared OneDrive folder (macOS cloud storage or Windows %OneDrive%\RECORDER)
+# 3. Local fallback: the same directory where record_dynamic.py is running from.
 _custom_config_path = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
 if _custom_config_path:
     DYNAMIC_CONFIG_PATH = os.path.abspath(
         os.path.expanduser(_custom_config_path)
     )
     RECORDER_CONFIG_DIR = os.path.dirname(DYNAMIC_CONFIG_PATH)
-elif sys.platform == "darwin":
-    RECORDER_CONFIG_DIR = os.path.expanduser(
-        "~/Library/CloudStorage/OneDrive-Personal/RECORDER"
-    )
-    DYNAMIC_CONFIG_PATH = os.path.join(
-        RECORDER_CONFIG_DIR,
-        "recorder_dynamic_user_config.py",
-    )
-elif os.name == "nt":
-    ONEDRIVE_ROOT = os.environ.get("OneDrive") or os.environ.get("USERPROFILE") or tempfile.gettempdir()
-    RECORDER_CONFIG_DIR = os.path.join(ONEDRIVE_ROOT, "RECORDER")
-    DYNAMIC_CONFIG_PATH = os.path.join(
-        RECORDER_CONFIG_DIR,
-        "recorder_dynamic_user_config.py",
-    )
 else:
-    raise RuntimeError("Unsupported operating system for recorder config location.")
+    onedrive_dir = None
+    if sys.platform == "darwin":
+        onedrive_dir = os.path.expanduser(
+            "~/Library/CloudStorage/OneDrive-Personal/RECORDER"
+        )
+    elif os.name == "nt":
+        onedrive_root = os.environ.get("OneDrive")
+        if onedrive_root:
+            onedrive_dir = os.path.join(onedrive_root, "RECORDER")
 
-if not os.path.isfile(DYNAMIC_CONFIG_PATH):
-    raise RuntimeError(
-        f"Dynamic recorder config not found: {DYNAMIC_CONFIG_PATH}"
+    onedrive_config = (
+        os.path.join(onedrive_dir, "recorder_dynamic_user_config.py")
+        if onedrive_dir
+        else None
     )
+
+    local_config = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "recorder_dynamic_user_config.py",
+    )
+
+    if onedrive_config and os.path.isfile(onedrive_config):
+        DYNAMIC_CONFIG_PATH = onedrive_config
+        RECORDER_CONFIG_DIR = onedrive_dir
+    elif os.path.isfile(local_config):
+        DYNAMIC_CONFIG_PATH = local_config
+        RECORDER_CONFIG_DIR = os.path.dirname(local_config)
+    else:
+        checked_locs = []
+        if onedrive_config:
+            checked_locs.append(f"OneDrive ({onedrive_config})")
+        else:
+            checked_locs.append("OneDrive (not available on this machine)")
+        checked_locs.append(f"local script folder ({local_config})")
+        raise RuntimeError(
+            f"Dynamic recorder config not found. Checked: {', '.join(checked_locs)}"
+        )
 
 # Load the verified OneDrive config directly by absolute path. This avoids
 # platform-specific Python module-search behavior for cloud-synced folders.
