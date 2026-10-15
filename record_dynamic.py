@@ -112,7 +112,7 @@ from recorder_source.policy import (
 # 2. Shared OneDrive folder (macOS cloud storage or Windows %OneDrive%\RECORDER)
 # 3. Local fallback: the same directory where record_dynamic.py is running from.
 _custom_config_path = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
-if _custom_config_path:
+if _custom_config_path and os.path.isfile(os.path.abspath(os.path.expanduser(_custom_config_path))):
     DYNAMIC_CONFIG_PATH = os.path.abspath(
         os.path.expanduser(_custom_config_path)
     )
@@ -147,6 +147,8 @@ else:
         RECORDER_CONFIG_DIR = os.path.dirname(local_config)
     else:
         checked_locs = []
+        if _custom_config_path:
+            checked_locs.append(f"custom path override ({_custom_config_path})")
         if onedrive_config:
             checked_locs.append(f"OneDrive ({onedrive_config})")
         else:

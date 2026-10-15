@@ -32,7 +32,8 @@ from recorder_runtime.network import (
 )
 
 # Fallback test configuration for CI environments without OneDrive
-if not os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH"):
+_ci_temp_config = None
+if not os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH") or not os.path.isfile(os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH", "")):
     _ci_temp_config = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
     _ci_temp_config.write(
         'NM3U8DL_PLAYLIST_PRIMARY_PHRASES = [["Test"]]\n'
@@ -44,7 +45,7 @@ if not os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH"):
         'SCHEDULE_START = None\n'
         'RUN_DURATION_MIN = 1\n'
         'BASE_NAME = "CI_TEST"\n'
-        'RECORDING_OUTPUT_DIR = "."\n'
+        f'RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n'
         'REQUIRED_VPN_COUNTRY = "IN"\n'
     )
     _ci_temp_config.flush()
@@ -564,25 +565,28 @@ class DynamicRecorderGeoMismatchTests(unittest.TestCase):
                 "SCHEDULE_START = ''\n"
                 "RUN_DURATION_MIN = 1\n"
                 "BASE_NAME = 'test'\n"
-                "RECORDING_OUTPUT_DIR = '/tmp'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
                 "REQUIRED_VPN_COUNTRY = 'IN'\n"
             )
-            tmp_path = tmp.name
+            cls._test_cfg_path = tmp.name
 
-        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
-        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        cls._old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = cls._test_cfg_path
+        import record_dynamic
+        cls.record_dynamic = record_dynamic
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._old_cfg and os.path.isfile(cls._old_cfg):
+            os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = cls._old_cfg
+        elif _ci_temp_config and os.path.isfile(_ci_temp_config.name):
+            os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = _ci_temp_config.name
+        else:
+            os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
         try:
-            import record_dynamic
-            cls.record_dynamic = record_dynamic
-        finally:
-            if old_cfg:
-                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
-            else:
-                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            os.unlink(cls._test_cfg_path)
+        except Exception:
+            pass
 
     def setUp(self):
         code_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
