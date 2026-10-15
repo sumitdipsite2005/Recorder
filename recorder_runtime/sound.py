@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 
 @dataclass
@@ -84,3 +84,58 @@ def sound_snooze_remaining_seconds(
     now = time.time() if now_ts is None else float(now_ts)
     until_ts = float(getattr(state, "sound_snooze_until_ts", 0.0) or 0.0)
     return max(0.0, until_ts - now)
+
+
+def acknowledge_vpn_drop_alarm(
+    state,
+    *,
+    log_fn: Optional[Callable] = None,
+    alarm_stop_fn: Optional[Callable] = None,
+) -> bool:
+    """Acknowledge the VPN drop alarm immediately."""
+    alarm_type = getattr(state, "shared_alarm_type", None)
+    if not (
+        getattr(state, "lenient_alarm_active", False)
+        or getattr(state, "network_guard_hold_active", False)
+        or alarm_type == "vpn_drop"
+    ):
+        return False
+
+    alarm_activity_id = getattr(state, "shared_alarm_activity_id", None)
+    if log_fn:
+        log_fn("ALARM_ACK", activity_id=alarm_activity_id)
+        log_fn("ALARM_VPN_DROP_STOP reason=ack", activity_id=alarm_activity_id)
+    state.vpn_drop_post_ack_silent = True
+    state.alarm_ack_requested = False
+    state.alarm_linger_until = None
+    if alarm_stop_fn:
+        alarm_stop_fn(state)
+    return True
+
+
+def acknowledge_internet_drop_alarm(
+    state,
+    *,
+    log_fn: Optional[Callable] = None,
+    alarm_stop_fn: Optional[Callable] = None,
+) -> bool:
+    """Acknowledge the internet drop alarm immediately."""
+    alarm_type = getattr(state, "shared_alarm_type", None)
+    if not (
+        getattr(state, "internet_drop_active", False)
+        or getattr(state, "internet_hold_active", False)
+        or alarm_type == "internet_drop"
+    ):
+        return False
+
+    alarm_activity_id = getattr(state, "shared_alarm_activity_id", None)
+    if log_fn:
+        log_fn("ALARM_ACK", activity_id=alarm_activity_id)
+        log_fn("ALARM_INTERNET_DROP_STOP reason=ack", activity_id=alarm_activity_id)
+    state.internet_drop_post_ack_silent = True
+    state.alarm_ack_requested = False
+    state.alarm_linger_until = None
+    if alarm_stop_fn:
+        alarm_stop_fn(state)
+    return True
+

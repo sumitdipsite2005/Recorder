@@ -31,6 +31,7 @@ import base64
 import hashlib
 import ipaddress
 import socket
+import platform
 import queue
 import tempfile
 from dataclasses import dataclass, field
@@ -63,6 +64,20 @@ from recorder_runtime import sound as runtime_sound
 from recorder_runtime.identity_launch import (
     IdentityLaunchRequest,
     target_match_contexts_for_recovery_playlist,
+)
+from recorder_runtime.network import (
+    NetworkGuard,
+    NetworkRouteResolver,
+    WireproxyManager,
+    WIREPROXY_HTTP_PORT,
+    WIREPROXY_SOCKS5_PORT,
+    RATE_LIMIT_COOLDOWN_SEC,
+    RATE_LIMIT_ERROR_THRESHOLD,
+    RATE_LIMIT_WINDOW_SEC,
+    VPN_HOLD_TIMEOUT_SEC,
+    INTERNET_HOLD_TIMEOUT_SEC,
+    is_wireproxy_active,
+    create_network_guard,
 )
 from recorder_runtime.paths import build_recorder_output_paths
 from recorder_source import discovery as source_discovery
@@ -144,6 +159,10 @@ RECORDING_OUTPUT_DIR = str(OUTPUT_PATHS.root)
 RECORDING_LOGS_DIR = str(OUTPUT_PATHS.recording_logs)
 PLAYLIST_HISTORY_DIR = str(OUTPUT_PATHS.playlist_history)
 
+# Network Guardrail & Userspace Wireproxy configuration
+REQUIRED_VPN_COUNTRY = _dynamic_user_config.get("REQUIRED_VPN_COUNTRY", None)
+VPN_SERVER_PRIORITY = _dynamic_user_config.get("VPN_SERVER_PRIORITY", None)
+
 
 
 # DOWNLOAD MODE SELECTOR
@@ -205,6 +224,8 @@ NM3U8DL_PLAYLIST_GROUP_COOKIE_POLICY = {
 # Dynamic playlist command profiles
 NM3U8DL_PLAYLIST_PROFILES = {
     "HOTSTAR": {
+        "vpn_country": "IN",
+        "vpn_policy": "STRICT",
         "safe_overtime_min": 60,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": shared_selection_policy_for_provider("HOTSTAR").allow_unknown_expiry,
@@ -218,6 +239,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     },
 
     "JIO": {
+        "vpn_country": "IN",
+        "vpn_policy": "LENIENT",
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": shared_selection_policy_for_provider("JIO").allow_unknown_expiry,
@@ -234,6 +257,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     },
     
     "KHEL": {
+        "vpn_country": "PK",
+        "vpn_policy": "LENIENT",
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": shared_selection_policy_for_provider("KHEL").allow_unknown_expiry,
@@ -243,6 +268,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     },
 
     "SONYLIV": {
+        "vpn_country": "IN",
+        "vpn_policy": "LENIENT",
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": shared_selection_policy_for_provider("SONYLIV").allow_unknown_expiry,
@@ -256,6 +283,8 @@ NM3U8DL_PLAYLIST_PROFILES = {
     },
     
     "FANCODE": {
+        "vpn_country": "IN",
+        "vpn_policy": "LENIENT",
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
         "allow_unknown_expiry": shared_selection_policy_for_provider("FANCODE").allow_unknown_expiry,
@@ -300,7 +329,7 @@ NM3U8DL_AUDIO_OFFSET_SEC = 0.0
 
 # Part B: Static/default options (appended to command with dynamic chunk name).
 # Dynamic playlist mode replaces --select-video best at launch with the representation already selected by the recorder.
-NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --download-retry-count 30 --http-request-timeout 90 --select-video best --select-audio best'
+NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --download-retry-count 5 --http-request-timeout 90 --select-video best --select-audio best'
 
 # ======================================================================================================================
 
@@ -545,6 +574,18 @@ class RecorderState:
     shared_alarm_timeout_timer: Optional[threading.Timer] = None
     shared_alarm_deadline: Optional[float] = None
     shared_alarm_activity_id: Optional[str] = None
+
+    # Network Guardrail & Userspace Wireproxy runtime state
+    network_guard: Optional[Any] = None
+    wireproxy_manager: Optional[Any] = None
+    network_guard_triggered: bool = False
+    network_guard_hold_active: bool = False
+    lenient_alarm_active: bool = False
+    vpn_drop_post_ack_silent: bool = False
+    internet_drop_active: bool = False
+    internet_drop_post_ack_silent: bool = False
+    rate_limit_429_detected: bool = False
+    is_scheduled: bool = False
     nm3u8dl_alarm_stop_event: Optional[threading.Event] = None
     nm3u8dl_alarm_thread: Optional[threading.Thread] = None
     nm3u8dl_key_listener_started: bool = False
@@ -576,6 +617,7 @@ class RecorderState:
     # verification. Used only to decide when the full recheck table changed.
     nm3u8dl_access_block_status_snapshot: dict = field(default_factory=dict)
     nm3u8dl_playlist_connectivity_alarm_silenced: bool = False
+    nm3u8dl_geo_jump_attempt: int = 0
 
     # Dynamic-playlist downloader-failure failover. This is deliberately separate
     # from the mature MANIFEST/NO_FILE/STALL/CRASH counters above: those counters
@@ -965,6 +1007,8 @@ def colorize_terminal_log_line(line: str) -> str:
     VPN_ACTION = "\033[1;30;103m"  # Bold black text on bright yellow background
     GRAY = "\033[90m"
     SELECTED = "\033[1;97;42m"
+    RUN_BLUE = "\033[1;94m"  # Bright blue: more distinct than cyan on black/white terminals.
+    BOLD = "\033[1m"  # Bold styling with terminal default foreground color (adapts to light/dark themes).
 
     # User-action VPN warnings should be impossible to miss. Color the entire
     # terminal line, while saved terminal/log capture remains plain text.
@@ -975,7 +1019,35 @@ def colorize_terminal_log_line(line: str) -> str:
         return f"{VPN_ACTION}{line}{RESET}"
 
     if re.search(r"=+\s+RUN \d+ START\b", line):
-        return f"{CYAN}{line}{RESET}"
+        return f"{RUN_BLUE}{line}{RESET}"
+
+    # High-visibility full-line styling for Network Guard & Rate-Limit lifecycle
+    if (
+        "NETWORK_GUARD: Tracking" in line
+        or "NETWORK_GUARD: Mismatch" in line
+        or "RATE_LIMIT: Tracking" in line
+        or "RATE_LIMIT: Cooldown remaining" in line
+    ):
+        return f"{YELLOW}{line}{RESET}"
+
+    if (
+        "NETWORK_GUARD: VPN connection restored" in line
+        or "RATE_LIMIT: 90s cooldown completed" in line
+        or "NETWORK_GUARD: Stream verified" in line
+        or "NETWORK_GUARD: Wireproxy route verified healthy" in line
+        or "NETWORK_GUARD: Successfully acquired fresh IP" in line
+        or "NETWORK_GUARD: Outbound internet connectivity restored" in line
+    ):
+        return f"{GREEN}{line}{RESET}"
+
+    if (
+        "NETWORK_GUARD_HOLD" in line
+        or "RATE_LIMIT_COOLDOWN" in line
+        or "RATE-LIMIT COOLDOWN" in line
+        or "ALARM_VPN_DROP" in line
+        or "RATE_LIMIT_CRITICAL" in line
+    ):
+        return f"{RED}{line}{RESET}"
 
     colored = line
 
@@ -1437,6 +1509,30 @@ def colorize_terminal_log_line(line: str) -> str:
             f"{CYAN}{label}{RESET}",
         )
 
+    # Startup and configuration header labels (bold cyan matching section headers)
+    for header_label in (
+        "RECORDING ENGINE  :",
+        "Host Platform     :",
+        "Recording mode    :",
+        "Base name         :",
+        "Recording start   :",
+        "Playlist group    :",
+        "Match rule        :",
+        "Planned duration  :",
+        "Expected end time :",
+        "Schedule start    :",
+        "Planned command   :",
+        "Live URL          :",
+        "Network Guard     :",
+        "Proxy Endpoints   :",
+        "Network Route     :",
+        "Engine selected   :",
+    ):
+        colored = colored.replace(
+            header_label,
+            f"{BOLD}{header_label}{RESET}",
+        )
+
     # ---------------------------------------------------------
     # Recovery / health
     # ---------------------------------------------------------
@@ -1694,19 +1790,35 @@ def log_run_start_banner(state: RecorderState, engine_label: str):
         f"==================== RUN {state.run_attempt_index} START — "
         f"{engine_label} ===================="
     )
+    guard = getattr(state, "network_guard", None)
+    if guard:
+        for g_line in guard.format_header_lines():
+            log(g_line)
+        if guard.is_armed:
+            if guard.vpn_mode == "WIREPROXY":
+                srv = getattr(guard.wireproxy_manager, "active_server", None) or "wireproxy"
+                log(f"Network Route     : Connected [WIREPROXY] (Country: {guard.launch_country or guard.required_country} | Server: {srv} | IP: {guard.launch_ip or 'verified'})")
+            else:
+                prov = guard.active_system_vpn or "SYSTEM_VPN"
+                log(f"Network Route     : Connected [{prov}] (Country: {guard.launch_country or guard.required_country} | Adapter: {guard.launch_interface or 'default'} | IP: {guard.launch_ip or 'verified'})")
 
 
 def ensure_chunks_dir():
     os.makedirs(CHUNKS_DIR, exist_ok=True)
 
-def init_termcap():
-    """Create/overwrite the temp terminal capture log inside CHUNKS_DIR."""
+def init_termcap(header_lines=None):
+    """Create/initialize the temp terminal capture log inside CHUNKS_DIR."""
     global TERMCAP_PATH
     ensure_chunks_dir()
     TERMCAP_PATH = os.path.join(CHUNKS_DIR, "_terminal_capture.tmp.log")
     try:
-        with open(TERMCAP_PATH, "w", encoding="utf-8", errors="replace") as _:
-            pass
+        if header_lines:
+            with open(TERMCAP_PATH, "w", encoding="utf-8", errors="replace") as f:
+                for line in header_lines:
+                    f.write(line + "\n")
+        elif not os.path.isfile(TERMCAP_PATH):
+            with open(TERMCAP_PATH, "w", encoding="utf-8", errors="replace") as _:
+                pass
     except Exception as e:
         try:
             print(f"[WARN] Terminal capture failed: {e}", file=sys.stderr)
@@ -1776,11 +1888,13 @@ def _clean_raw_external_text(value) -> str:
 def init_raw_external_capture():
     """Create/overwrite the temp black-box output capture inside CHUNKS_DIR."""
     global RAW_EXTERNAL_PATH, RAW_EXTERNAL_COUNTER
+    if RAW_EXTERNAL_PATH and os.path.exists(RAW_EXTERNAL_PATH):
+        return
     ensure_chunks_dir()
     RAW_EXTERNAL_PATH = os.path.join(CHUNKS_DIR, "_raw_external_output.tmp.log")
     RAW_EXTERNAL_COUNTER = 0
     try:
-        with open(RAW_EXTERNAL_PATH, "w", encoding="utf-8", errors="replace"):
+        with open(RAW_EXTERNAL_PATH, "a", encoding="utf-8", errors="replace"):
             pass
     except Exception:
         # Diagnostics must never alter recorder behavior or terminal output.
@@ -2163,6 +2277,10 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
                 or getattr(state, "ffmpeg_off_alarm_active", False)
                 or getattr(state, "ffmpeg_alarm_active", False)
                 or getattr(state, "nm3u8dl_alarm_active", False)
+                or getattr(state, "network_guard_hold_active", False)
+                or getattr(state, "internet_hold_active", False)
+                or getattr(state, "lenient_alarm_active", False)
+                or getattr(state, "shared_alarm_type", None) in ("vpn_drop", "internet_drop", "critical")
             )
 
             if alarm_active:
@@ -2195,6 +2313,18 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
                     )
                 elif getattr(state, "nm3u8dl_alarm_active", False):
                     acknowledge_nm3u8dl_stall_alarm(state)
+                elif (
+                    getattr(state, "lenient_alarm_active", False)
+                    or getattr(state, "network_guard_hold_active", False)
+                    or getattr(state, "shared_alarm_type", None) == "vpn_drop"
+                ):
+                    acknowledge_vpn_drop_alarm(state)
+                elif (
+                    getattr(state, "internet_drop_active", False)
+                    or getattr(state, "internet_hold_active", False)
+                    or getattr(state, "shared_alarm_type", None) == "internet_drop"
+                ):
+                    acknowledge_internet_drop_alarm(state)
                 else:
                     state.alarm_ack_requested = True
 
@@ -2642,6 +2772,24 @@ def acknowledge_nm3u8dl_stall_alarm(state, reason: str = "ack") -> bool:
     return True
 
 
+def acknowledge_vpn_drop_alarm(state) -> bool:
+    """Acknowledge the VPN drop alarm immediately."""
+    return runtime_sound.acknowledge_vpn_drop_alarm(
+        state,
+        log_fn=log,
+        alarm_stop_fn=shared_alarm_stop,
+    )
+
+
+def acknowledge_internet_drop_alarm(state) -> bool:
+    """Acknowledge the internet drop alarm immediately."""
+    return runtime_sound.acknowledge_internet_drop_alarm(
+        state,
+        log_fn=log,
+        alarm_stop_fn=shared_alarm_stop,
+    )
+
+
 def ffmpeg_alarm_start(state, alarm_type: str = "ffmpeg"):
     shared_alarm_start(state, alarm_type=alarm_type, incident=None)
     state.ffmpeg_alarm_active = (
@@ -2680,6 +2828,8 @@ def make_signal_handler(state: RecorderState):
         state.stop_flag = True
         if state.nm3u8dl_stop_event is not None:
             state.nm3u8dl_stop_event.set()
+        if getattr(state, "wireproxy_manager", None):
+            state.wireproxy_manager.stop()
     return _handler
 
 def fmt_hms(seconds):
@@ -3065,6 +3215,8 @@ def show_recording_info(state: RecorderState):
         lines.append(f"Schedule start     : {SCHEDULE_START}")
 
     lines.extend(_runtime_source_info_lines(state))
+    if getattr(state, "network_guard", None):
+        lines.extend(state.network_guard.format_info_lines())
     lines.extend([
         f"Original duration  : {_format_minutes_value(original_duration)}",
         f"Current duration   : {_format_minutes_value(current_duration)}",
@@ -4306,13 +4458,24 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
             ff_prev_size = cur_size
             ff_prev_t = now_t
 
+            ff_hard_required = FF_HARD_STALL_REQUIRED
+            ff_soft_required = FF_SOFT_STALL_REQUIRED
+            is_double_vpn_capped = False
+            guard = getattr(state, "network_guard", None)
+            if guard and hasattr(guard, "is_wireproxy_nested_in_vpn"):
+                is_nested, _ = guard.is_wireproxy_nested_in_vpn()
+                if is_nested and (ff_hard_required > 4 or ff_soft_required > 4):
+                    is_double_vpn_capped = True
+                    ff_hard_required = min(4, ff_hard_required)
+                    ff_soft_required = min(4, ff_soft_required)
+
             is_hard = (growth_bytes <= FF_HARD_STALL_ZERO_BYTES)
             if is_hard:
                 ff_hard_count += 1
                 ff_soft_count = 0
                 flush_progress_line()
                 log(
-                    f"HARD_STALL_CHECK {min(ff_hard_count, FF_HARD_STALL_REQUIRED)}/{FF_HARD_STALL_REQUIRED} growth_bytes={growth_bytes}"
+                    f"HARD_STALL_CHECK {min(ff_hard_count, ff_hard_required)}/{ff_hard_required} growth_bytes={growth_bytes}"
                 )
                 if not is_alarm_active(state):
                     beep_bad(state)
@@ -4351,7 +4514,7 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
                         ff_soft_count += 1
                         flush_progress_line()
                         log(
-                            f"SOFT_STALL_CHECK {min(ff_soft_count, FF_SOFT_STALL_REQUIRED)}/{FF_SOFT_STALL_REQUIRED} "
+                            f"SOFT_STALL_CHECK {min(ff_soft_count, ff_soft_required)}/{ff_soft_required} "
                             f"growth_kbps={int(growth_kbps)} threshold_kbps={int(threshold_kbps)} expected_kbps={int(ff_expected_kbps)}"
                         )
                         if not is_alarm_active(state):
@@ -4377,14 +4540,36 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
                             )
                             ff_last_health_log_t = now_health_log_t
 
-            hard_trigger = (ff_hard_count >= FF_HARD_STALL_REQUIRED)
-            soft_trigger = (ff_soft_count >= FF_SOFT_STALL_REQUIRED)
+            hard_trigger = (ff_hard_count >= ff_hard_required)
+            soft_trigger = (ff_soft_count >= ff_soft_required)
 
             if hard_trigger or soft_trigger:
                 stall_type = "hard" if hard_trigger else "soft"
                 flush_progress_line()
                 log(f"CLASSIFY STALL_{stall_type.upper()}", level="WARN")
                 reset_good_beep_state(state, "ffmpeg")
+
+                # Network Guard: In-flight attribution for nested double-VPN stall
+                guard = getattr(state, "network_guard", None)
+                if guard and hasattr(guard, "is_wireproxy_nested_in_vpn"):
+                    is_nested, vpn_name = guard.is_wireproxy_nested_in_vpn()
+                    if is_nested:
+                        if is_double_vpn_capped:
+                            effective_trigger = ff_soft_required if soft_trigger else ff_hard_required
+                            normal_trigger = FF_SOFT_STALL_REQUIRED if soft_trigger else FF_HARD_STALL_REQUIRED
+                            log(
+                                f"NETWORK_GUARD: Active double-VPN ({vpn_name}) detected during stall! "
+                                f"Smart stall cap enforced: ending chunk early at check {effective_trigger} (normal {normal_trigger}) "
+                                f"to seal video bytes safely and hand over routing for next chunk.",
+                                level="WARN",
+                            )
+                        else:
+                            log(
+                                f"NETWORK_GUARD: Stream stalled while Wireproxy was nested inside {vpn_name}! "
+                                f"Attributing stall to nested tunnel packet loss / MTU conflict.",
+                                level="WARN",
+                            )
+
                 status = "stalled"
                 reason = f"STALL_{stall_type.upper()}"
                 proc.terminate()
@@ -9133,6 +9318,139 @@ def format_nm3u8dl_access_block_warning(
     )
 
 
+def _scan_has_confirmed_geo_mismatch(
+    source_results: list,
+    required_country: Optional[str] = None,
+) -> tuple[bool, list[dict]]:
+    """
+    Check if any candidate in source_results suffered a confirmed geo-block
+    where detected country does not match required_country.
+    Returns (has_mismatch, mismatched_candidates).
+    """
+    req = (required_country or "IN").strip().upper()
+    mismatched = []
+    for item in (source_results or []):
+        candidates = (
+            item.get("candidate_rows", [])
+            if isinstance(item, dict) and "candidate_rows" in item
+            else [item]
+        )
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            if not cand.get("access_blocked", False):
+                continue
+            if cand.get("access_block_kind") != "confirmed_geo":
+                continue
+            detected_country = str(cand.get("geo_country") or "").strip().upper()
+            if detected_country and detected_country != req:
+                mismatched.append(cand)
+            elif not detected_country:
+                mismatched.append(cand)
+    return bool(mismatched), mismatched
+
+
+def _handle_scan_geo_mismatch_recovery(
+    state: RecorderState,
+    source_results: list,
+    *,
+    has_viable_fallback: bool = False,
+) -> bool:
+    """
+    Check if the playlist scan encountered any confirmed geo-mismatch (e.g. Akamai/Hotstar
+    reporting SG when IN is required). If under Wireproxy, attempt canonical 3:2:1 IP pool
+    rotation to acquire a clean IP and trigger a full re-scan.
+
+    Returns True if Wireproxy was successfully rotated and caller should `continue` (re-scan).
+    Returns False if no mismatch, not under Wireproxy, or rotation was exhausted.
+    """
+    guard = getattr(state, "network_guard", None)
+    if not guard or guard.vpn_mode != "WIREPROXY" or not getattr(guard, "wireproxy_manager", None):
+        return False
+
+    has_mismatch, mismatched_candidates = _scan_has_confirmed_geo_mismatch(
+        source_results,
+        guard.required_country,
+    )
+    if not has_mismatch:
+        state.nm3u8dl_geo_jump_attempt = 0
+        return False
+
+    detected_countries = sorted({
+        str(c.get("geo_country") or "").strip().upper()
+        for c in mismatched_candidates
+        if str(c.get("geo_country") or "").strip()
+    })
+    countries_str = ", ".join(detected_countries) if detected_countries else "unknown country"
+
+    attempt = getattr(state, "nm3u8dl_geo_jump_attempt", 0) + 1
+    temp_dir = CHUNKS_DIR or "./_temp_chunks"
+
+    if attempt <= 5:
+        state.nm3u8dl_geo_jump_attempt = attempt
+        blocked_ip = guard.launch_ip or getattr(guard, "blocked_403_ip", None)
+        if not blocked_ip:
+            ip, _ = NetworkRouteResolver.get_public_ip_and_country(timeout=1.5)
+            blocked_ip = ip or "unknown"
+        guard.blocked_403_ip = blocked_ip
+
+        log(
+            f"NETWORK_GUARD: Egress geo-mismatch detected during playlist scan on IP {blocked_ip} "
+            f"(stream reported: {countries_str}, required: {guard.required_country}). "
+            f"Initiating Wireproxy 3-2-1 rotation (attempt {attempt}/5)...",
+            level="WARN",
+        )
+
+        recovered = guard.attempt_wireguard_auto_recovery(
+            blocked_ip=blocked_ip,
+            temp_dir=temp_dir,
+        )
+        if recovered:
+            log(
+                f"NETWORK_GUARD: Successfully acquired fresh IP ({guard.launch_ip}, "
+                f"Country: {guard.launch_country}) via Wireproxy. Rerunning full playlist scan from scratch...",
+                level="INFO",
+            )
+            return True
+        else:
+            log(
+                "NETWORK_GUARD: Wireproxy 3-2-1 auto-recovery was unable to establish a clean IP.",
+                level="WARN",
+            )
+    else:
+        log(
+            f"NETWORK_GUARD: Wireproxy rotation attempts exhausted ({attempt - 1}/5) for geo-mismatch recovery.",
+            level="WARN",
+        )
+
+    # Exhausted or recovery failed
+    state.nm3u8dl_geo_jump_attempt = 0
+    beep_bad(state)
+
+    if has_viable_fallback:
+        log(
+            "NETWORK_GUARD: Proceeding with available fallback candidate stream(s) despite geo-block on other candidate(s).",
+            level="WARN",
+        )
+        return False
+    else:
+        log(
+            "NETWORK_GUARD: All streams are blocked or unusable. Diverting to VPN Hold state...",
+            level="WARN",
+        )
+        recovered = guard.handle_vpn_hold_state(
+            is_startup=True,
+            blocked_ip=guard.launch_ip or getattr(guard, "blocked_403_ip", None),
+        )
+        if recovered:
+            log(
+                f"NETWORK_GUARD: Operator restored VPN route ({guard.launch_ip}). Rerunning playlist scan...",
+                level="INFO",
+            )
+            return True
+        return False
+
+
 def _make_nm3u8dl_candidate_display_row(candidate: dict) -> dict:
     """Keep only safe, presentation-relevant candidate facts in source results."""
     fields = (
@@ -10426,17 +10744,23 @@ def update_nm3u8dl_access_block_alarm_state(
             and not state.nm3u8dl_access_block_alarm_acknowledged
             and not shared_alarm_is_active(state)
         ):
-            log(
-                "Source access remains blocked after confirmation and is "
-                "preventing recording or a potentially better-quality source "
-                "→ VPN/route attention needed.",
-                level="WARN",
-            )
-            shared_alarm_start(
-                state,
-                alarm_type="playlist_access_block",
-                incident=None,
-            )
+            if not running_quality:
+                log(
+                    "Source access remains blocked and no reachable source is available "
+                    "→ VPN/route attention needed.",
+                    level="WARN",
+                )
+                shared_alarm_start(
+                    state,
+                    alarm_type="playlist_access_block",
+                    incident=None,
+                )
+            else:
+                log(
+                    f"NETWORK_GUARD: Top-tier candidate ({blocked_quality or 'quality unknown'}) is blocked on current IP. "
+                    f"Recording fallback candidate ({running_quality}). Switch VPN location if you wish to unlock maximum quality.",
+                    level="WARN",
+                )
 
         return
 
@@ -13193,6 +13517,7 @@ def resolve_nm3u8dl_launch_source(
             _nm3u8dl_set_running_stream_identity(state, source)
             state.nm3u8dl_renewal_rollover_requested = False
             state.nm3u8dl_rollover_reason = None
+            state.nm3u8dl_geo_jump_attempt = 0
             set_terminal_activity_context(None)
             return source
 
@@ -13219,6 +13544,7 @@ def resolve_nm3u8dl_launch_source(
             _nm3u8dl_set_running_stream_identity(state, source)
             state.nm3u8dl_renewal_rollover_requested = False
             state.nm3u8dl_rollover_reason = None
+            state.nm3u8dl_geo_jump_attempt = 0
             set_terminal_activity_context(None)
             return source
 
@@ -13288,6 +13614,14 @@ def resolve_nm3u8dl_launch_source(
                 )
 
                 initial_source_results = source.get("source_results", [])
+
+                if _handle_scan_geo_mismatch_recovery(
+                    state,
+                    initial_source_results,
+                    has_viable_fallback=True,
+                ):
+                    last_wait_signature = None
+                    continue
 
                 if _nm3u8dl_confirm_access_change_and_reset_failover(
                     state,
@@ -13367,6 +13701,14 @@ def resolve_nm3u8dl_launch_source(
                     "source_results",
                     [],
                 )
+
+                if _handle_scan_geo_mismatch_recovery(
+                    state,
+                    source_results,
+                    has_viable_fallback=False,
+                ):
+                    last_wait_signature = None
+                    continue
                 _publish_identity_runtime_status(
                     state,
                     "WAITING_FOR_SOURCE",
@@ -13889,6 +14231,7 @@ def resolve_nm3u8dl_launch_source(
             _nm3u8dl_set_running_stream_identity(state, source)
             state.nm3u8dl_renewal_rollover_requested = False
             state.nm3u8dl_rollover_reason = None
+            state.nm3u8dl_geo_jump_attempt = 0
             set_terminal_activity_context(None)
             return source
 
@@ -15955,8 +16298,30 @@ def should_exclude_nm3u8dl_line(stripped_line: str, exclude_substrings: List[str
     if stripped_line in ("ERROR", "ERROR:"):
         return True
     return any(ex in stripped_line for ex in exclude_substrings)
-    
-def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=None):
+
+def is_nm3u8dl_fatal_producer_error(line: str) -> bool:
+    """
+    Detect fatal N_m3u8DL-RE internal live playlist producer crash/timeout.
+    When N_m3u8DL's DASH/HLS RefreshPlayListAsync times out or cancels (e.g. during a network drop),
+    its producer task terminates permanently while consumer workers sit in 'Waiting 100%' indefinitely.
+    Fast-path terminating the deadlocked process avoids wasting 10 minutes in stall cycles.
+    """
+    raw = line.lower()
+    if (
+        ("refreshplaylist" in raw or "playlistproduce" in raw)
+        and (
+            "taskcanceledexception" in raw
+            or "timeoutexception" in raw
+            or "socketexception" in raw
+            or "error" in raw
+        )
+    ):
+        return True
+    if "taskcanceledexception" in raw and "httpclient.timeout" in raw:
+        return True
+    return False
+
+def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=None, state=None):
     """
     Read N_m3u8DL startup stdout until the manifest refresh interval is found.
 
@@ -16050,10 +16415,22 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
             maybe_log_startup_progress()
             return
 
+        if is_nm3u8dl_fatal_producer_error(stripped_line):
+            if state is not None and not getattr(state, "nm3u8dl_stall_flag", False):
+                state.nm3u8dl_stall_flag = True
+                state.nm3u8dl_stall_reason = "playlist_producer_timeout"
+                log(
+                    "N_m3u8DL: Fatal playlist producer timeout/cancellation detected (TaskCanceledException)! "
+                    "Fast-path terminating stalled process to seal chunk...",
+                    level="WARN",
+                )
+
         if not should_exclude_nm3u8dl_line(
             stripped_line,
             exclude_substrings
         ):
+            if state is not None and getattr(state, "network_guard", None):
+                state.network_guard.inspect_stdout_line(stripped_line)
             log(f"N_m3u8DL: {stripped_line}")
 
         if "Selected streams:" in stripped_line:
@@ -16174,6 +16551,7 @@ def monitor_nm3u8dl_stdout(
     live_end_event=None,
     raw_invocation=None,
     progress_activity_id: Optional[str] = None,
+    state=None,
 ):
     """
     Monitor N_m3u8DL stdout.
@@ -16277,6 +16655,20 @@ def monitor_nm3u8dl_stdout(
         if not stripped.strip():
             return
 
+        # Fatal N_m3u8DL playlist producer crash/timeout intercept:
+        # When N_m3u8DL's DASH/HLS RefreshPlayListAsync times out or cancels (e.g. during a network drop),
+        # its producer thread dies permanently while consumer workers sit in 'Waiting 100%' indefinitely.
+        # Fast-path terminate to seal chunk and allow instant orchestrator recovery without wasting 10 minutes in stalls.
+        if is_nm3u8dl_fatal_producer_error(stripped):
+            if state is not None and not getattr(state, "nm3u8dl_stall_flag", False):
+                state.nm3u8dl_stall_flag = True
+                state.nm3u8dl_stall_reason = "playlist_producer_timeout"
+                log(
+                    "N_m3u8DL: Fatal playlist producer timeout/cancellation detected (TaskCanceledException)! "
+                    "Fast-path terminating stalled process to seal chunk...",
+                    level="WARN",
+                )
+
         # N_m3u8DL emits this when the live playlist has actually ended.
         # Record it as a run fact; let N_m3u8DL finish/finalize normally.
         if (
@@ -16287,6 +16679,10 @@ def monitor_nm3u8dl_stdout(
 
         if should_exclude_nm3u8dl_line(stripped, exclude_substrings):
             return
+
+        if state is not None and getattr(state, "network_guard", None):
+            if state.network_guard.inspect_stdout_line(stripped):
+                return
 
         # Supports:
         #   Vid ...
@@ -16532,6 +16928,18 @@ def nm3u8dl_handle_growth_events(state: RecorderState, stop_event: threading.Eve
         soft_stall_required = int(
             profile.get("soft_stall_required", soft_stall_required)
         )
+
+    normal_hard_stall = hard_stall_required
+    is_double_vpn_capped = False
+
+    # In-flight double-VPN smart stall cap: if host VPN is nested over Wireproxy, cap stall wait to max 4 checks
+    guard = getattr(state, "network_guard", None)
+    if guard and hasattr(guard, "is_wireproxy_nested_in_vpn"):
+        is_nested, _ = guard.is_wireproxy_nested_in_vpn()
+        if is_nested and (hard_stall_required > 4 or soft_stall_required > 4):
+            is_double_vpn_capped = True
+            hard_stall_required = min(4, hard_stall_required)
+            soft_stall_required = min(4, soft_stall_required)
     # ACK belongs to the stall incident, not to one particular N process.
     if getattr(state, "nm3u8dl_ack_requested", False):
         acknowledge_nm3u8dl_stall_alarm(state)
@@ -16606,6 +17014,8 @@ def nm3u8dl_handle_growth_events(state: RecorderState, stop_event: threading.Eve
             )
             if not is_alarm_active(state):
                 beep_bad(state)
+            reset_good_beep_state(state, "nm3u8dl")
+            state.nm3u8dl_had_alarm_incident = True
         else:
             is_soft = (growth_kbps < threshold_kbps)
             if is_soft:
@@ -16621,6 +17031,8 @@ def nm3u8dl_handle_growth_events(state: RecorderState, stop_event: threading.Eve
                 )
                 if not is_alarm_active(state):
                     beep_bad(state)
+                reset_good_beep_state(state, "nm3u8dl")
+                state.nm3u8dl_had_alarm_incident = True
             else:
                 # One confirmed healthy growth check is the ONLY recovery reset.
                 state.nm3u8dl_run_had_healthy_check = True
@@ -16665,10 +17077,10 @@ def nm3u8dl_handle_growth_events(state: RecorderState, stop_event: threading.Eve
                 continue
 
         hard_trigger = (
-            state.nm3u8dl_hard_count == hard_stall_required
+            state.nm3u8dl_hard_count >= hard_stall_required
         )
         soft_trigger = (
-            state.nm3u8dl_soft_count == soft_stall_required
+            state.nm3u8dl_soft_count >= soft_stall_required
         )
 
         if not (hard_trigger or soft_trigger):
@@ -16677,6 +17089,25 @@ def nm3u8dl_handle_growth_events(state: RecorderState, stop_event: threading.Eve
         stall_type = "hard" if hard_trigger else "soft"
         log(f"CLASSIFY STALL_{stall_type.upper()}", level="WARN")
         reset_good_beep_state(state, "nm3u8dl")
+
+        # Network Guard: In-flight attribution for nested double-VPN stall
+        guard = getattr(state, "network_guard", None)
+        if guard and hasattr(guard, "is_wireproxy_nested_in_vpn"):
+            is_nested, vpn_name = guard.is_wireproxy_nested_in_vpn()
+            if is_nested:
+                if is_double_vpn_capped:
+                    log(
+                        f"NETWORK_GUARD: Active double-VPN ({vpn_name}) detected during stall! "
+                        f"Smart stall cap enforced: ending chunk early at check {hard_stall_required} (normal {normal_hard_stall}) "
+                        f"to seal video bytes safely and hand over routing for next chunk.",
+                        level="WARN",
+                    )
+                else:
+                    log(
+                        f"NETWORK_GUARD: Stream stalled while Wireproxy was nested inside {vpn_name}! "
+                        f"Attributing stall to nested tunnel packet loss / MTU conflict.",
+                        level="WARN",
+                    )
 
         state.nm3u8dl_stall_event_count += 1
         event_count = state.nm3u8dl_stall_event_count
@@ -16785,6 +17216,12 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
             "--decryption-engine SHAKA_PACKAGER"
         )
 
+        if is_wireproxy_active(state) and "--custom-proxy" not in cmd:
+            cmd = f"{cmd} --custom-proxy http://127.0.0.1:{WIREPROXY_HTTP_PORT}"
+
+        if "--download-retry-count" not in cmd:
+            cmd = f"{cmd} --download-retry-count 5"
+
         # Per-process state only. Stall/crash counters and stall-alarm state are
         # incident-level state and survive process replacement/restart until one
         # confirmed healthy growth check proves recovery.
@@ -16810,6 +17247,12 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
         state.stats["last_run_start"] = run_launch_ts
         
         popen_env = os.environ.copy()
+        if is_wireproxy_active(state):
+            proxy_url = f"http://127.0.0.1:{WIREPROXY_HTTP_PORT}"
+            popen_env["HTTP_PROXY"] = proxy_url
+            popen_env["HTTPS_PROXY"] = proxy_url
+            popen_env["http_proxy"] = proxy_url
+            popen_env["https_proxy"] = proxy_url
 
         if NM3U8DL_AUDIO_OFFSET_SEC != 0:
             offset = NM3U8DL_AUDIO_OFFSET_SEC
@@ -16856,6 +17299,7 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
             proc,
             exclude_substrings=exclude_substrings,
             raw_invocation=raw_invocation,
+            state=state,
         )
         state.nm3u8dl_selected_bitrate_kbps = startup_data['bitrate']
         state.nm3u8dl_bitrate_is_fallback = False
@@ -16944,6 +17388,7 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 live_end_event,
                 raw_invocation,
                 nm3u8dl_progress_activity_id,
+                state,
             ),
             daemon=True,
         )
@@ -16986,6 +17431,40 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                         f"{os.path.basename(actual_chunk_path)}"
                     )
                 break
+
+            # Process alarm silence request if operator pressed 'A'
+            if getattr(state, "alarm_ack_requested", False):
+                state.alarm_ack_requested = False
+                shared_alarm_stop(state)
+
+            # Network Guard: In-stream route monitoring for Phase A (Hook 4)
+            # Outbound internet severed while in VPN drop! Aborting retry to seal chunk...
+            if getattr(state, "network_guard", None) and not state.stop_flag:
+                drop_status = state.network_guard.supervise_in_flight(proc, temp_dir=CHUNKS_DIR, stop_event=stop_event)
+                if drop_status:
+                    actual_out = find_nm3u8dl_output_path(chunk_path, not_before=run_launch_ts)
+                    raw_external_end(raw_invocation, returncode=proc.poll())
+                    if drop_status == "internet_drop":
+                        return EngineResult(
+                            status="internet_drop",
+                            reason="internet connection lost during lenient drop",
+                            chunk_path=actual_out or chunk_path,
+                            chunk_name=os.path.basename(actual_out) if actual_out else chunk_name,
+                            metrics={
+                                "selected_bitrate_kbps": state.nm3u8dl_selected_bitrate_kbps,
+                                "refresh_interval_s": state.nm3u8dl_refresh_interval_s,
+                            },
+                        )
+                    return EngineResult(
+                        status="vpn_drop",
+                        reason="vpn route dropped",
+                        chunk_path=actual_out or chunk_path,
+                        chunk_name=os.path.basename(actual_out) if actual_out else chunk_name,
+                        metrics={
+                            "selected_bitrate_kbps": state.nm3u8dl_selected_bitrate_kbps,
+                            "refresh_interval_s": state.nm3u8dl_refresh_interval_s,
+                        },
+                    )
 
             if proc.poll() is not None:
                 break
@@ -17174,6 +17653,28 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
             
             nm3u8dl_handle_growth_events(state, stop_event, notify)
 
+            # Process alarm silence request if operator pressed 'A'
+            if getattr(state, "alarm_ack_requested", False):
+                state.alarm_ack_requested = False
+                shared_alarm_stop(state)
+
+            # Network Guard: Zero-traffic kernel route monitoring (every 1s)
+            if getattr(state, "network_guard", None) and not state.stop_flag:
+                drop_status = state.network_guard.supervise_in_flight(proc, temp_dir=CHUNKS_DIR, stop_event=stop_event)
+                if drop_status:
+                    actual_out = find_nm3u8dl_output_path(chunk_path, not_before=run_launch_ts)
+                    raw_external_end(raw_invocation, returncode=proc.poll())
+                    return EngineResult(
+                        status=drop_status,
+                        reason="vpn route dropped" if drop_status == "vpn_drop" else "internet connection lost during lenient drop",
+                        chunk_path=actual_out or chunk_path,
+                        chunk_name=os.path.basename(actual_out) if actual_out else chunk_name,
+                        metrics={
+                            "selected_bitrate_kbps": state.nm3u8dl_selected_bitrate_kbps,
+                            "refresh_interval_s": state.nm3u8dl_refresh_interval_s,
+                        },
+                    )
+
             # Check for crash/stall signals
             if state.nm3u8dl_stall_flag:
                 reason = state.nm3u8dl_stall_reason or "file growth stall"
@@ -17318,6 +17819,13 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
         log("N_m3u8DL stopped for this run")
         state.nm3u8dl_stop_event = None
 
+        if getattr(state, "lenient_alarm_active", False):
+            status = "vpn_drop"
+            reason = "vpn route dropped mid-stream"
+        elif getattr(state, "internet_drop_active", False):
+            status = "internet_drop"
+            reason = "internet connection lost mid-stream"
+
         return EngineResult(
             status=status,
             reason=reason if status != "ended" or proc.returncode != 0 else f"exit code {proc.returncode}",
@@ -17333,6 +17841,11 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
             },
         )
     finally:
+        if getattr(state, "lenient_alarm_active", False):
+            state.lenient_alarm_active = False
+            shared_alarm_stop(state)
+        if getattr(state, "internet_drop_active", False):
+            shared_alarm_stop(state)
         state.nm3u8dl_run_active = False
         state.nm3u8dl_event_queue = None
 
@@ -17658,6 +18171,56 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
     # The final chunk has now been accepted, so do not classify it as a recovery failure.
     if result.status == "duration_reached":
         return backoff_sec
+
+    # Universal Internet Outage Protection ([INTERNET_HOLD] across all streams)
+    if getattr(state, "network_guard", None) and not state.stop_flag:
+        if result.status == "internet_drop" or getattr(state, "internet_drop_active", False):
+            log("NETWORK_GUARD: Outbound internet connectivity lost! Diverting to Internet Hold...", level="WARN")
+            res = state.network_guard.handle_internet_hold_state(is_startup=False)
+            if not res:
+                state.stop_flag = True
+            return 0.0
+
+    # Network Guardrail & Rate-Limit Circuit Breaker intercept
+    if getattr(state, "network_guard_triggered", False) or result.status == "vpn_drop":
+        state.network_guard_triggered = False
+        if getattr(state, "network_guard", None):
+            res = state.network_guard.handle_vpn_hold_state(is_startup=False)
+            if not res:
+                state.stop_flag = True
+        return 0.0
+
+    if getattr(state, "rate_limit_429_detected", False) or "429" in str(result.reason or "") or (result.metrics and result.metrics.get("rate_limit_429", False)):
+        state.rate_limit_429_detected = False
+        if getattr(state, "network_guard", None):
+            res = state.network_guard.handle_rate_limit_cooldown()
+            if not res:
+                state.stop_flag = True
+        return 0.0
+
+    # Defensive Guardrail: Intercept unexpected engine exit or 403 geo-block
+    if getattr(state, "network_guard", None) and state.network_guard.is_armed and not state.stop_flag:
+        # 1. Route Severance / VPN Drop takes precedence (Section 11)
+        if not state.network_guard.check_runtime_route() or result.status == "vpn_drop":
+            log("NETWORK_GUARD: Egress dropped off VPN! Diverting to Hold state...", level="WARN")
+            res = state.network_guard.handle_vpn_hold_state(is_startup=False)
+            if not res:
+                state.stop_flag = True
+            return 0.0
+
+        # 2. Burned IP Block: Egress route verified healthy, but CDN returns 403 (Section 13)
+        has_403 = (
+            getattr(state.network_guard, "has_403_error", False)
+            or "403" in str(result.reason or "")
+            or (result.metrics and result.metrics.get("geo_block_403", False))
+        )
+        if has_403:
+            state.network_guard.has_403_error = False
+            is_startup = (state.stats.get("good_chunks", 0) == 0)
+            res = state.network_guard.handle_403_recovery(is_startup=is_startup)
+            if not res:
+                state.stop_flag = True
+            return 0.0
 
     if (
         engine.name == ENGINE_NM3U8DL
@@ -18093,6 +18656,9 @@ def write_summary_log(state, dur, finalized=True):
         lines.append("Retry / offline / BAD   : " + fmt_hms(time_retry_offline))
         lines.append("")
 
+        if getattr(state, "network_guard", None):
+            lines.extend(state.network_guard.format_summary_lines())
+            lines.append("")
 
         lines.append("Chunks")
         lines.append("------")
@@ -18195,6 +18761,10 @@ def finalize_recording(state: RecorderState):
     """
     Run ffmpeg concat to build FINAL_FILE, then robust checks and cleanup.
     """
+    # Stop wireproxy child process before anything else to free ports and unlock temporary files
+    if getattr(state, "wireproxy_manager", None):
+        state.wireproxy_manager.stop()
+
     if not os.path.exists(LIST_FILE):
         log(f"No concat list file → {LIST_FILE} missing → no chunks to concat. Skipping finalize.")
         return
@@ -18312,6 +18882,72 @@ def finalize_recording(state: RecorderState):
     except Exception as e:
         log(f"Could not delete chunks folder {CHUNKS_DIR}: {e}")
 
+def setup_network_guard(state: RecorderState, is_scheduled: bool = False) -> bool:
+    """
+    Initialize NetworkGuard with current live network state, resolve policy,
+    print contiguous network headers, and execute preflight check.
+    Called only when actual recording is ready to start (after scheduled wait, or immediately for manual start).
+    """
+    init_raw_external_capture()
+    state.is_scheduled = is_scheduled
+    if getattr(state, "network_guard", None) is not None:
+        return state.network_guard.preflight_check(temp_dir=CHUNKS_DIR, is_scheduled=False)
+
+    req_country = REQUIRED_VPN_COUNTRY
+    policy = "LENIENT"
+    detection_source = "user_override" if req_country else "unrestricted"
+
+    if NM3U8DL_SOURCE_MODE == "playlist":
+        try:
+            profile = get_nm3u8dl_playlist_profile()
+            prof_country = profile.get("vpn_country")
+            prof_policy = profile.get("vpn_policy", "LENIENT")
+            if req_country is None and prof_country:
+                req_country = prof_country
+                group_name = NM3U8DL_PLAYLIST_GROUP.strip().upper()
+                detection_source = f"profile: {group_name}"
+            policy = prof_policy
+        except Exception:
+            pass
+
+    guard, guard_ok = create_network_guard(
+        state,
+        required_country=req_country,
+        drop_policy=policy,
+        detection_source=detection_source,
+        server_priority=VPN_SERVER_PRIORITY,
+        log_fn=log,
+        render_progress_fn=render_progress_line,
+        clear_progress_fn=clear_progress_line,
+        alarm_start_fn=shared_alarm_start,
+        alarm_stop_fn=shared_alarm_stop,
+        beep_good_fn=beep_good,
+        beep_bad_fn=beep_bad,
+        log_good_beep_fn=log_good_beep,
+        raw_start_fn=raw_external_start,
+        raw_end_fn=raw_external_end,
+        raw_write_fn=raw_external_write,
+        temp_dir=CHUNKS_DIR,
+    )
+    return guard_ok
+
+
+def get_host_platform_summary() -> str:
+    host_name = socket.gethostname() or "unknown-host"
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    arch = platform.machine() or "unknown-arch"
+    if os.name == "nt":
+        win_ver = platform.version() or platform.release()
+        return f"{host_name} | Windows {win_ver} ({arch}) | Python {py_ver}"
+    elif sys.platform == "darwin":
+        mac_ver = platform.mac_ver()[0] or "macOS"
+        return f"{host_name} | macOS {mac_ver} (Darwin {arch}) | Python {py_ver}"
+    else:
+        system = platform.system()
+        release = platform.release()
+        return f"{host_name} | {system} {release} ({arch}) | Python {py_ver}"
+
+
 def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
     """
     If SCHEDULE_START is set to a future time, wait until then.
@@ -18327,6 +18963,7 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
         if RUN_DURATION_MIN is not None:
             end_time = now + timedelta(minutes=RUN_DURATION_MIN)
             log(f"RECORDING ENGINE  : {selected_engine.name}")
+            log(f"Host Platform     : {get_host_platform_summary()}")
             log(f"Recording mode    : {mode}")
             log(f"Base name         : {BASE_NAME}")
             log(
@@ -18339,6 +18976,7 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
             log(f"Expected end time : {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
             log(f"RECORDING ENGINE  : {selected_engine.name}")
+            log(f"Host Platform     : {get_host_platform_summary()}")
             log(f"Recording mode    : {mode}")
             log(f"Base name         : {BASE_NAME}")
             log(
@@ -18348,6 +18986,10 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
             for line in selected_engine.summary_lines():
                 log(line)
             log("Planned duration  : until stopped")
+
+        guard_ok = setup_network_guard(state, is_scheduled=False)
+        if not guard_ok:
+            sys.exit(0 if getattr(state, "stop_flag", False) else 1)
         return  # start immediately
         
     # Scheduled mode
@@ -18356,11 +18998,15 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
         target = datetime.strptime(SCHEDULE_START, "%Y-%m-%d %H:%M")
     except ValueError:
         log(f"Invalid SCHEDULE_START '{SCHEDULE_START}', starting immediately.")
+        guard_ok = setup_network_guard(state, is_scheduled=False)
+        if not guard_ok:
+            sys.exit(0 if getattr(state, "stop_flag", False) else 1)
         return
     # Header printed once
     if RUN_DURATION_MIN is not None:
         end_time = target + timedelta(minutes=RUN_DURATION_MIN)
         log(f"RECORDING ENGINE  : {selected_engine.name}")
+        log(f"Host Platform     : {get_host_platform_summary()}")
         log(f"Recording mode    : {mode}")
         log(f"Base name         : {BASE_NAME}")
         for line in selected_engine.summary_lines():
@@ -18378,6 +19024,7 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
         log(f"Expected end time : {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     else:
         log(f"RECORDING ENGINE  : {selected_engine.name}")
+        log(f"Host Platform     : {get_host_platform_summary()}")
         log(f"Recording mode    : {mode}")
         log(f"Base name         : {BASE_NAME}")
         for line in selected_engine.summary_lines():
@@ -18398,6 +19045,9 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
     now = datetime.now()
     if now >= target:
         log(f"SCHEDULE_START {SCHEDULE_START} is in the past → starting immediately.")
+        guard_ok = setup_network_guard(state, is_scheduled=True)
+        if not guard_ok:
+            sys.exit(0 if getattr(state, "stop_flag", False) else 1)
         return
 
     last_wait_len = 0
@@ -18424,6 +19074,9 @@ def wait_until_start(state: RecorderState, selected_engine: RecorderEngine):
 
     clear_progress_line()
     log(f"Reached scheduled start time {SCHEDULE_START} → starting recording.")
+    guard_ok = setup_network_guard(state, is_scheduled=True)
+    if not guard_ok:
+        sys.exit(0 if getattr(state, "stop_flag", False) else 1)
     
 
 def ffmpeg_summary_lines():
@@ -18571,6 +19224,26 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
                 continue
             break
             
+        # Check inter-chunk network route gate before launching next chunk
+        if getattr(state, "network_guard", None) and not state.stop_flag:
+            if hasattr(state.network_guard, "inter_chunk_gate_check"):
+                if not state.network_guard.inter_chunk_gate_check(temp_dir=CHUNKS_DIR):
+                    break
+            elif state.network_guard.is_armed:
+                if not state.network_guard.check_runtime_route():
+                    time.sleep(1.5)
+                    if not state.network_guard.check_runtime_route():
+                        log("NETWORK_GUARD: VPN route not verified before chunk launch! Entering Hold state...", level="WARN")
+                        if not state.network_guard.handle_vpn_hold_state(is_startup=False):
+                            break
+            else:
+                if not state.network_guard.check_runtime_internet():
+                    time.sleep(1.5)
+                    if not state.network_guard.check_runtime_internet():
+                        log("NETWORK_GUARD: Internet offline before chunk launch! Entering Hold state...", level="WARN")
+                        if not state.network_guard.handle_internet_hold_state(is_startup=False):
+                            break
+
         if recording_deadline_reached(state):
             result = EngineResult(
                 status="duration_reached",
@@ -18724,6 +19397,9 @@ def run_recorder_process(
         LIST_FILE = os.path.join(CHUNKS_DIR, "concat_list.txt")
         os.makedirs(CHUNKS_DIR, exist_ok=True)
 
+        init_termcap()
+        init_raw_external_capture()
+        ensure_global_key_listener(state)
         wait_until_start(state, selected_engine)
         main(state, selected_engine)
 
@@ -18742,6 +19418,11 @@ def run_recorder_process(
             reason="recorder stopped without a normal terminal reason",
         )
     finally:
+        if 'state' in locals() and getattr(state, "wireproxy_manager", None):
+            try:
+                state.wireproxy_manager.stop(silent=True)
+            except Exception:
+                pass
         if osSleep:
             osSleep.uninhibit()
 
