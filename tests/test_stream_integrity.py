@@ -20,13 +20,16 @@ HELPER_CONSTANTS = ("STREAM_CORRUPT_WINDOW_SEC", "STREAM_CORRUPT_ALARM_THRESHOLD
 
 
 def resolve_record_py_path() -> Path:
-    """Resolve RECORD.py: RECORD_PY_PATH env -> sibling WORKSPACE FOR AI AGENTS -> skip."""
+    """Resolve RECORD.py: RECORD_PY_PATH env -> local workspace candidates -> skip in CI."""
     env_path = os.environ.get("RECORD_PY_PATH")
     if env_path and Path(env_path).exists():
         return Path(env_path)
-    sibling = Path(__file__).resolve().parents[3] / "WORKSPACE FOR AI AGENTS" / "RECORD.py"
-    if sibling.exists():
-        return sibling
+    parents = Path(__file__).resolve().parents
+    for parent in parents:
+        for candidate_dir in ("WORKSPACE FOR AI AGENTS", "RECORDER CODE FOR ANTIGRAVITY"):
+            candidate = parent / candidate_dir / "RECORD.py"
+            if candidate.exists():
+                return candidate
     raise unittest.SkipTest("Static recorder RECORD.py not found in local workspace (CI environment)")
 
 
