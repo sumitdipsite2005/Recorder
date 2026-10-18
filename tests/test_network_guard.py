@@ -521,7 +521,11 @@ class RecordDynamicWiringTests(unittest.TestCase):
         self.assertIn('"hard_stall_required": 20,', self.code)
 
     def test_nm3u8dl_fatal_producer_error_wiring_in_static_recorder(self):
-        static_path = Path(__file__).resolve().parent.parent.parent / "RECORDER CODE FOR ANTIGRAVITY" / "RECORD.py"
+        static_path = Path(__file__).resolve().parent.parent.parent / "WORKSPACE FOR AI AGENTS" / "RECORD.py"
+        if not static_path.exists():
+            static_path = Path("/Users/sumitsinha/Movies/GSE SMART IPTV/Recordings/WORKSPACE FOR AI AGENTS/RECORD.py")
+        if not static_path.exists():
+            static_path = Path(__file__).resolve().parent.parent.parent / "RECORDER CODE FOR ANTIGRAVITY" / "RECORD.py"
         if not static_path.exists():
             static_path = Path("/Users/sumitsinha/Movies/GSE SMART IPTV/Recordings/RECORDER CODE FOR ANTIGRAVITY/RECORD.py")
         if not static_path.exists():
