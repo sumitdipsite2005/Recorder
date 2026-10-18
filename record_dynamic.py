@@ -279,7 +279,7 @@ NM3U8DL_PLAYLIST_PROFILES = {
     },
     
     "KHEL": {
-        "vpn_country": "PK",
+        "vpn_country": "IN",
         "vpn_policy": "LENIENT",
         "safe_overtime_min": 0,
         "renewal_mode": "EXPIRY_ROLLOVER",
