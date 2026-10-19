@@ -609,6 +609,10 @@ class RecorderState:
     internet_drop_post_ack_silent: bool = False
     rate_limit_429_detected: bool = False
     is_scheduled: bool = False
+    token_hold_active: bool = False
+    token_expired_post_ack_silent: bool = False
+    token_hold_input_buffer: str = ""
+    token_hold_submitted_url: Optional[str] = None
     nm3u8dl_alarm_stop_event: Optional[threading.Event] = None
     nm3u8dl_alarm_thread: Optional[threading.Thread] = None
     nm3u8dl_key_listener_started: bool = False
@@ -2290,6 +2294,46 @@ def alarm_critical(state):
 def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
 
     def handle_key(ch):
+        if getattr(state, "token_hold_active", False):
+            if not getattr(state, "token_hold_input_buffer", "") and ch in ("a", "A"):
+                state.alarm_ack_requested = True
+                acknowledge_token_expired_alarm(state, log_fn=log, alarm_stop_fn=shared_alarm_stop)
+                return
+
+            if ch in ("\r", "\n"):
+                buf = getattr(state, "token_hold_input_buffer", "").strip()
+                if buf:
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    state.token_hold_submitted_url = buf
+                    state.token_hold_input_buffer = ""
+                return
+
+            if ch in ("\x08", "\x7f"):
+                buf = getattr(state, "token_hold_input_buffer", "")
+                if buf:
+                    state.token_hold_input_buffer = buf[:-1]
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                return
+
+            if ch == "\x1b":
+                buf = getattr(state, "token_hold_input_buffer", "")
+                if buf:
+                    sys.stdout.write("\b \b" * len(buf))
+                    sys.stdout.flush()
+                    state.token_hold_input_buffer = ""
+                return
+
+            if ch.isprintable():
+                buf = getattr(state, "token_hold_input_buffer", "")
+                state.token_hold_input_buffer = buf + ch
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+                return
+
+            return
+
         if handle_runtime_control_key(state, ch):
             return
 
@@ -2625,6 +2669,15 @@ def _auto_silence_shared_alarm(state, alarm_type: str):
         state.nm3u8dl_failover_alarm_silenced = True
         state.alarm_ack_requested = False
         log("ALARM_PLAYLIST_FAILOVER_STOP reason=timeout", level="WARN")
+    elif alarm_type == "vpn_drop":
+        state.vpn_drop_post_ack_silent = True
+        log("ALARM_VPN_STOP reason=timeout", level="WARN")
+    elif alarm_type == "internet_drop":
+        state.internet_drop_post_ack_silent = True
+        log("ALARM_INTERNET_STOP reason=timeout", level="WARN")
+    elif alarm_type == "token_expired":
+        state.token_expired_post_ack_silent = True
+        log("ALARM_TOKEN_EXPIRED_STOP reason=timeout", level="WARN")
 
     shared_alarm_stop(state)
 
@@ -2634,6 +2687,12 @@ def shared_alarm_start(state, alarm_type: str, incident: Optional[int] = None):
     if alarm_type == "ffmpeg" and getattr(state, "ffmpeg_post_ack_silent", False):
         return
     if alarm_type == "nm3u8dl_stall" and getattr(state, "nm3u8dl_post_ack_silent", False):
+        return
+    if alarm_type == "vpn_drop" and getattr(state, "vpn_drop_post_ack_silent", False):
+        return
+    if alarm_type == "internet_drop" and getattr(state, "internet_drop_post_ack_silent", False):
+        return
+    if alarm_type == "token_expired" and getattr(state, "token_expired_post_ack_silent", False):
         return
 
     # Only one alarm sound at a time (shared across engines).
@@ -3487,6 +3546,9 @@ def _apply_custom_runtime_entry(state: RecorderState):
 
 def handle_runtime_control_key(state: RecorderState, ch: str) -> bool:
     """Handle I/+/-/E/D/S plus interactive runtime controls. Return True if consumed."""
+    if getattr(state, "token_hold_active", False):
+        return False
+
     mode = getattr(state, "console_input_mode", None)
 
     if mode is not None:
@@ -17124,9 +17186,8 @@ def nm3u8dl_handle_growth_events(state: RecorderState, stop_event: threading.Eve
                 state.no_file_appear_count = 0
                 state.nm3u8dl_crash_count = 0
                 if getattr(state, "network_guard", None):
-                    state.network_guard.rate_limit_strike = 0
-                    state.network_guard.consecutive_429_count = 0
-                    state.network_guard.recent_429_timestamps.clear()
+                    if (time.monotonic() - getattr(state.network_guard, "last_429_incident_mono", 0.0)) > 30.0:
+                        state.network_guard.rate_limit_strike = 0
 
                 maybe_trigger_good_beep(
                     state,
@@ -17385,6 +17446,11 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
 
         if startup_data.get("has_429") or getattr(state, "rate_limit_429_detected", False):
             log("HTTP 429 Too Many Requests detected during startup → triggering rate-limit circuit breaker", level="WARN")
+            if getattr(state, "network_guard", None):
+                state.rate_limit_429_detected = True
+                if state.network_guard.rate_limit_429_count == 0 or (time.monotonic() - state.network_guard.last_429_incident_mono > 1.0):
+                    state.network_guard.rate_limit_429_count += 1
+                    state.network_guard.last_429_incident_mono = time.monotonic()
             if proc.poll() is None:
                 proc.terminate()
                 try:

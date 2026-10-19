@@ -916,22 +916,87 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
 
         # 1st 429 error -> does not trip yet
         self.assertFalse(guard.inspect_stdout_line("ERROR: Response status code does not indicate success: 429 (Too Many Requests)."))
-        self.assertEqual(guard.consecutive_429_count, 1)
+        self.assertEqual(len(guard.recent_429_timestamps), 1)
 
-        # "Waiting 100%" progress line must NOT reset consecutive_429_count
+        # "Waiting 100%" progress line must NOT reset timestamps
         self.assertFalse(guard.inspect_stdout_line("Vid 1920x1080 | 6000 Kbps | Waiting 100%"))
-        self.assertEqual(guard.consecutive_429_count, 1)
+        self.assertEqual(len(guard.recent_429_timestamps), 1)
 
-        # 2nd consecutive 429 error -> trips circuit breaker immediately
+        # "Recording" progress line must NOT reset timestamps
+        self.assertFalse(guard.inspect_stdout_line("Vid 1920x1080 | Recording 45%"))
+        self.assertEqual(len(guard.recent_429_timestamps), 1)
+
+        # 2nd 429 within 30s -> does not trip yet
+        self.assertFalse(guard.inspect_stdout_line("HTTP Error 429: Too Many Requests"))
+        self.assertEqual(len(guard.recent_429_timestamps), 2)
+
+        # 3rd 429 within 30s -> trips circuit breaker (3 in 30s)
         self.assertTrue(guard.inspect_stdout_line("ERROR: Response status code does not indicate success: 429 (Too Many Requests)."))
         self.assertEqual(guard.rate_limit_429_count, 1)
-        self.assertEqual(guard.consecutive_429_count, 0)
+        self.assertEqual(len(guard.recent_429_timestamps), 0)
 
-        # Genuine "Recording" progress line DOES reset consecutive_429_count
-        self.assertFalse(guard.inspect_stdout_line("HTTP Error 429: Too Many Requests"))
-        self.assertEqual(guard.consecutive_429_count, 1)
-        self.assertFalse(guard.inspect_stdout_line("Vid 1920x1080 | Recording 45%"))
-        self.assertEqual(guard.consecutive_429_count, 0)
+    def test_extract_stream_expiry_and_token_expiration(self):
+        guard = NetworkGuard(required_country="IN")
+
+        # Query param formats: exp, expires, expiry
+        self.assertEqual(guard.extract_stream_expiry("https://example.com/live.m3u8?exp=1740000000"), 1740000000)
+        self.assertEqual(guard.extract_stream_expiry("https://example.com/live.m3u8?expires=1740000000"), 1740000000)
+        self.assertEqual(guard.extract_stream_expiry("https://example.com/live.m3u8?token=xyz;expiry=1740000000"), 1740000000)
+
+        # 13-digit millisecond normalization
+        self.assertEqual(guard.extract_stream_expiry("https://example.com/live.m3u8?exp=1740000000000"), 1740000000)
+
+        # Active token expiration check
+        past_ts = int(time.time()) - 100
+        future_ts = int(time.time()) + 3600
+
+        mock_state = MagicMock()
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={past_ts}"
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        mock_state.active_stream_url = ""
+        guard.state = mock_state
+        self.assertTrue(guard.is_stream_token_expired(lead_time_sec=0.0))
+
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={future_ts}"
+        self.assertFalse(guard.is_stream_token_expired(lead_time_sec=60.0))
+
+    def test_handle_token_hold_state_headless_fast_fail(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+
+        with patch("sys.stdin.isatty", return_value=False):
+            res = guard.handle_token_hold_state()
+            self.assertFalse(res)
+            self.assertTrue(mock_state.stop_flag)
+            self.assertEqual(guard.token_expiry_count, 1)
+
+    def test_handle_403_recovery_decouples_token_expiry_without_vpn_siren(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.stats = {"good_chunks": 1}
+        mock_state.live_url = "https://example.com/live.m3u8"
+        mock_state.token_hold_active = False
+
+        alarms_started = []
+        guard = NetworkGuard(
+            required_country="IN",
+            state=mock_state,
+            alarm_start_fn=lambda s, alarm_type: alarms_started.append(alarm_type),
+        )
+        guard.vpn_mode = "LEGACY_VPN"
+        guard.is_armed = True
+        guard.launch_country = "IN"
+
+        with patch.object(guard, "check_runtime_route", return_value=True), \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_token_hold, \
+             patch.object(guard, "handle_vpn_hold_state") as mock_vpn_hold:
+            res = guard.handle_403_recovery(is_startup=False)
+            self.assertTrue(res)
+            mock_token_hold.assert_called_once()
+            mock_vpn_hold.assert_not_called()
+            self.assertNotIn("vpn_drop", alarms_started)
 
     def test_supervise_in_flight_terminates_on_rate_limit_429(self):
         mock_state = MagicMock()

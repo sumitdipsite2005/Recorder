@@ -139,3 +139,30 @@ def acknowledge_internet_drop_alarm(
         alarm_stop_fn(state)
     return True
 
+
+def acknowledge_token_expired_alarm(
+    state,
+    *,
+    log_fn: Optional[Callable] = None,
+    alarm_stop_fn: Optional[Callable] = None,
+) -> bool:
+    """Acknowledge the token expired alarm immediately."""
+    alarm_type = getattr(state, "shared_alarm_type", None)
+    if not (
+        getattr(state, "token_hold_active", False)
+        or alarm_type == "token_expired"
+    ):
+        return False
+
+    alarm_activity_id = getattr(state, "shared_alarm_activity_id", None)
+    if log_fn:
+        log_fn("ALARM_ACK", activity_id=alarm_activity_id)
+        log_fn("ALARM_TOKEN_EXPIRED_STOP reason=ack", activity_id=alarm_activity_id)
+    state.token_expired_post_ack_silent = True
+    state.alarm_ack_requested = False
+    state.alarm_linger_until = None
+    if alarm_stop_fn:
+        alarm_stop_fn(state)
+    return True
+
+

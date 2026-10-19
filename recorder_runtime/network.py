@@ -33,6 +33,7 @@ RATE_LIMIT_ERROR_THRESHOLD = 3
 RATE_LIMIT_WINDOW_SEC = 30.0
 VPN_HOLD_TIMEOUT_SEC = 30 * 60.0
 INTERNET_HOLD_TIMEOUT_SEC = 30 * 60.0
+TOKEN_HOLD_TIMEOUT_SEC = 30 * 60.0
 
 
 def default_log(msg: str, level: str = "INFO", **kwargs) -> None:
@@ -915,11 +916,12 @@ class NetworkGuard:
 
         # Real-time HTTP 429 & 403 tracking
         self.recent_429_timestamps: List[float] = []
-        self.consecutive_429_count: int = 0
         self.rate_limit_strike: int = 0
         self.has_403_error: bool = False
         self.blocked_403_ip: Optional[str] = None
         self.last_403_incident_mono: float = 0.0
+        self.token_expiry_count: int = 0
+
 
         # Double-VPN runtime tracking
         self._runtime_double_vpn_warned: bool = False
@@ -1046,6 +1048,7 @@ class NetworkGuard:
             lines.append(f"VPN Disconnect Events   : {self.vpn_drop_count}")
             lines.append(f"Total VPN Hold Duration : {fmt_hms(self.vpn_hold_total_duration)}")
             lines.append(f"HTTP 429 Incidents      : {self.rate_limit_429_count}")
+            lines.append(f"Token Expiry Holds      : {self.token_expiry_count}")
             lines.append("Guardrail Violations    : 0 (0 packets leaked outside VPN)")
         else:
             lines.append("Guardrail Status        : UNRESTRICTED (Open / Generic Stream)")
@@ -1305,6 +1308,19 @@ class NetworkGuard:
                 return True, provider
         return False, ""
 
+    def _proactive_token_gate_check(self) -> bool:
+        """Evaluate stream token validity before chunk launch, bypassing dynamic playlist mode."""
+        source_mode = getattr(self.state, "source_mode", None)
+        if source_mode != "playlist":
+            if self.is_stream_token_expired(lead_time_sec=60.0):
+                self.log_fn(
+                    "NETWORK_GUARD: Stream authentication token expired or expiring within 60s! "
+                    "Diverting to Token Hold before chunk launch...",
+                    level="WARN",
+                )
+                return self.handle_token_hold_state()
+        return True
+
     def inter_chunk_gate_check(self, temp_dir: str = "./_temp_chunks") -> bool:
         """
         Inter-chunk route re-assessment (evaluates network route between chunks / attempts).
@@ -1327,10 +1343,10 @@ class NetworkGuard:
                 if not self.check_runtime_internet():
                     self.log_fn("NETWORK_GUARD: Internet offline before chunk launch! Entering Hold state...", level="WARN")
                     return self.handle_internet_hold_state(is_startup=False)
-            return True
+            return self._proactive_token_gate_check()
 
         if not self.is_armed:
-            return True
+            return self._proactive_token_gate_check()
 
         # Check physical internet first
         if not NetworkRouteResolver.is_internet_online(timeout=1.5):
@@ -1374,7 +1390,7 @@ class NetworkGuard:
                         f"(Country: {self.launch_country} | Adapter: {self.launch_interface} | IP: {self.launch_ip})",
                         level="INFO",
                     )
-                    return True
+                    return self._proactive_token_gate_check()
                 else:
                     self.log_fn(
                         f"NETWORK_GUARD: Host System VPN ({host_provider} | {host_iface}) connected to conflicting country "
@@ -1393,7 +1409,7 @@ class NetworkGuard:
                     if not self.check_runtime_route():
                         self.log_fn("NETWORK_GUARD: Wireproxy route not verified before chunk launch! Entering Hold state...", level="WARN")
                         return self.handle_vpn_hold_state(is_startup=False)
-                return True
+                return self._proactive_token_gate_check()
 
         # Case 2: Currently in LEGACY_VPN mode
         elif self.vpn_mode == "LEGACY_VPN":
@@ -1430,7 +1446,7 @@ class NetworkGuard:
                                 f"Network Route     : Connected [WIREPROXY] (Country: {loc} | Server: {self.wireproxy_manager.active_server} | IP: {ip})",
                                 level="INFO",
                             )
-                            return True
+                            return self._proactive_token_gate_check()
                         else:
                             self.wireproxy_manager.stop()
                     return self.handle_vpn_hold_state(is_startup=False)
@@ -1444,9 +1460,9 @@ class NetworkGuard:
                     if not self.check_runtime_route():
                         self.log_fn("NETWORK_GUARD: VPN route not verified before chunk launch! Entering Hold state...", level="WARN")
                         return self.handle_vpn_hold_state(is_startup=False)
-                return True
+                return self._proactive_token_gate_check()
 
-        return True
+        return self._proactive_token_gate_check()
 
     def check_runtime_internet(self) -> bool:
         """In-flight internet connectivity test throttled to 5.0 seconds with debounced drop confirmation."""
@@ -1466,7 +1482,7 @@ class NetworkGuard:
     def inspect_stdout_line(self, line: str) -> bool:
         """
         Inspect downloader stdout line for HTTP 429 or 403 Forbidden.
-        Returns True if sustained rate-limit threshold is crossed.
+        Returns True if sustained rate-limit threshold is crossed (3 occurrences in 30s).
         """
         now = time.monotonic()
         raw = line.lower()
@@ -1480,18 +1496,13 @@ class NetworkGuard:
         if "429" in raw and ("too many requests" in raw or "status code does not indicate success: 429" in raw or "http error 429" in raw):
             self.recent_429_timestamps.append(now)
             self.recent_429_timestamps = [t for t in self.recent_429_timestamps if now - t <= RATE_LIMIT_WINDOW_SEC]
-            self.consecutive_429_count += 1
 
-            if len(self.recent_429_timestamps) >= RATE_LIMIT_ERROR_THRESHOLD or self.consecutive_429_count >= 2:
+            if len(self.recent_429_timestamps) >= RATE_LIMIT_ERROR_THRESHOLD:
                 self.rate_limit_429_count += 1
                 self.last_429_incident_mono = now
                 self.recent_429_timestamps.clear()
-                self.consecutive_429_count = 0
                 return True
             return False
-
-        if "recording" in raw:
-            self.consecutive_429_count = 0
 
         return False
 
@@ -1515,8 +1526,8 @@ class NetworkGuard:
                         setattr(self.state, "network_guard_hold_active", False)
                         setattr(self.state, "vpn_drop_post_ack_silent", False)
                     self.log_fn(f"NETWORK_GUARD: Wireproxy route verified healthy (Country: {loc} | Server: {self.wireproxy_manager.active_server} | IP: {ip}). Bypassing Hold state.", level="INFO")
-                    if not is_startup and self.resume_callback:
-                        self.resume_callback(self.state)
+                    if not is_startup:
+                        self._verify_and_resume_stream(self.state)
                     return True
         else:
             cur_iface, cur_is_vpn = NetworkRouteResolver.get_default_route_info()
@@ -1536,8 +1547,8 @@ class NetworkGuard:
                         setattr(self.state, "network_guard_hold_active", False)
                         setattr(self.state, "vpn_drop_post_ack_silent", False)
                     self.log_fn(f"NETWORK_GUARD: VPN route verified healthy (Country: {loc} | Provider: {provider} | IP: {ip}). Bypassing Hold state.", level="INFO")
-                    if not is_startup and self.resume_callback:
-                        self.resume_callback(self.state)
+                    if not is_startup:
+                        self._verify_and_resume_stream(self.state)
                     return True
 
         self.hold_active = True
@@ -1654,8 +1665,8 @@ class NetworkGuard:
                             f"NETWORK_GUARD: Wireproxy connection restored (Server: {self.wireproxy_manager.active_server} | IP: {self.launch_ip}). Guardrail cleared.",
                             level="INFO",
                         )
-                        if not is_startup and self.resume_callback:
-                            self.resume_callback(self.state)
+                        if not is_startup:
+                            self._verify_and_resume_stream(self.state)
                         return True
             else:
                 cur_iface, cur_is_vpn = NetworkRouteResolver.get_default_route_info()
@@ -1687,14 +1698,294 @@ class NetworkGuard:
                             f"NETWORK_GUARD: VPN connection restored (Country: {loc} | Provider: {provider} | IP: {ip}). Guardrail cleared.",
                             level="INFO",
                         )
-                        if not is_startup and self.resume_callback:
-                            self.resume_callback(self.state)
+                        if not is_startup:
+                            self._verify_and_resume_stream(self.state)
                         return True
 
             time.sleep(1.0)
 
+    def get_active_source_url(self) -> Optional[str]:
+        """Extract the active streaming URL from state or engine configuration."""
+        if not self.state:
+            return None
+        live_url = getattr(self.state, "live_url", None) or getattr(self.state, "active_stream_url", None)
+        if isinstance(live_url, str) and live_url.strip():
+            return live_url.strip()
+        mat = self.get_active_source_material()
+        if mat and isinstance(mat, str):
+            m = re.search(r'["\'](https?://[^"\']+)["\']', mat)
+            if m:
+                return m.group(1)
+            m2 = re.search(r'(https?://\S+)', mat)
+            if m2:
+                return m2.group(1)
+        return None
+
+    def get_active_source_material(self) -> str:
+        """Retrieve active command line material or source URL string."""
+        if self.state:
+            for attr in ("nm3u8dl_part_a", "active_command", "live_url", "active_stream_url"):
+                val = getattr(self.state, attr, None)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        return ""
+
+    @staticmethod
+    def extract_stream_expiry(url_or_cmd: Optional[str]) -> Optional[int]:
+        """
+        Extract token expiry epoch timestamp from URL or command string.
+        Supports query params: exp, expires, expiry. Normalizes 13-digit ms to seconds.
+        """
+        if not url_or_cmd:
+            return None
+        expiries = []
+        for match in re.finditer(
+            r'(?:^|[?&~=;])(?:exp|expires|expiry)=(\d+)',
+            str(url_or_cmd),
+            flags=re.IGNORECASE,
+        ):
+            raw_val = int(match.group(1))
+            if 1_000_000_000_000 <= raw_val <= 2_500_000_000_000:
+                raw_val = raw_val // 1000
+            if 1_000_000_000 <= raw_val <= 2_500_000_000:
+                expiries.append(raw_val)
+        return min(expiries) if expiries else None
+
+    def is_stream_token_expired(self, lead_time_sec: float = 60.0) -> bool:
+        """
+        Check if the active stream token is already expired or expiring within lead_time_sec.
+        Returns False if no expiry parameter is present.
+        """
+        url = self.get_active_source_url() or self.get_active_source_material()
+        expiry = self.extract_stream_expiry(url)
+        if expiry is None:
+            return False
+        return float(expiry) <= (time.time() + lead_time_sec)
+
+    def _probe_stream_url(self, url: str, timeout: float = 3.0) -> bool:
+        """
+        Probe stream URL via HTTP GET with Range request.
+        Returns True if HTTP 200/206, False if 401/403/404/410 or connection failure.
+        """
+        if not url:
+            return False
+        try:
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+                    "Range": "bytes=0-100",
+                },
+            )
+            opener = None
+            if self.vpn_mode == "WIREPROXY" and self.wireproxy_manager and self.wireproxy_manager.is_running():
+                proxy_handler = ProxyHandler({
+                    "http": f"http://127.0.0.1:{self.wireproxy_manager.http_port}",
+                    "https": f"http://127.0.0.1:{self.wireproxy_manager.http_port}",
+                })
+                opener = build_opener(proxy_handler)
+
+            open_fn = opener.open if opener else urlopen
+            with open_fn(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", None) or getattr(resp, "code", None)
+                if status in (200, 206):
+                    return True
+        except HTTPError as e:
+            if e.code in (401, 403, 404, 410):
+                return False
+            return False
+        except Exception:
+            return False
+        return False
+
+    def update_stream_url(self, new_input: str) -> None:
+        """
+        Update stream URL and headers across active command material.
+        Accepts both bare URLs and full command lines.
+        """
+        candidate = str(new_input or "").strip()
+        if not candidate:
+            return
+
+        new_url = ""
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            new_url = candidate.split()[0]
+        else:
+            m = re.search(r'["\'](https?://[^"\']+)["\']', candidate)
+            if m:
+                new_url = m.group(1)
+            else:
+                m2 = re.search(r'(https?://\S+)', candidate)
+                if m2:
+                    new_url = m2.group(1)
+
+        if not new_url:
+            return
+
+        if self.state:
+            setattr(self.state, "active_stream_url", new_url)
+            setattr(self.state, "live_url", new_url)
+
+            part_a = getattr(self.state, "nm3u8dl_part_a", "")
+            if part_a:
+                if '"http' in part_a:
+                    part_a = re.sub(r'"https?://[^"]+"', f'"{new_url}"', part_a, count=1)
+                elif "'http" in part_a:
+                    part_a = re.sub(r"'https?://[^']+'", f"'{new_url}'", part_a, count=1)
+                else:
+                    part_a = re.sub(r'https?://\S+', new_url, part_a, count=1)
+                setattr(self.state, "nm3u8dl_part_a", part_a)
+
+    def _verify_and_resume_stream(self, state=None) -> bool:
+        """
+        Unattended Resumption Protocol:
+        Probes existing URL. If valid, resumes automatically.
+        If expired / 403, diverts to 30-minute Token Hold state.
+        """
+        url = self.get_active_source_url()
+        if not url:
+            if self.resume_callback:
+                self.resume_callback(self.state)
+            return True
+
+        is_valid = self._probe_stream_url(url)
+        if is_valid:
+            network_type = "VPN" if self.is_armed else "internet connection"
+            self.log_fn(f"NETWORK_GUARD: Stream verified via restored {network_type}. Resuming unattended recording.", level="INFO")
+            if self.resume_callback:
+                self.resume_callback(self.state)
+            return True
+        else:
+            self.log_fn("NETWORK_GUARD: Stream token expired during outage. Diverting to Token Hold...", level="WARN")
+            return self.handle_token_hold_state()
+
+    def handle_token_hold_state(self) -> bool:
+        """
+        30-Minute Stream Token Expiry Hold State:
+        Safely halts downstream attempts, sounds token_expired alarm,
+        renders live countdown, and prompts operator to paste updated stream URL or command.
+        """
+        self.token_expiry_count += 1
+        if not sys.stdin.isatty():
+            self.log_fn(
+                "NETWORK_GUARD: [TOKEN_HOLD] Headless/non-interactive stdin detected. "
+                "Cannot prompt operator for updated URL. Finalizing recording.",
+                level="ERROR",
+            )
+            if self.state:
+                setattr(self.state, "stop_flag", True)
+            return False
+
+        hold_start_mono = time.monotonic()
+        if self.state:
+            setattr(self.state, "token_hold_active", True)
+            setattr(self.state, "token_hold_input_buffer", "")
+            setattr(self.state, "token_hold_submitted_url", None)
+
+        already_silenced = bool(self.state and getattr(self.state, "token_expired_post_ack_silent", False))
+
+        banner = [
+            "====================================================================",
+            "[TOKEN_HOLD] Stream authentication token expired!",
+            "Outbound VPN and internet verified healthy.",
+            "Active chunk safely sealed to disk.",
+            "Holding for up to 30 minutes for updated stream URL.",
+            "Paste updated URL or full command and press ENTER to resume.",
+        ]
+        if not already_silenced:
+            banner.append("Press 'A' to silence audio alarm.")
+        else:
+            banner.append("Audio alarm already silenced by operator.")
+        banner.append("====================================================================")
+
+        for b_line in banner:
+            self.log_fn(b_line, level="WARN")
+
+        if not already_silenced and self.alarm_start_fn:
+            self.alarm_start_fn(self.state, alarm_type="token_expired")
+        elif not already_silenced and self.beep_bad_fn:
+            self.beep_bad_fn(self.state)
+
+        last_wait_len = 0
+        alarm_silenced = already_silenced
+
+        while True:
+            now = time.monotonic()
+
+            if self.state and getattr(self.state, "stop_flag", False):
+                if self.state:
+                    setattr(self.state, "token_hold_active", False)
+                if self.alarm_stop_fn:
+                    self.alarm_stop_fn(self.state)
+                self.clear_progress_fn()
+                return False
+
+            if self.state and getattr(self.state, "alarm_ack_requested", False):
+                if self.alarm_stop_fn:
+                    self.alarm_stop_fn(self.state)
+                setattr(self.state, "alarm_ack_requested", False)
+                setattr(self.state, "token_expired_post_ack_silent", True)
+                alarm_silenced = True
+                self.clear_progress_fn()
+                self.log_fn("ALARM_ACK (Token Expiry Hold audio alarm silenced by operator)", level="INFO")
+
+            elapsed = now - hold_start_mono
+            if elapsed >= self.hold_timeout_sec:
+                if self.state:
+                    setattr(self.state, "token_hold_active", False)
+                if self.alarm_stop_fn:
+                    self.alarm_stop_fn(self.state)
+                self.clear_progress_fn()
+                self.log_fn("NETWORK_GUARD: 30-minute Token Hold timed out without updated URL. Finalizing recording.", level="ERROR")
+                return False
+
+            submitted = getattr(self.state, "token_hold_submitted_url", None) if self.state else None
+            if submitted:
+                setattr(self.state, "token_hold_submitted_url", None)
+                candidate = submitted.strip()
+                self.clear_progress_fn()
+                self.log_fn("[TOKEN_HOLD] Operator entered candidate stream URL / command. Verifying connectivity...", level="INFO")
+
+                probe_url = ""
+                if candidate.startswith("http://") or candidate.startswith("https://"):
+                    probe_url = candidate.split()[0]
+                else:
+                    m = re.search(r'["\'](https?://[^"\']+)["\']', candidate)
+                    if m:
+                        probe_url = m.group(1)
+                    else:
+                        m2 = re.search(r'(https?://\S+)', candidate)
+                        if m2:
+                            probe_url = m2.group(1)
+
+                if probe_url and self._probe_stream_url(probe_url):
+                    self.update_stream_url(candidate)
+                    if self.state:
+                        setattr(self.state, "token_hold_active", False)
+                        setattr(self.state, "token_expired_post_ack_silent", False)
+                    if self.alarm_stop_fn:
+                        self.alarm_stop_fn(self.state)
+                    if self.log_good_beep_fn:
+                        self.log_good_beep_fn("stream_token_renewed")
+                    if self.beep_good_fn:
+                        self.beep_good_fn(self.state)
+                    self.log_fn("NETWORK_GUARD: Stream token verified and updated successfully! Resuming recording.", level="INFO")
+                    return True
+                else:
+                    self.log_fn("NETWORK_GUARD: Candidate URL failed verification probe (HTTP 401/403/404 or connection error).", level="WARN")
+                    self.log_fn("Please paste a valid, active stream URL or command:", level="WARN")
+
+            rem = max(0.0, self.hold_timeout_sec - elapsed)
+            alarm_hint = " (Alarm silenced)" if (alarm_silenced or (self.state and getattr(self.state, "token_expired_post_ack_silent", False))) else " (Press 'A' to silence alarm)"
+            hold_text = f"[TOKEN_HOLD] Waiting for updated stream URL... Timeout remaining: {fmt_hms(rem)}{alarm_hint}"
+            pad = max(0, last_wait_len - len(hold_text))
+            self.render_progress_fn(hold_text, pad=pad)
+            last_wait_len = len(hold_text)
+
+            time.sleep(1.0)
+
     def handle_403_recovery(self, is_startup: bool = False) -> bool:
-        """Unified 403 Forbidden (CDN IP-Block / Geo-Block) Recovery Protocol."""
+        """Unified 403 Forbidden (CDN IP-Block / Geo-Block / Token Expiry) Recovery Protocol."""
         blocked_ip = self.blocked_403_ip or self.launch_ip
         if not blocked_ip:
             ip, _ = NetworkRouteResolver.get_public_ip_and_country(timeout=1.5)
@@ -1704,7 +1995,31 @@ class NetworkGuard:
         provider_name = self.active_system_vpn or "System VPN"
         self.log_fn(f"NETWORK_GUARD: Broadcaster CDN rejected egress IP ({blocked_ip}) with HTTP 403 Forbidden!", level="WARN")
 
-        if self.vpn_mode == "WIREPROXY" and self.wireproxy_manager:
+        # 1. Verify route health first: if VPN dropped or country mismatch, divert to VPN Hold
+        vpn_healthy = True
+        if self.is_armed:
+            if not self.check_runtime_route():
+                vpn_healthy = False
+            elif self.launch_country and self.launch_country != self.required_country:
+                vpn_healthy = False
+
+        if not vpn_healthy:
+            self.log_fn(f"NETWORK_GUARD: Egress VPN route severed or country mismatch during 403. Diverting to VPN Hold...", level="WARN")
+            recovered = self.handle_vpn_hold_state(is_startup=is_startup, blocked_ip=blocked_ip)
+            if recovered:
+                self.has_403_error = False
+                self.blocked_403_ip = None
+                return True
+            return False
+
+        good_chunks = 0
+        if self.state and hasattr(self.state, "stats"):
+            good_chunks = self.state.stats.get("good_chunks", 0)
+
+        is_token_expired = self.is_stream_token_expired(lead_time_sec=0.0)
+
+        # STAGE 1: Under Wireproxy on startup before any chunks and token not expired, attempt 3-2-1 IP rotation
+        if self.vpn_mode == "WIREPROXY" and self.wireproxy_manager and good_chunks == 0 and not is_token_expired:
             self.log_fn(f"NETWORK_GUARD: Initiating Wireproxy 3-2-1 IP pool rotation to evade 403 block on {blocked_ip}...", level="INFO")
             if self.attempt_wireguard_auto_recovery(blocked_ip=blocked_ip):
                 self.log_fn(f"NETWORK_GUARD: Successfully acquired fresh IP ({self.launch_ip}) != {blocked_ip} via Wireproxy. Resuming recording.", level="INFO")
@@ -1713,8 +2028,13 @@ class NetworkGuard:
                 return True
             self.log_fn("NETWORK_GUARD: Wireproxy 3-2-1 pool rotation failed to find unblocked IP.", level="WARN")
 
-        self.log_fn(f"NETWORK_GUARD: Diverting to 30-minute VPN Hold for IP refresh in {provider_name}...", level="WARN")
-        recovered = self.handle_vpn_hold_state(is_startup=is_startup, blocked_ip=blocked_ip)
+        # STAGE 2: Decoupled Token Expiry Hold (VPN route is verified healthy)
+        self.log_fn(
+            f"NETWORK_GUARD: Route verified healthy ({self.launch_country or self.required_country}); "
+            f"403 classified as STREAM_TOKEN_EXPIRED. Diverting to Token Hold...",
+            level="WARN",
+        )
+        recovered = self.handle_token_hold_state()
         if recovered:
             self.has_403_error = False
             self.blocked_403_ip = None
@@ -1826,8 +2146,8 @@ class NetworkGuard:
                 setattr(self.state, "internet_hold_active", False)
                 setattr(self.state, "internet_drop_active", False)
             self.log_fn("NETWORK_GUARD: Outbound internet verified online. Bypassing Internet Hold state.", level="INFO")
-            if not is_startup and self.resume_callback:
-                self.resume_callback(self.state)
+            if not is_startup:
+                self._verify_and_resume_stream(self.state)
             return True
 
         self.hold_active = True
@@ -2007,8 +2327,8 @@ class NetworkGuard:
                     self.log_fn(f"NETWORK_GUARD: Outbound internet and network route verified healthy {vpn_desc}! Guardrail cleared.", level="INFO")
                 else:
                     self.log_fn("NETWORK_GUARD: Outbound internet verified online! Guardrail cleared.", level="INFO")
-                if not is_startup and self.resume_callback:
-                    self.resume_callback(self.state)
+                if not is_startup:
+                    self._verify_and_resume_stream(self.state)
                 return True
 
             time.sleep(1.0)
