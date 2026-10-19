@@ -174,13 +174,16 @@ class WireproxyManager:
             return target
         return None
 
-    def create_runtime_config(self, source_conf_path: str, temp_dir: str) -> str:
+    def create_runtime_config(self, source_conf_path: str, temp_dir: Optional[str] = None) -> str:
         """
         Create ephemeral runtime config inside temp_dir,
         appending [Socks5] and [http] blocks without modifying source file.
         """
-        os.makedirs(temp_dir, exist_ok=True)
-        runtime_conf_path = os.path.join(temp_dir, "_wireproxy_active.tmp.conf")
+        target_dir = temp_dir if (temp_dir and str(temp_dir).strip()) else getattr(self, "active_temp_dir", "")
+        if not target_dir:
+            target_dir = "."
+        os.makedirs(target_dir, exist_ok=True)
+        runtime_conf_path = os.path.join(target_dir, "_wireproxy_active.tmp.conf")
 
         with open(source_conf_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -196,12 +199,14 @@ class WireproxyManager:
 
         return runtime_conf_path
 
-    def start(self, server_name: str, temp_dir: str) -> bool:
+    def start(self, server_name: str, temp_dir: Optional[str] = None) -> bool:
         """
         Launch wireproxy with server_name.
         Returns True if process starts and port responds within 2.5s.
         If an existing instance is already running (multi-worker), reuses it cleanly.
         """
+        if temp_dir and str(temp_dir).strip():
+            self.active_temp_dir = temp_dir
         # Idempotent port check: reuse existing active tunnel if available
         if self.check_port_responsive(timeout=0.2):
             self.active_server = server_name
@@ -394,7 +399,7 @@ class WireproxyManager:
         self,
         country: str,
         priority_list: List[str],
-        temp_dir: str,
+        temp_dir: Optional[str] = None,
         geo_verifier: Optional[Callable[[str], bool]] = None,
     ) -> bool:
         """
@@ -1068,7 +1073,7 @@ class NetworkGuard:
         """LENIENT mode is permitted for N_m3u8DL-RE when drop policy is LENIENT."""
         return self.drop_policy == "LENIENT"
 
-    def attempt_wireguard_auto_recovery(self, blocked_ip: Optional[str] = None, temp_dir: str = "./_temp_chunks") -> bool:
+    def attempt_wireguard_auto_recovery(self, blocked_ip: Optional[str] = None, temp_dir: Optional[str] = None) -> bool:
         """Stage 1: Silent WireGuard Auto-Recovery across configured servers."""
         if getattr(self.state, "stop_flag", False):
             return False
@@ -1104,7 +1109,7 @@ class NetworkGuard:
         self.last_route_is_vpn = False
         return False
 
-    def preflight_check(self, temp_dir: str = "./_temp_chunks", is_scheduled: bool = False) -> bool:
+    def preflight_check(self, temp_dir: Optional[str] = None, is_scheduled: bool = False) -> bool:
         """Verify network route and geo egress before connecting to broadcaster endpoints."""
         if self.vpn_mode == "UNRESTRICTED":
             if not NetworkRouteResolver.is_internet_online():
@@ -1326,7 +1331,7 @@ class NetworkGuard:
                 return self.handle_token_hold_state()
         return True
 
-    def inter_chunk_gate_check(self, temp_dir: str = "./_temp_chunks") -> bool:
+    def inter_chunk_gate_check(self, temp_dir: Optional[str] = None) -> bool:
         """
         Inter-chunk route re-assessment (evaluates network route between chunks / attempts).
         - If Wireproxy was running and a host VPN (e.g. Surfshark) auto-connected:
@@ -2393,7 +2398,7 @@ class NetworkGuard:
     def supervise_in_flight(
         self,
         proc: Optional[subprocess.Popen] = None,
-        temp_dir: str = "./_temp_chunks",
+        temp_dir: Optional[str] = None,
         stop_event: Optional[threading.Event] = None,
     ) -> Optional[str]:
         """
@@ -2565,7 +2570,7 @@ def create_network_guard(
     raw_start_fn: Optional[Callable] = None,
     raw_end_fn: Optional[Callable] = None,
     raw_write_fn: Optional[Callable] = None,
-    temp_dir: str = "./_temp_chunks",
+    temp_dir: Optional[str] = None,
 ) -> Tuple[NetworkGuard, bool]:
     """
     Factory helper to instantiate NetworkGuard, attach to state,

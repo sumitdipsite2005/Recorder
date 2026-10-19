@@ -9497,7 +9497,7 @@ def _handle_scan_geo_mismatch_recovery(
     countries_str = ", ".join(detected_countries) if detected_countries else "unknown country"
 
     attempt = getattr(state, "nm3u8dl_geo_jump_attempt", 0) + 1
-    temp_dir = CHUNKS_DIR or "./_temp_chunks"
+    temp_dir = CHUNKS_DIR or (f"{BASE_NAME}_chunks" if BASE_NAME else "")
 
     if attempt <= 5:
         state.nm3u8dl_geo_jump_attempt = attempt
