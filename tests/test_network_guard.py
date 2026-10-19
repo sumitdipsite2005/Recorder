@@ -1059,8 +1059,83 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         self.assertIn('Sec-CH-UA: "Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"', tokens)
         self.assertIn('Sec-CH-UA-Platform: "Windows"', tokens)
 
+    def test_update_stream_url_full_command_and_header_expiry_sync(self):
+        mock_state = MagicMock()
+        old_exp = int(time.time()) - 300
+        new_exp = int(time.time()) + 7200
+        mock_state.live_url = f"https://example.com/old.m3u8?exp={old_exp}"
+        mock_state.active_stream_url = mock_state.live_url
+        mock_state.nm3u8dl_part_a = (
+            f'N_m3u8DL-RE "{mock_state.live_url}" '
+            f'-H "Cookie: hdntl=exp={old_exp}~acl=/*" --key 1111:2222'
+        )
+        mock_state.active_command = mock_state.nm3u8dl_part_a
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+
+        # Case 1: Pasting a bare URL with a new expiry also updates stale exp= in headers
+        bare_new_url = f"https://example.com/new.m3u8?exp={new_exp}"
+        guard.update_stream_url(bare_new_url)
+        self.assertEqual(mock_state.live_url, bare_new_url)
+        self.assertEqual(mock_state.active_stream_url, bare_new_url)
+        self.assertIn(f"hdntl=exp={new_exp}", mock_state.nm3u8dl_part_a)
+        self.assertFalse(guard.is_stream_token_expired(lead_time_sec=60.0))
+
+        # Case 2: Pasting a full N_m3u8DL-RE command updates headers/keys and strips --save-name
+        full_cmd = (
+            f'N_m3u8DL-RE "https://example.com/cmd.m3u8?exp={new_exp}" '
+            f'-H "Authorization: Bearer NEW_TOKEN" --key 3333:4444 --save-name "manual_clip"'
+        )
+        guard.update_stream_url(full_cmd)
+        self.assertEqual(mock_state.live_url, f"https://example.com/cmd.m3u8?exp={new_exp}")
+        self.assertIn("Authorization: Bearer NEW_TOKEN", mock_state.nm3u8dl_part_a)
+        self.assertIn("--key 3333:4444", mock_state.nm3u8dl_part_a)
+        self.assertNotIn("--save-name", mock_state.nm3u8dl_part_a)
+
+    def test_handle_token_hold_rejects_expired_candidate_and_propagates_timeout_stop(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.token_hold_active = False
+        mock_state.token_hold_input_buffer = ""
+        mock_state.token_hold_submitted_url = None
+        mock_state.live_url = "https://example.com/old.m3u8"
+        mock_state.nm3u8dl_part_a = 'N_m3u8DL-RE "https://example.com/old.m3u8"'
+        mock_state.active_command = mock_state.nm3u8dl_part_a
+
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+        expired_url = f"https://example.com/expired.m3u8?exp={int(time.time()) - 10}"
+        fresh_url = f"https://example.com/fresh.m3u8?exp={int(time.time()) + 3600}"
+
+        # Simulate operator submitting an already-expired URL on loop 1, then a fresh URL on loop 2
+        submissions = [expired_url, fresh_url]
+
+        def fake_sleep(_sec):
+            if submissions:
+                mock_state.token_hold_submitted_url = submissions.pop(0)
+
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep), \
+             patch.object(guard, "_probe_stream_url", return_value=True) as mock_probe:
+            res = guard.handle_token_hold_state()
+            self.assertTrue(res)
+            # Probe should only be called once (for fresh_url, not expired_url)
+            mock_probe.assert_called_once_with(fresh_url)
+            self.assertEqual(mock_state.live_url, fresh_url)
+
+    def test_verify_and_resume_stream_propagates_false_on_token_hold_failure(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.live_url = "https://example.com/DeadToken.m3u8"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+        guard.vpn_mode = "UNRESTRICTED"
+        guard.is_armed = False
+
+        with patch("recorder_runtime.network.NetworkRouteResolver.is_internet_online", return_value=True), \
+             patch.object(guard, "_probe_stream_url", return_value=False), \
+             patch.object(guard, "handle_token_hold_state", return_value=False) as mock_token_hold:
+            res = guard.handle_internet_hold_state(is_startup=False)
+            self.assertFalse(res)
+            mock_token_hold.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

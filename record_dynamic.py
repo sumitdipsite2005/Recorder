@@ -646,6 +646,18 @@ class RecorderState:
     nm3u8dl_playlist_connectivity_alarm_silenced: bool = False
     nm3u8dl_geo_jump_attempt: int = 0
 
+    # Source / URL state used by NetworkGuard token expiry & URL replacement
+    source_mode: str = field(
+        default_factory=lambda: NM3U8DL_SOURCE_MODE if DOWNLOAD_MODE == ENGINE_NM3U8DL else "static"
+    )
+    nm3u8dl_part_a: str = field(
+        default_factory=lambda: NM3U8DL_PART_A if (DOWNLOAD_MODE == ENGINE_NM3U8DL and NM3U8DL_SOURCE_MODE == "static") else ""
+    )
+    live_url: str = field(
+        default_factory=lambda: LIVE_URL if DOWNLOAD_MODE == ENGINE_FFMPEG else ""
+    )
+    active_stream_url: Optional[str] = None
+
     # Dynamic-playlist downloader-failure failover. This is deliberately separate
     # from the mature MANIFEST/NO_FILE/STALL/CRASH counters above: those counters
     # keep their existing incident/recovery meanings, while this state answers one
@@ -2346,8 +2358,9 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
                 or getattr(state, "nm3u8dl_alarm_active", False)
                 or getattr(state, "network_guard_hold_active", False)
                 or getattr(state, "internet_hold_active", False)
+                or getattr(state, "token_hold_active", False)
                 or getattr(state, "lenient_alarm_active", False)
-                or getattr(state, "shared_alarm_type", None) in ("vpn_drop", "internet_drop", "critical")
+                or getattr(state, "shared_alarm_type", None) in ("vpn_drop", "internet_drop", "token_expired", "critical")
             )
 
             if alarm_active:
@@ -2392,6 +2405,11 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
                     or getattr(state, "shared_alarm_type", None) == "internet_drop"
                 ):
                     acknowledge_internet_drop_alarm(state)
+                elif (
+                    getattr(state, "token_hold_active", False)
+                    or getattr(state, "shared_alarm_type", None) == "token_expired"
+                ):
+                    acknowledge_token_expired_alarm(state, log_fn=log, alarm_stop_fn=shared_alarm_stop)
                 else:
                     state.alarm_ack_requested = True
 
@@ -4247,10 +4265,14 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
     Start one FFmpeg run that writes directly to the 'next' chunk_NNN.ts.
     Does NOT increment state.chunk_index yet. Returns EngineResult with run facts only.
     """
+    global LIVE_URL
     chunk_path, chunk_name = next_chunk_names(state)
     
     # record when this recording attempt started
     state.stats["last_run_start"] = time.time()
+    effective_live_url = getattr(state, "live_url", None) or LIVE_URL
+    if isinstance(effective_live_url, str) and effective_live_url.strip():
+        LIVE_URL = effective_live_url.strip()
 
     cmd = [
         "ffmpeg",
@@ -4404,6 +4426,12 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
                 # Capture before any recorder filtering/suppression/parsing.
                 raw_external_write(raw_invocation, line, "stderr")
                 s = line.strip()
+                if not s:
+                    continue
+
+                if state is not None and getattr(state, "network_guard", None):
+                    if state.network_guard.inspect_stdout_line(s):
+                        state.rate_limit_429_detected = True
                 
                 # HOT-AUDIO: if audio appears mid-run, restart FFmpeg so NEXT chunk includes audio
                 if "new audio stream" in s.lower():
@@ -14570,8 +14598,11 @@ def _get_nm3u8dl_part_b_for_launch(state: RecorderState, part_a: str = "") -> st
 def get_nm3u8dl_part_a(
     state: RecorderState
 ) -> Optional[str]:
-
+    global NM3U8DL_PART_A
     if NM3U8DL_SOURCE_MODE == "static":
+        updated_part_a = getattr(state, "nm3u8dl_part_a", None) if state is not None else None
+        if isinstance(updated_part_a, str) and updated_part_a.strip():
+            NM3U8DL_PART_A = updated_part_a.strip()
         return NM3U8DL_PART_A
 
     if NM3U8DL_SOURCE_MODE != "playlist":
@@ -16515,6 +16546,11 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
         if "429" in lower_s and ("too many requests" in lower_s or "status code does not indicate success: 429" in lower_s or "http error 429" in lower_s):
             has_429 = True
 
+        if state is not None and getattr(state, "network_guard", None):
+            if state.network_guard.inspect_stdout_line(stripped_line):
+                state.rate_limit_429_detected = True
+                has_429 = True
+
         # Raw console-refresh progress has no timestamp/newline. Keep only the
         # latest Vid/Aud record and log it periodically instead of dumping every
         # refresh fragment into one unreadable line.
@@ -16543,10 +16579,6 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
             stripped_line,
             exclude_substrings
         ):
-            if state is not None and getattr(state, "network_guard", None):
-                if state.network_guard.inspect_stdout_line(stripped_line):
-                    state.rate_limit_429_detected = True
-                    has_429 = True
             log(f"N_m3u8DL: {stripped_line}")
 
         if "Selected streams:" in stripped_line:
@@ -16775,6 +16807,10 @@ def monitor_nm3u8dl_stdout(
         if not stripped.strip():
             return
 
+        if state is not None and getattr(state, "network_guard", None):
+            if state.network_guard.inspect_stdout_line(stripped):
+                state.rate_limit_429_detected = True
+
         # Fatal N_m3u8DL playlist producer crash/timeout intercept:
         # When N_m3u8DL's DASH/HLS RefreshPlayListAsync times out or cancels (e.g. during a network drop),
         # its producer thread dies permanently while consumer workers sit in 'Waiting 100%' indefinitely.
@@ -16799,10 +16835,6 @@ def monitor_nm3u8dl_stdout(
 
         if should_exclude_nm3u8dl_line(stripped, exclude_substrings):
             return
-
-        if state is not None and getattr(state, "network_guard", None):
-            if state.network_guard.inspect_stdout_line(stripped):
-                state.rate_limit_429_detected = True
 
         # Supports:
         #   Vid ...
@@ -17186,7 +17218,7 @@ def nm3u8dl_handle_growth_events(state: RecorderState, stop_event: threading.Eve
                 state.no_file_appear_count = 0
                 state.nm3u8dl_crash_count = 0
                 if getattr(state, "network_guard", None):
-                    if (time.monotonic() - getattr(state.network_guard, "last_429_incident_mono", 0.0)) > 30.0:
+                    if (time.monotonic() - getattr(state.network_guard, "last_429_incident_mono", 0.0)) > RATE_LIMIT_WINDOW_SEC:
                         state.network_guard.rate_limit_strike = 0
 
                 maybe_trigger_good_beep(
@@ -17444,7 +17476,11 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 f"{state.nm3u8dl_selected_bitrate_kbps} Kbps for stall monitoring only"
             )
 
-        if startup_data.get("has_429") or getattr(state, "rate_limit_429_detected", False):
+        startup_failed = (
+            state.nm3u8dl_refresh_interval_s == 0
+            or state.nm3u8dl_selected_bitrate_kbps == 0
+        )
+        if getattr(state, "rate_limit_429_detected", False) or (startup_failed and startup_data.get("has_429")):
             log("HTTP 429 Too Many Requests detected during startup → triggering rate-limit circuit breaker", level="WARN")
             if getattr(state, "network_guard", None):
                 state.rate_limit_429_detected = True
@@ -17473,7 +17509,7 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 },
             )
 
-        if state.nm3u8dl_refresh_interval_s == 0 or state.nm3u8dl_selected_bitrate_kbps == 0:
+        if startup_failed:
             startup_exit_code = proc.poll()
             if (
                 NM3U8DL_SOURCE_MODE == "playlist"
@@ -19088,6 +19124,11 @@ def setup_network_guard(state: RecorderState, is_scheduled: bool = False) -> boo
     """
     init_raw_external_capture()
     state.is_scheduled = is_scheduled
+    state.source_mode = NM3U8DL_SOURCE_MODE if DOWNLOAD_MODE == ENGINE_NM3U8DL else "static"
+    if DOWNLOAD_MODE == ENGINE_NM3U8DL and NM3U8DL_SOURCE_MODE == "static" and not getattr(state, "nm3u8dl_part_a", ""):
+        state.nm3u8dl_part_a = NM3U8DL_PART_A
+    elif DOWNLOAD_MODE == ENGINE_FFMPEG and not getattr(state, "live_url", ""):
+        state.live_url = LIVE_URL
     if getattr(state, "network_guard", None) is not None:
         return state.network_guard.preflight_check(temp_dir=CHUNKS_DIR, is_scheduled=False)
 

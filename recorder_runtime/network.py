@@ -1018,11 +1018,14 @@ class NetworkGuard:
             lines.append(f"VPN drop events    : {self.vpn_drop_count}")
             lines.append(f"Total VPN hold     : {fmt_hms(self.vpn_hold_total_duration)}")
             lines.append(f"HTTP 429 incidents : {self.rate_limit_429_count}")
+            lines.append(f"Token expiry holds : {self.token_expiry_count}")
         else:
             lines.append("Guardrail status   : UNRESTRICTED")
             if self.internet_drop_count > 0:
                 lines.append(f"Internet drop events: {self.internet_drop_count}")
                 lines.append(f"Total Internet hold : {fmt_hms(self.internet_hold_total_duration)}")
+            if self.token_expiry_count > 0:
+                lines.append(f"Token expiry holds  : {self.token_expiry_count}")
         return lines
 
     def format_summary_lines(self) -> List[str]:
@@ -1057,6 +1060,8 @@ class NetworkGuard:
                 lines.append(f"Total Internet Hold     : {fmt_hms(self.internet_hold_total_duration)}")
             else:
                 lines.append("Internet Outages        : 0")
+            if self.token_expiry_count > 0:
+                lines.append(f"Token Expiry Holds      : {self.token_expiry_count}")
         return lines
 
     def is_lenient_drop_allowed(self) -> bool:
@@ -1527,7 +1532,7 @@ class NetworkGuard:
                         setattr(self.state, "vpn_drop_post_ack_silent", False)
                     self.log_fn(f"NETWORK_GUARD: Wireproxy route verified healthy (Country: {loc} | Server: {self.wireproxy_manager.active_server} | IP: {ip}). Bypassing Hold state.", level="INFO")
                     if not is_startup:
-                        self._verify_and_resume_stream(self.state)
+                        return self._verify_and_resume_stream(self.state)
                     return True
         else:
             cur_iface, cur_is_vpn = NetworkRouteResolver.get_default_route_info()
@@ -1548,7 +1553,7 @@ class NetworkGuard:
                         setattr(self.state, "vpn_drop_post_ack_silent", False)
                     self.log_fn(f"NETWORK_GUARD: VPN route verified healthy (Country: {loc} | Provider: {provider} | IP: {ip}). Bypassing Hold state.", level="INFO")
                     if not is_startup:
-                        self._verify_and_resume_stream(self.state)
+                        return self._verify_and_resume_stream(self.state)
                     return True
 
         self.hold_active = True
@@ -1666,7 +1671,7 @@ class NetworkGuard:
                             level="INFO",
                         )
                         if not is_startup:
-                            self._verify_and_resume_stream(self.state)
+                            return self._verify_and_resume_stream(self.state)
                         return True
             else:
                 cur_iface, cur_is_vpn = NetworkRouteResolver.get_default_route_info()
@@ -1699,7 +1704,7 @@ class NetworkGuard:
                             level="INFO",
                         )
                         if not is_startup:
-                            self._verify_and_resume_stream(self.state)
+                            return self._verify_and_resume_stream(self.state)
                         return True
 
             time.sleep(1.0)
@@ -1807,9 +1812,14 @@ class NetworkGuard:
         if not candidate:
             return
 
+        is_bare_url = (
+            (candidate.startswith("http://") or candidate.startswith("https://"))
+            and len(candidate.split()) == 1
+        )
+
         new_url = ""
-        if candidate.startswith("http://") or candidate.startswith("https://"):
-            new_url = candidate.split()[0]
+        if is_bare_url:
+            new_url = candidate
         else:
             m = re.search(r'["\'](https?://[^"\']+)["\']', candidate)
             if m:
@@ -1822,19 +1832,46 @@ class NetworkGuard:
         if not new_url:
             return
 
+        cleaned_cmd = ""
+        if not is_bare_url:
+            cleaned_cmd = re.sub(
+                r'\s+--save-name\s+(?:"[^"]*"|\'[^\']*\'|\S+)',
+                "",
+                candidate,
+            ).strip()
+
+        new_exp = self.extract_stream_expiry(new_url)
+
+        def _replace_url_in_cmd(cmd_str: str) -> str:
+            if not cmd_str:
+                return cmd_str
+            if not is_bare_url and cleaned_cmd:
+                return cleaned_cmd
+            if '"http' in cmd_str:
+                updated = re.sub(r'"https?://[^"]+"', f'"{new_url}"', cmd_str, count=1)
+            elif "'http" in cmd_str:
+                updated = re.sub(r"'https?://[^']+'", f"'{new_url}'", cmd_str, count=1)
+            else:
+                updated = re.sub(r'https?://\S+', new_url, cmd_str, count=1)
+            if new_exp is not None:
+                updated = re.sub(
+                    r'(\b(?:exp|expires|expiry)=)\d+',
+                    rf'\g<1>{new_exp}',
+                    updated,
+                    flags=re.IGNORECASE,
+                )
+            return updated
+
         if self.state:
             setattr(self.state, "active_stream_url", new_url)
             setattr(self.state, "live_url", new_url)
 
-            part_a = getattr(self.state, "nm3u8dl_part_a", "")
-            if part_a:
-                if '"http' in part_a:
-                    part_a = re.sub(r'"https?://[^"]+"', f'"{new_url}"', part_a, count=1)
-                elif "'http" in part_a:
-                    part_a = re.sub(r"'https?://[^']+'", f"'{new_url}'", part_a, count=1)
-                else:
-                    part_a = re.sub(r'https?://\S+', new_url, part_a, count=1)
-                setattr(self.state, "nm3u8dl_part_a", part_a)
+            for attr in ("nm3u8dl_part_a", "active_command"):
+                part_a = getattr(self.state, attr, "")
+                if isinstance(part_a, str) and part_a.strip():
+                    setattr(self.state, attr, _replace_url_in_cmd(part_a))
+                elif attr == "nm3u8dl_part_a" and not is_bare_url and cleaned_cmd:
+                    setattr(self.state, attr, cleaned_cmd)
 
     def _verify_and_resume_stream(self, state=None) -> bool:
         """
@@ -1920,6 +1957,17 @@ class NetworkGuard:
                 self.clear_progress_fn()
                 return False
 
+            deadline_ts = getattr(self.state, "deadline_ts", None) if self.state else None
+            if isinstance(deadline_ts, (int, float)) and time.time() >= deadline_ts:
+                if self.state:
+                    setattr(self.state, "token_hold_active", False)
+                    setattr(self.state, "stop_flag", True)
+                if self.alarm_stop_fn:
+                    self.alarm_stop_fn(self.state)
+                self.clear_progress_fn()
+                self.log_fn("NETWORK_GUARD: Planned recording duration reached during Token Hold. Finalizing recording.", level="INFO")
+                return False
+
             if self.state and getattr(self.state, "alarm_ack_requested", False):
                 if self.alarm_stop_fn:
                     self.alarm_stop_fn(self.state)
@@ -1933,6 +1981,7 @@ class NetworkGuard:
             if elapsed >= self.hold_timeout_sec:
                 if self.state:
                     setattr(self.state, "token_hold_active", False)
+                    setattr(self.state, "stop_flag", True)
                 if self.alarm_stop_fn:
                     self.alarm_stop_fn(self.state)
                 self.clear_progress_fn()
@@ -1958,7 +2007,14 @@ class NetworkGuard:
                         if m2:
                             probe_url = m2.group(1)
 
-                if probe_url and self._probe_stream_url(probe_url):
+                cand_exp = self.extract_stream_expiry(candidate)
+                if cand_exp is not None and float(cand_exp) <= (time.time() + 60.0):
+                    self.log_fn(
+                        "NETWORK_GUARD: [TOKEN_HOLD] Submitted URL token is already expired or expiring within 60s. "
+                        "Please paste a freshly generated stream URL or command:",
+                        level="WARN",
+                    )
+                elif probe_url and self._probe_stream_url(probe_url):
                     self.update_stream_url(candidate)
                     if self.state:
                         setattr(self.state, "token_hold_active", False)
@@ -1979,8 +2035,9 @@ class NetworkGuard:
             alarm_hint = " (Alarm silenced)" if (alarm_silenced or (self.state and getattr(self.state, "token_expired_post_ack_silent", False))) else " (Press 'A' to silence alarm)"
             hold_text = f"[TOKEN_HOLD] Waiting for updated stream URL... Timeout remaining: {fmt_hms(rem)}{alarm_hint}"
             pad = max(0, last_wait_len - len(hold_text))
-            self.render_progress_fn(hold_text, pad=pad)
-            last_wait_len = len(hold_text)
+            if not (self.state and getattr(self.state, "token_hold_input_buffer", "")):
+                self.render_progress_fn(hold_text, pad=pad)
+                last_wait_len = len(hold_text)
 
             time.sleep(1.0)
 
@@ -2147,7 +2204,7 @@ class NetworkGuard:
                 setattr(self.state, "internet_drop_active", False)
             self.log_fn("NETWORK_GUARD: Outbound internet verified online. Bypassing Internet Hold state.", level="INFO")
             if not is_startup:
-                self._verify_and_resume_stream(self.state)
+                return self._verify_and_resume_stream(self.state)
             return True
 
         self.hold_active = True
@@ -2328,7 +2385,7 @@ class NetworkGuard:
                 else:
                     self.log_fn("NETWORK_GUARD: Outbound internet verified online! Guardrail cleared.", level="INFO")
                 if not is_startup:
-                    self._verify_and_resume_stream(self.state)
+                    return self._verify_and_resume_stream(self.state)
                 return True
 
             time.sleep(1.0)
