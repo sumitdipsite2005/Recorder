@@ -276,20 +276,27 @@ class NetworkGuardPolicyTests(unittest.TestCase):
             clear_progress_fn=lambda: None,
         )
 
-        # Strike 1: Cooldown
+        # Strike 1: 90s Cooldown
         with patch("recorder_runtime.network.time.sleep"), \
              patch("recorder_runtime.network.time.monotonic", side_effect=[0.0, 95.0, 100.0, 105.0]):
             res = guard.handle_rate_limit_cooldown()
             self.assertEqual(guard.rate_limit_strike, 1)
             self.assertTrue(res)
 
-        # Strike 2: Rotation attempt (wireguard recovers)
+        # Strike 2: 240s Extended In-Place Cooldown on same IP (no IP rotation)
         guard.vpn_mode = "WIREPROXY"
         guard.wireproxy_manager = MagicMock()
-        guard.attempt_wireguard_auto_recovery = lambda *a, **k: True
-        res = guard.handle_rate_limit_cooldown()
-        self.assertEqual(guard.rate_limit_strike, 2)
-        self.assertTrue(res)
+        rotation_mock = MagicMock(return_value=True)
+        hold_mock = MagicMock(return_value=True)
+        guard.attempt_wireguard_auto_recovery = rotation_mock
+        guard.handle_vpn_hold_state = hold_mock
+        with patch("recorder_runtime.network.time.sleep"), \
+             patch("recorder_runtime.network.time.monotonic", side_effect=[200.0, 300.0, 445.0]):
+            res = guard.handle_rate_limit_cooldown()
+            self.assertEqual(guard.rate_limit_strike, 2)
+            self.assertTrue(res)
+            rotation_mock.assert_not_called()
+            hold_mock.assert_not_called()
 
         # Strike 3: Critical Concurrency Exhaustion Alarm
         res = guard.handle_rate_limit_cooldown()
@@ -361,7 +368,10 @@ class RecordDynamicWiringTests(unittest.TestCase):
 
     def test_custom_proxy_injected_for_wireproxy(self):
         self.assertIn("--custom-proxy http://127.0.0.1:{WIREPROXY_HTTP_PORT}", self.code)
-        self.assertIn("NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --download-retry-count 5", self.code)
+        self.assertIn(
+            "NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --live-take-count 2 --live-wait-time 3 --download-retry-count 2",
+            self.code,
+        )
         self.assertNotIn("--download-retry-count 30", self.code)
 
     def test_preflight_wireproxy_not_skipped_on_internet_recovery(self):
@@ -901,7 +911,91 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         self.assertTrue(any("Network Guard     : ARMED [SYSTEM_VPN: Surfshark]" in m for m in logged))
         self.assertTrue(any("Network Route     : Connected [Surfshark] (Country: IN | Adapter: utun6 | IP: 103.21.244.2)" in m for m in logged))
 
+    def test_inspect_stdout_line_429_threshold_and_waiting_not_resetting(self):
+        guard = NetworkGuard(required_country="IN")
+
+        # 1st 429 error -> does not trip yet
+        self.assertFalse(guard.inspect_stdout_line("ERROR: Response status code does not indicate success: 429 (Too Many Requests)."))
+        self.assertEqual(guard.consecutive_429_count, 1)
+
+        # "Waiting 100%" progress line must NOT reset consecutive_429_count
+        self.assertFalse(guard.inspect_stdout_line("Vid 1920x1080 | 6000 Kbps | Waiting 100%"))
+        self.assertEqual(guard.consecutive_429_count, 1)
+
+        # 2nd consecutive 429 error -> trips circuit breaker immediately
+        self.assertTrue(guard.inspect_stdout_line("ERROR: Response status code does not indicate success: 429 (Too Many Requests)."))
+        self.assertEqual(guard.rate_limit_429_count, 1)
+        self.assertEqual(guard.consecutive_429_count, 0)
+
+        # Genuine "Recording" progress line DOES reset consecutive_429_count
+        self.assertFalse(guard.inspect_stdout_line("HTTP Error 429: Too Many Requests"))
+        self.assertEqual(guard.consecutive_429_count, 1)
+        self.assertFalse(guard.inspect_stdout_line("Vid 1920x1080 | Recording 45%"))
+        self.assertEqual(guard.consecutive_429_count, 0)
+
+    def test_supervise_in_flight_terminates_on_rate_limit_429(self):
+        mock_state = MagicMock()
+        mock_state.rate_limit_429_detected = True
+        mock_state.stop_flag = False
+        stop_event = MagicMock()
+        mock_proc = MagicMock()
+
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+        status = guard.supervise_in_flight(proc=mock_proc, stop_event=stop_event)
+
+        self.assertEqual(status, "rate_limit_429")
+        self.assertTrue(stop_event.set.called)
+        self.assertTrue(mock_proc.terminate.called)
+
+    def test_deduplicate_nm3u8dl_part_b_preserves_provider_overrides(self):
+        import record_dynamic
+
+        default_b = record_dynamic.NM3U8DL_PART_B
+
+        # JIO overrides --thread-count 1 in PART_A
+        jio_a = 'N_m3u8DL-RE "https://example.com/index.m3u8" --thread-count 1'
+        dedup_jio = record_dynamic._deduplicate_nm3u8dl_part_b(jio_a, default_b)
+        self.assertNotIn("--thread-count", dedup_jio)
+        self.assertIn("--live-take-count 2", dedup_jio)
+        self.assertIn("--live-wait-time 3", dedup_jio)
+        self.assertIn("--download-retry-count 2", dedup_jio)
+
+        # 7AU overrides --live-wait-time 25 in PART_A
+        au_a = 'N_m3u8DL-RE "https://example.com/index.m3u8" --use-shaka-packager --live-wait-time 25'
+        dedup_au = record_dynamic._deduplicate_nm3u8dl_part_b(au_a, default_b)
+        self.assertNotIn("--live-wait-time", dedup_au)
+        self.assertIn("--thread-count 2", dedup_au)
+        self.assertIn("--live-take-count 2", dedup_au)
+
+    def test_hotstar_client_hints_and_quote_escaping(self):
+        import shlex
+        from recorder_source.headers import canonicalize_header_name
+        from recorder_source.policy import PROVIDER_ADDED_HEADERS
+
+        self.assertEqual(canonicalize_header_name("sec-ch-ua"), "Sec-CH-UA")
+        self.assertEqual(canonicalize_header_name("sec-ch-ua-platform"), "Sec-CH-UA-Platform")
+        self.assertEqual(canonicalize_header_name("sec-fetch-mode"), "Sec-Fetch-Mode")
+        self.assertEqual(canonicalize_header_name("accept-language"), "Accept-Language")
+
+        hotstar_headers = PROVIDER_ADDED_HEADERS["HOTSTAR"]
+        self.assertIn("Sec-CH-UA", hotstar_headers)
+        self.assertEqual(hotstar_headers["Origin"], "https://www.hotstar.com")
+        self.assertEqual(hotstar_headers["Referer"], "https://www.hotstar.com/")
+        self.assertEqual(hotstar_headers["Sec-Fetch-Mode"], "cors")
+        self.assertEqual(hotstar_headers["Sec-Fetch-Site"], "cross-site")
+
+        # Verify quote escaping produces valid shlex tokens with intact inner quotes
+        parts = ["N_m3u8DL-RE", '"https://live14p.hotstar.com/master.m3u8"']
+        for name, value in hotstar_headers.items():
+            escaped_value = str(value).replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'-H "{name}: {escaped_value}"')
+        cmd = " ".join(parts)
+        tokens = shlex.split(cmd)
+        self.assertIn('Sec-CH-UA: "Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"', tokens)
+        self.assertIn('Sec-CH-UA-Platform: "Windows"', tokens)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

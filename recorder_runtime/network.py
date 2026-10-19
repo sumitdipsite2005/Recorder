@@ -28,8 +28,9 @@ WIREPROXY_HTTP_PORT = 10809
 
 # Rate limiting and hold timeouts
 RATE_LIMIT_COOLDOWN_SEC = 90.0
-RATE_LIMIT_ERROR_THRESHOLD = 8
-RATE_LIMIT_WINDOW_SEC = 15.0
+RATE_LIMIT_EXTENDED_COOLDOWN_SEC = 240.0
+RATE_LIMIT_ERROR_THRESHOLD = 3
+RATE_LIMIT_WINDOW_SEC = 30.0
 VPN_HOLD_TIMEOUT_SEC = 30 * 60.0
 INTERNET_HOLD_TIMEOUT_SEC = 30 * 60.0
 
@@ -1481,7 +1482,7 @@ class NetworkGuard:
             self.recent_429_timestamps = [t for t in self.recent_429_timestamps if now - t <= RATE_LIMIT_WINDOW_SEC]
             self.consecutive_429_count += 1
 
-            if len(self.recent_429_timestamps) >= RATE_LIMIT_ERROR_THRESHOLD or self.consecutive_429_count >= 5:
+            if len(self.recent_429_timestamps) >= RATE_LIMIT_ERROR_THRESHOLD or self.consecutive_429_count >= 2:
                 self.rate_limit_429_count += 1
                 self.last_429_incident_mono = now
                 self.recent_429_timestamps.clear()
@@ -1489,7 +1490,7 @@ class NetworkGuard:
                 return True
             return False
 
-        if "recording" in raw or "waiting" in raw or "100%" in raw:
+        if "recording" in raw:
             self.consecutive_429_count = 0
 
         return False
@@ -1763,37 +1764,50 @@ class NetworkGuard:
             return True
 
         elif self.rate_limit_strike == 2:
+            cooldown_start = time.monotonic()
             banner = [
                 "====================================================================",
                 "[RATE-LIMIT STRIKE 2/3] HTTP 429 persisted after 90s cooldown!",
-                f"Broadcaster CDN is enforcing persistent rate-limiting on egress IP ({current_ip}).",
-                "Rotating egress IP to clear rate limit bucket...",
+                f"Suppressing mid-stream IP rotation to prevent token-hopping account lockout on egress IP ({current_ip}).",
+                f"Halting requests for {int(RATE_LIMIT_EXTENDED_COOLDOWN_SEC)}s extended cooldown to allow CDN edge bucket to drain...",
                 "====================================================================",
             ]
             for b_line in banner:
                 self.log_fn(b_line, level="WARN")
 
-            if self.vpn_mode == "WIREPROXY" and self.wireproxy_manager:
-                self.log_fn(f"NETWORK_GUARD: Initiating Wireproxy 3-2-1 IP rotation to clear rate limit on {current_ip}...", level="INFO")
-                if self.attempt_wireguard_auto_recovery(blocked_ip=current_ip):
-                    self.log_fn(f"NETWORK_GUARD: Fresh IP ({self.launch_ip}) acquired via Wireproxy. Strike 2 cleared; resuming next chunk.", level="INFO")
-                    return True
-                self.log_fn("NETWORK_GUARD: Wireproxy pool rotation exhausted.", level="WARN")
+            total_cd = float(RATE_LIMIT_EXTENDED_COOLDOWN_SEC)
+            last_cd_len = 0
 
-            self.log_fn(f"NETWORK_GUARD: Diverting to 30-minute VPN Hold for IP refresh in {provider_name}...", level="WARN")
-            recovered = self.handle_vpn_hold_state(is_startup=False, blocked_ip=current_ip)
-            if recovered:
-                self.log_fn(f"NETWORK_GUARD: Fresh IP ({self.launch_ip}) acquired via {provider_name}. Strike 2 cleared; resuming next chunk.", level="INFO")
-                return True
-            return False
+            while True:
+                now = time.monotonic()
+                if self.state and getattr(self.state, "stop_flag", False):
+                    self.clear_progress_fn()
+                    return False
+
+                elapsed = now - cooldown_start
+                rem = max(0.0, total_cd - elapsed)
+                if rem <= 0.0:
+                    break
+
+                cd_text = f"[RATE_LIMIT_COOLDOWN] Strike 2/3: Extended CDN 429 backoff... Cooldown remaining: {int(rem)}s"
+                pad = max(0, last_cd_len - len(cd_text))
+                self.render_progress_fn(cd_text, pad=pad)
+                last_cd_len = len(cd_text)
+                time.sleep(1.0)
+
+            self.clear_progress_fn()
+            self.log_fn(
+                f"RATE_LIMIT: {int(RATE_LIMIT_EXTENDED_COOLDOWN_SEC)}s extended cooldown completed on {current_ip}. Resuming next chunk attempt.",
+                level="INFO",
+            )
+            return True
 
         else:
             banner = [
                 "====================================================================",
-                "[RATE-LIMIT STRIKE 3/3] HTTP 429 persisted across multiple IP addresses!",
-                "Broadcaster CDN has locked account concurrency or expired stream token.",
-                "Further IP rotation cannot resolve account-level concurrency limits.",
-                "Terminating recording with critical alarm.",
+                "[RATE-LIMIT STRIKE 3/3] HTTP 429 persisted after extended in-place cooldowns!",
+                "Broadcaster CDN is enforcing an account-level rate limit or concurrency lock.",
+                "Terminating recording with critical alarm to protect subscriber token.",
                 "====================================================================",
             ]
             for b_line in banner:
@@ -2011,9 +2025,27 @@ class NetworkGuard:
 
         Returns:
             None: Stream route and physical internet are healthy (or absorbing lenient retry).
+            "rate_limit_429": Sustained HTTP 429 threshold crossed; child process terminated to seal chunk.
             "vpn_drop": Strict route drop occurred; child process terminated to seal chunk.
             "internet_drop": Physical internet died during lenient retry; process terminated to seal chunk.
         """
+        # 0. Sustained HTTP 429 rate-limit interception
+        if self.state and getattr(self.state, "rate_limit_429_detected", False):
+            self.log_fn(
+                "RATE_LIMIT: Sustained HTTP 429 threshold crossed! Terminating child process to seal chunk...",
+                level="WARN",
+            )
+            if stop_event:
+                stop_event.set()
+            if proc:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            return "rate_limit_429"
+
         # 1. Route monitoring (if armed and session not already stopped)
         if self.is_armed and not (self.state and getattr(self.state, "stop_flag", False)):
             if not self.check_runtime_route():

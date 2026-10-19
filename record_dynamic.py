@@ -71,6 +71,7 @@ from recorder_runtime.network import (
     WIREPROXY_HTTP_PORT,
     WIREPROXY_SOCKS5_PORT,
     RATE_LIMIT_COOLDOWN_SEC,
+    RATE_LIMIT_EXTENDED_COOLDOWN_SEC,
     RATE_LIMIT_ERROR_THRESHOLD,
     RATE_LIMIT_WINDOW_SEC,
     VPN_HOLD_TIMEOUT_SEC,
@@ -351,7 +352,7 @@ NM3U8DL_AUDIO_OFFSET_SEC = 0.0
 
 # Part B: Static/default options (appended to command with dynamic chunk name).
 # Dynamic playlist mode replaces --select-video best at launch with the representation already selected by the recorder.
-NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --download-retry-count 5 --http-request-timeout 90 --select-video best --select-audio best'
+NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --live-take-count 2 --live-wait-time 3 --download-retry-count 2 --http-request-timeout 90 --select-video best --select-audio best'
 
 # ======================================================================================================================
 
@@ -14479,9 +14480,29 @@ def _build_nm3u8dl_selected_video_filter(source: dict) -> str:
 #    )
 
 
-def _get_nm3u8dl_part_b_for_launch(state: RecorderState) -> str:
-    """Use the configured N_m3u8DL selection unchanged."""
-    return NM3U8DL_PART_B
+_NM3U8DL_DEDUP_FLAGS = (
+    "--thread-count",
+    "--live-take-count",
+    "--live-wait-time",
+    "--download-retry-count",
+    "--http-request-timeout",
+)
+
+
+def _deduplicate_nm3u8dl_part_b(part_a: str, part_b: str) -> str:
+    """Strip default pacing/timeout flags from PART_B when explicitly overridden in PART_A."""
+    if not part_a or not part_b:
+        return part_b
+    deduped = part_b
+    for flag in _NM3U8DL_DEDUP_FLAGS:
+        if re.search(rf"(?<!\S){re.escape(flag)}(?=\s|=|$)", part_a):
+            deduped = re.sub(rf"\s*{re.escape(flag)}(?:\s+\S+|=[^\s]+)", "", deduped)
+    return re.sub(r"\s{2,}", " ", deduped).strip()
+
+
+def _get_nm3u8dl_part_b_for_launch(state: RecorderState, part_a: str = "") -> str:
+    """Use the configured N_m3u8DL selection while deduplicating any flags overridden in PART_A."""
+    return _deduplicate_nm3u8dl_part_b(part_a, NM3U8DL_PART_B)
     
 
 def get_nm3u8dl_part_a(
@@ -14538,7 +14559,8 @@ def get_nm3u8dl_part_a(
     ]
 
     for name, value in headers.items():
-        parts.append(f'-H "{name}: {value}"')
+        escaped_value = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'-H "{name}: {escaped_value}"')
 
     for key in resolved_keys:
         parts.append(f"--key {key}")
@@ -16357,6 +16379,8 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
     bitrate = 0
     refresh = 0
     in_selected_section = False
+    has_403 = False
+    has_429 = False
 
     if exclude_substrings is None:
         exclude_substrings = []
@@ -16405,7 +16429,7 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
             startup_progress_last_log_time = now
 
     def handle_startup_record(record):
-        nonlocal bitrate, in_selected_section
+        nonlocal bitrate, in_selected_section, has_403, has_429
 
         raw_external_write(raw_invocation, record)
         stripped_line = record.strip()
@@ -16422,6 +16446,12 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
 
         if not stripped_line:
             return
+
+        lower_s = stripped_line.lower()
+        if "403" in lower_s and ("forbidden" in lower_s or "status code does not indicate success: 403" in lower_s or "http error 403" in lower_s):
+            has_403 = True
+        if "429" in lower_s and ("too many requests" in lower_s or "status code does not indicate success: 429" in lower_s or "http error 429" in lower_s):
+            has_429 = True
 
         # Raw console-refresh progress has no timestamp/newline. Keep only the
         # latest Vid/Aud record and log it periodically instead of dumping every
@@ -16452,7 +16482,9 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
             exclude_substrings
         ):
             if state is not None and getattr(state, "network_guard", None):
-                state.network_guard.inspect_stdout_line(stripped_line)
+                if state.network_guard.inspect_stdout_line(stripped_line):
+                    state.rate_limit_429_detected = True
+                    has_429 = True
             log(f"N_m3u8DL: {stripped_line}")
 
         if "Selected streams:" in stripped_line:
@@ -16531,7 +16563,9 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
 
                     return {
                         'bitrate': bitrate,
-                        'refresh_interval': refresh
+                        'refresh_interval': refresh,
+                        'has_403': has_403,
+                        'has_429': has_429,
                     }
 
                 except Exception:
@@ -16563,7 +16597,9 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
 
     return {
         'bitrate': bitrate,
-        'refresh_interval': refresh
+        'refresh_interval': refresh,
+        'has_403': has_403,
+        'has_429': has_429,
     }
     
 def monitor_nm3u8dl_stdout(
@@ -16704,7 +16740,7 @@ def monitor_nm3u8dl_stdout(
 
         if state is not None and getattr(state, "network_guard", None):
             if state.network_guard.inspect_stdout_line(stripped):
-                return
+                state.rate_limit_429_detected = True
 
         # Supports:
         #   Vid ...
@@ -17087,6 +17123,10 @@ def nm3u8dl_handle_growth_events(state: RecorderState, stop_event: threading.Eve
                 state.manifest_fail_count = 0
                 state.no_file_appear_count = 0
                 state.nm3u8dl_crash_count = 0
+                if getattr(state, "network_guard", None):
+                    state.network_guard.rate_limit_strike = 0
+                    state.network_guard.consecutive_429_count = 0
+                    state.network_guard.recent_429_timestamps.clear()
 
                 maybe_trigger_good_beep(
                     state,
@@ -17228,7 +17268,7 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 metrics={"stop_requested": True},
             )
 
-        nm3u8dl_part_b = _get_nm3u8dl_part_b_for_launch(state)
+        nm3u8dl_part_b = _get_nm3u8dl_part_b_for_launch(state, nm3u8dl_part_a)
         cmd = f'{nm3u8dl_part_a} --save-name "{chunk_name_without_ext}" {nm3u8dl_part_b}'
         
         exclude_substrings = get_nm3u8dl_exclude_substrings(nm3u8dl_part_a)
@@ -17242,7 +17282,7 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
             cmd = f"{cmd} --custom-proxy http://127.0.0.1:{WIREPROXY_HTTP_PORT}"
 
         if "--download-retry-count" not in cmd:
-            cmd = f"{cmd} --download-retry-count 5"
+            cmd = f"{cmd} --download-retry-count 2"
 
         # Per-process state only. Stall/crash counters and stall-alarm state are
         # incident-level state and survive process replacement/restart until one
@@ -17259,6 +17299,7 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
         state.nm3u8dl_healthy_consec_count = 0
         state.nm3u8dl_beeped_this_healthy_streak = False
         state.nm3u8dl_refresh_interval_s = 0.0
+        state.rate_limit_429_detected = False
 
         log(f"Starting N_m3u8DL → writing to {chunk_name}...")
         log(f"Command: {cmd}")
@@ -17342,6 +17383,30 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 f"{state.nm3u8dl_selected_bitrate_kbps} Kbps for stall monitoring only"
             )
 
+        if startup_data.get("has_429") or getattr(state, "rate_limit_429_detected", False):
+            log("HTTP 429 Too Many Requests detected during startup → triggering rate-limit circuit breaker", level="WARN")
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log_process_shutdown_timeout("N_m3u8DL", 5)
+                    proc.kill()
+                    proc.wait()
+            raw_external_end(raw_invocation, returncode=proc.poll())
+            return EngineResult(
+                status="no_stream",
+                reason="RATE_LIMIT_429",
+                chunk_path=chunk_path,
+                chunk_name=chunk_name,
+                metrics={
+                    "selected_bitrate_kbps": state.nm3u8dl_selected_bitrate_kbps,
+                    "refresh_interval_s": state.nm3u8dl_refresh_interval_s,
+                    "rate_limit_429": True,
+                    "manifest_dead": False,
+                },
+            )
+
         if state.nm3u8dl_refresh_interval_s == 0 or state.nm3u8dl_selected_bitrate_kbps == 0:
             startup_exit_code = proc.poll()
             if (
@@ -17363,6 +17428,30 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                         "selected_bitrate_kbps": state.nm3u8dl_selected_bitrate_kbps,
                         "refresh_interval_s": state.nm3u8dl_refresh_interval_s,
                         "unexpected_process_exit": True,
+                    },
+                )
+
+            if startup_data.get("has_403") or (getattr(state, "network_guard", None) and state.network_guard.has_403_error):
+                log("HTTP 403 Forbidden detected during startup → triggering burned-IP recovery", level="WARN")
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        log_process_shutdown_timeout("N_m3u8DL", 5)
+                        proc.kill()
+                        proc.wait()
+                raw_external_end(raw_invocation, returncode=proc.poll())
+                return EngineResult(
+                    status="no_stream",
+                    reason="HTTP_403_FORBIDDEN",
+                    chunk_path=chunk_path,
+                    chunk_name=chunk_name,
+                    metrics={
+                        "selected_bitrate_kbps": state.nm3u8dl_selected_bitrate_kbps,
+                        "refresh_interval_s": state.nm3u8dl_refresh_interval_s,
+                        "geo_block_403": True,
+                        "manifest_dead": False,
                     },
                 )
 
@@ -17466,6 +17555,18 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                 if drop_status:
                     actual_out = find_nm3u8dl_output_path(chunk_path, not_before=run_launch_ts)
                     raw_external_end(raw_invocation, returncode=proc.poll())
+                    if drop_status == "rate_limit_429":
+                        return EngineResult(
+                            status="rate_limit_429",
+                            reason="http 429 sustained rate limit",
+                            chunk_path=actual_out or chunk_path,
+                            chunk_name=os.path.basename(actual_out) if actual_out else chunk_name,
+                            metrics={
+                                "selected_bitrate_kbps": state.nm3u8dl_selected_bitrate_kbps,
+                                "refresh_interval_s": state.nm3u8dl_refresh_interval_s,
+                                "rate_limit_429": True,
+                            },
+                        )
                     if drop_status == "internet_drop":
                         return EngineResult(
                             status="internet_drop",
@@ -17688,12 +17789,21 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
                     raw_external_end(raw_invocation, returncode=proc.poll())
                     return EngineResult(
                         status=drop_status,
-                        reason="vpn route dropped" if drop_status == "vpn_drop" else "internet connection lost during lenient drop",
+                        reason=(
+                            "http 429 sustained rate limit"
+                            if drop_status == "rate_limit_429"
+                            else (
+                                "vpn route dropped"
+                                if drop_status == "vpn_drop"
+                                else "internet connection lost during lenient drop"
+                            )
+                        ),
                         chunk_path=actual_out or chunk_path,
                         chunk_name=os.path.basename(actual_out) if actual_out else chunk_name,
                         metrics={
                             "selected_bitrate_kbps": state.nm3u8dl_selected_bitrate_kbps,
                             "refresh_interval_s": state.nm3u8dl_refresh_interval_s,
+                            "rate_limit_429": drop_status == "rate_limit_429",
                         },
                     )
 
