@@ -531,15 +531,26 @@ class RecordDynamicWiringTests(unittest.TestCase):
         self.assertIn('"hard_stall_required": 20,', self.code)
 
     def test_nm3u8dl_fatal_producer_error_wiring_in_static_recorder(self):
-        static_path = None
-        for parent in Path(__file__).resolve().parents:
-            for candidate_dir in ("WORKSPACE FOR AI AGENTS", "RECORDER CODE FOR ANTIGRAVITY"):
-                candidate = parent / candidate_dir / "RECORD.py"
-                if candidate.exists():
-                    static_path = candidate
-                    break
-            if static_path:
-                break
+        env_path = os.environ.get("RECORD_PY_PATH")
+        if env_path and Path(env_path).exists():
+            static_path = Path(env_path)
+        else:
+            static_path = None
+            for parent in Path(__file__).resolve().parents[:4]:
+                try:
+                    for item in parent.iterdir():
+                        if item.is_file() and item.name == "RECORD.py":
+                            static_path = item
+                            break
+                        if item.is_dir() and not item.name.startswith((".", "_")) and item.name != "Recorder":
+                            sub = item / "RECORD.py"
+                            if sub.is_file():
+                                static_path = sub
+                                break
+                    if static_path:
+                        break
+                except (PermissionError, OSError):
+                    continue
         if not static_path:
             self.skipTest("Static recorder RECORD.py not found in local workspace (CI environment)")
         static_code = static_path.read_text(encoding="utf-8")
