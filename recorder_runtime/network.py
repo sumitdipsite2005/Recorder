@@ -136,9 +136,10 @@ class WireproxyManager:
         """
         Locate wireguard_configs directory:
         1. Explicit environment variable WIREGUARD_CONFIG_DIR
-        2. Grandparent directory (e.g. ~/Movies/GSE SMART IPTV/Recordings/wireguard_configs)
+        2. Grandparent directory (e.g. ../../wireguard_configs)
         3. Parent directory (e.g. ../wireguard_configs)
         4. Repo / script directory (e.g. ./wireguard_configs)
+        5. User home directory fallbacks
         """
         env_dir = os.environ.get("WIREGUARD_CONFIG_DIR")
         if env_dir and os.path.isdir(env_dir):
@@ -148,6 +149,7 @@ class WireproxyManager:
         repo_dir = os.path.dirname(script_dir)
         manual_recordings_dir = os.path.dirname(repo_dir)
         grandparent_dir = os.path.dirname(manual_recordings_dir)
+        user_home = os.path.expanduser("~")
 
         candidates = [
             os.path.join(grandparent_dir, "wireguard_configs"),
@@ -155,9 +157,9 @@ class WireproxyManager:
             os.path.join(repo_dir, "wireguard_configs"),
             os.path.join(script_dir, "wireguard_configs"),
             os.path.join(os.getcwd(), "wireguard_configs"),
-            os.path.expanduser("~/Movies/GSE SMART IPTV/Recordings/wireguard_configs"),
+            os.path.join(user_home, "WIN_TV_RECORDINGS", "wireguard_configs"),
+            os.path.join(user_home, "Movies", "wireguard_configs"),
             r"C:\My PC Recordings\wireguard_configs",
-            r"C:\Users\sumit\WIN_TV_RECORDINGS\wireguard_configs",
         ]
         for c in candidates:
             if os.path.isdir(c):
