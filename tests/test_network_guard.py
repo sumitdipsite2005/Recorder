@@ -276,20 +276,27 @@ class NetworkGuardPolicyTests(unittest.TestCase):
             clear_progress_fn=lambda: None,
         )
 
-        # Strike 1: Cooldown
+        # Strike 1: 90s Cooldown
         with patch("recorder_runtime.network.time.sleep"), \
              patch("recorder_runtime.network.time.monotonic", side_effect=[0.0, 95.0, 100.0, 105.0]):
             res = guard.handle_rate_limit_cooldown()
             self.assertEqual(guard.rate_limit_strike, 1)
             self.assertTrue(res)
 
-        # Strike 2: Rotation attempt (wireguard recovers)
+        # Strike 2: 240s Extended In-Place Cooldown on same IP (no IP rotation)
         guard.vpn_mode = "WIREPROXY"
         guard.wireproxy_manager = MagicMock()
-        guard.attempt_wireguard_auto_recovery = lambda *a, **k: True
-        res = guard.handle_rate_limit_cooldown()
-        self.assertEqual(guard.rate_limit_strike, 2)
-        self.assertTrue(res)
+        rotation_mock = MagicMock(return_value=True)
+        hold_mock = MagicMock(return_value=True)
+        guard.attempt_wireguard_auto_recovery = rotation_mock
+        guard.handle_vpn_hold_state = hold_mock
+        with patch("recorder_runtime.network.time.sleep"), \
+             patch("recorder_runtime.network.time.monotonic", side_effect=[200.0, 300.0, 445.0]):
+            res = guard.handle_rate_limit_cooldown()
+            self.assertEqual(guard.rate_limit_strike, 2)
+            self.assertTrue(res)
+            rotation_mock.assert_not_called()
+            hold_mock.assert_not_called()
 
         # Strike 3: Critical Concurrency Exhaustion Alarm
         res = guard.handle_rate_limit_cooldown()
@@ -361,7 +368,10 @@ class RecordDynamicWiringTests(unittest.TestCase):
 
     def test_custom_proxy_injected_for_wireproxy(self):
         self.assertIn("--custom-proxy http://127.0.0.1:{WIREPROXY_HTTP_PORT}", self.code)
-        self.assertIn("NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --download-retry-count 5", self.code)
+        self.assertIn(
+            "NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --live-take-count 2 --live-wait-time 3 --download-retry-count 2",
+            self.code,
+        )
         self.assertNotIn("--download-retry-count 30", self.code)
 
     def test_preflight_wireproxy_not_skipped_on_internet_recovery(self):
@@ -521,7 +531,11 @@ class RecordDynamicWiringTests(unittest.TestCase):
         self.assertIn('"hard_stall_required": 20,', self.code)
 
     def test_nm3u8dl_fatal_producer_error_wiring_in_static_recorder(self):
-        static_path = Path(__file__).resolve().parent.parent.parent / "RECORDER CODE FOR ANTIGRAVITY" / "RECORD.py"
+        static_path = Path(__file__).resolve().parent.parent.parent / "WORKSPACE FOR AI AGENTS" / "RECORD.py"
+        if not static_path.exists():
+            static_path = Path("/Users/sumitsinha/Movies/GSE SMART IPTV/Recordings/WORKSPACE FOR AI AGENTS/RECORD.py")
+        if not static_path.exists():
+            static_path = Path(__file__).resolve().parent.parent.parent / "RECORDER CODE FOR ANTIGRAVITY" / "RECORD.py"
         if not static_path.exists():
             static_path = Path("/Users/sumitsinha/Movies/GSE SMART IPTV/Recordings/RECORDER CODE FOR ANTIGRAVITY/RECORD.py")
         if not static_path.exists():
@@ -897,7 +911,231 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         self.assertTrue(any("Network Guard     : ARMED [SYSTEM_VPN: Surfshark]" in m for m in logged))
         self.assertTrue(any("Network Route     : Connected [Surfshark] (Country: IN | Adapter: utun6 | IP: 103.21.244.2)" in m for m in logged))
 
+    def test_inspect_stdout_line_429_threshold_and_waiting_not_resetting(self):
+        guard = NetworkGuard(required_country="IN")
+
+        # 1st 429 error -> does not trip yet
+        self.assertFalse(guard.inspect_stdout_line("ERROR: Response status code does not indicate success: 429 (Too Many Requests)."))
+        self.assertEqual(len(guard.recent_429_timestamps), 1)
+
+        # "Waiting 100%" progress line must NOT reset timestamps
+        self.assertFalse(guard.inspect_stdout_line("Vid 1920x1080 | 6000 Kbps | Waiting 100%"))
+        self.assertEqual(len(guard.recent_429_timestamps), 1)
+
+        # "Recording" progress line must NOT reset timestamps
+        self.assertFalse(guard.inspect_stdout_line("Vid 1920x1080 | Recording 45%"))
+        self.assertEqual(len(guard.recent_429_timestamps), 1)
+
+        # 2nd 429 within 30s -> does not trip yet
+        self.assertFalse(guard.inspect_stdout_line("HTTP Error 429: Too Many Requests"))
+        self.assertEqual(len(guard.recent_429_timestamps), 2)
+
+        # 3rd 429 within 30s -> trips circuit breaker (3 in 30s)
+        self.assertTrue(guard.inspect_stdout_line("ERROR: Response status code does not indicate success: 429 (Too Many Requests)."))
+        self.assertEqual(guard.rate_limit_429_count, 1)
+        self.assertEqual(len(guard.recent_429_timestamps), 0)
+
+    def test_extract_stream_expiry_and_token_expiration(self):
+        guard = NetworkGuard(required_country="IN")
+
+        # Query param formats: exp, expires, expiry
+        self.assertEqual(guard.extract_stream_expiry("https://example.com/live.m3u8?exp=1740000000"), 1740000000)
+        self.assertEqual(guard.extract_stream_expiry("https://example.com/live.m3u8?expires=1740000000"), 1740000000)
+        self.assertEqual(guard.extract_stream_expiry("https://example.com/live.m3u8?token=xyz;expiry=1740000000"), 1740000000)
+
+        # 13-digit millisecond normalization
+        self.assertEqual(guard.extract_stream_expiry("https://example.com/live.m3u8?exp=1740000000000"), 1740000000)
+
+        # Active token expiration check
+        past_ts = int(time.time()) - 100
+        future_ts = int(time.time()) + 3600
+
+        mock_state = MagicMock()
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={past_ts}"
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        mock_state.active_stream_url = ""
+        guard.state = mock_state
+        self.assertTrue(guard.is_stream_token_expired(lead_time_sec=0.0))
+
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={future_ts}"
+        self.assertFalse(guard.is_stream_token_expired(lead_time_sec=60.0))
+
+    def test_handle_token_hold_state_headless_fast_fail(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+
+        with patch("sys.stdin.isatty", return_value=False):
+            res = guard.handle_token_hold_state()
+            self.assertFalse(res)
+            self.assertTrue(mock_state.stop_flag)
+            self.assertEqual(guard.token_expiry_count, 1)
+
+    def test_handle_403_recovery_decouples_token_expiry_without_vpn_siren(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.stats = {"good_chunks": 1}
+        mock_state.live_url = "https://example.com/live.m3u8"
+        mock_state.token_hold_active = False
+
+        alarms_started = []
+        guard = NetworkGuard(
+            required_country="IN",
+            state=mock_state,
+            alarm_start_fn=lambda s, alarm_type: alarms_started.append(alarm_type),
+        )
+        guard.vpn_mode = "LEGACY_VPN"
+        guard.is_armed = True
+        guard.launch_country = "IN"
+
+        with patch.object(guard, "check_runtime_route", return_value=True), \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_token_hold, \
+             patch.object(guard, "handle_vpn_hold_state") as mock_vpn_hold:
+            res = guard.handle_403_recovery(is_startup=False)
+            self.assertTrue(res)
+            mock_token_hold.assert_called_once()
+            mock_vpn_hold.assert_not_called()
+            self.assertNotIn("vpn_drop", alarms_started)
+
+    def test_supervise_in_flight_terminates_on_rate_limit_429(self):
+        mock_state = MagicMock()
+        mock_state.rate_limit_429_detected = True
+        mock_state.stop_flag = False
+        stop_event = MagicMock()
+        mock_proc = MagicMock()
+
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+        status = guard.supervise_in_flight(proc=mock_proc, stop_event=stop_event)
+
+        self.assertEqual(status, "rate_limit_429")
+        self.assertTrue(stop_event.set.called)
+        self.assertTrue(mock_proc.terminate.called)
+
+    def test_deduplicate_nm3u8dl_part_b_preserves_provider_overrides(self):
+        import record_dynamic
+
+        default_b = record_dynamic.NM3U8DL_PART_B
+
+        # JIO overrides --thread-count 1 in PART_A
+        jio_a = 'N_m3u8DL-RE "https://example.com/index.m3u8" --thread-count 1'
+        dedup_jio = record_dynamic._deduplicate_nm3u8dl_part_b(jio_a, default_b)
+        self.assertNotIn("--thread-count", dedup_jio)
+        self.assertIn("--live-take-count 2", dedup_jio)
+        self.assertIn("--live-wait-time 3", dedup_jio)
+        self.assertIn("--download-retry-count 2", dedup_jio)
+
+        # 7AU overrides --live-wait-time 25 in PART_A
+        au_a = 'N_m3u8DL-RE "https://example.com/index.m3u8" --use-shaka-packager --live-wait-time 25'
+        dedup_au = record_dynamic._deduplicate_nm3u8dl_part_b(au_a, default_b)
+        self.assertNotIn("--live-wait-time", dedup_au)
+        self.assertIn("--thread-count 2", dedup_au)
+        self.assertIn("--live-take-count 2", dedup_au)
+
+    def test_hotstar_client_hints_and_quote_escaping(self):
+        import shlex
+        from recorder_source.headers import canonicalize_header_name
+        from recorder_source.policy import PROVIDER_ADDED_HEADERS
+
+        self.assertEqual(canonicalize_header_name("sec-ch-ua"), "Sec-CH-UA")
+        self.assertEqual(canonicalize_header_name("sec-ch-ua-platform"), "Sec-CH-UA-Platform")
+        self.assertEqual(canonicalize_header_name("sec-fetch-mode"), "Sec-Fetch-Mode")
+        self.assertEqual(canonicalize_header_name("accept-language"), "Accept-Language")
+
+        hotstar_headers = PROVIDER_ADDED_HEADERS["HOTSTAR"]
+        self.assertIn("Sec-CH-UA", hotstar_headers)
+        self.assertEqual(hotstar_headers["Origin"], "https://www.hotstar.com")
+        self.assertEqual(hotstar_headers["Referer"], "https://www.hotstar.com/")
+        self.assertEqual(hotstar_headers["Sec-Fetch-Mode"], "cors")
+        self.assertEqual(hotstar_headers["Sec-Fetch-Site"], "cross-site")
+
+        # Verify quote escaping produces valid shlex tokens with intact inner quotes
+        parts = ["N_m3u8DL-RE", '"https://live14p.hotstar.com/master.m3u8"']
+        for name, value in hotstar_headers.items():
+            escaped_value = str(value).replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'-H "{name}: {escaped_value}"')
+        cmd = " ".join(parts)
+        tokens = shlex.split(cmd)
+        self.assertIn('Sec-CH-UA: "Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"', tokens)
+        self.assertIn('Sec-CH-UA-Platform: "Windows"', tokens)
+
+    def test_update_stream_url_full_command_and_header_expiry_sync(self):
+        mock_state = MagicMock()
+        old_exp = int(time.time()) - 300
+        new_exp = int(time.time()) + 7200
+        mock_state.live_url = f"https://example.com/old.m3u8?exp={old_exp}"
+        mock_state.active_stream_url = mock_state.live_url
+        mock_state.nm3u8dl_part_a = (
+            f'N_m3u8DL-RE "{mock_state.live_url}" '
+            f'-H "Cookie: hdntl=exp={old_exp}~acl=/*" --key 1111:2222'
+        )
+        mock_state.active_command = mock_state.nm3u8dl_part_a
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+
+        # Case 1: Pasting a bare URL with a new expiry also updates stale exp= in headers
+        bare_new_url = f"https://example.com/new.m3u8?exp={new_exp}"
+        guard.update_stream_url(bare_new_url)
+        self.assertEqual(mock_state.live_url, bare_new_url)
+        self.assertEqual(mock_state.active_stream_url, bare_new_url)
+        self.assertIn(f"hdntl=exp={new_exp}", mock_state.nm3u8dl_part_a)
+        self.assertFalse(guard.is_stream_token_expired(lead_time_sec=60.0))
+
+        # Case 2: Pasting a full N_m3u8DL-RE command updates headers/keys and strips --save-name
+        full_cmd = (
+            f'N_m3u8DL-RE "https://example.com/cmd.m3u8?exp={new_exp}" '
+            f'-H "Authorization: Bearer NEW_TOKEN" --key 3333:4444 --save-name "manual_clip"'
+        )
+        guard.update_stream_url(full_cmd)
+        self.assertEqual(mock_state.live_url, f"https://example.com/cmd.m3u8?exp={new_exp}")
+        self.assertIn("Authorization: Bearer NEW_TOKEN", mock_state.nm3u8dl_part_a)
+        self.assertIn("--key 3333:4444", mock_state.nm3u8dl_part_a)
+        self.assertNotIn("--save-name", mock_state.nm3u8dl_part_a)
+
+    def test_handle_token_hold_rejects_expired_candidate_and_propagates_timeout_stop(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.token_hold_active = False
+        mock_state.token_hold_input_buffer = ""
+        mock_state.token_hold_submitted_url = None
+        mock_state.live_url = "https://example.com/old.m3u8"
+        mock_state.nm3u8dl_part_a = 'N_m3u8DL-RE "https://example.com/old.m3u8"'
+        mock_state.active_command = mock_state.nm3u8dl_part_a
+
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+        expired_url = f"https://example.com/expired.m3u8?exp={int(time.time()) - 10}"
+        fresh_url = f"https://example.com/fresh.m3u8?exp={int(time.time()) + 3600}"
+
+        # Simulate operator submitting an already-expired URL on loop 1, then a fresh URL on loop 2
+        submissions = [expired_url, fresh_url]
+
+        def fake_sleep(_sec):
+            if submissions:
+                mock_state.token_hold_submitted_url = submissions.pop(0)
+
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep), \
+             patch.object(guard, "_probe_stream_url", return_value=True) as mock_probe:
+            res = guard.handle_token_hold_state()
+            self.assertTrue(res)
+            # Probe should only be called once (for fresh_url, not expired_url)
+            mock_probe.assert_called_once_with(fresh_url)
+            self.assertEqual(mock_state.live_url, fresh_url)
+
+    def test_verify_and_resume_stream_propagates_false_on_token_hold_failure(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.live_url = "https://example.com/DeadToken.m3u8"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+        guard.vpn_mode = "UNRESTRICTED"
+        guard.is_armed = False
+
+        with patch("recorder_runtime.network.NetworkRouteResolver.is_internet_online", return_value=True), \
+             patch.object(guard, "_probe_stream_url", return_value=False), \
+             patch.object(guard, "handle_token_hold_state", return_value=False) as mock_token_hold:
+            res = guard.handle_internet_hold_state(is_startup=False)
+            self.assertFalse(res)
+            mock_token_hold.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
-

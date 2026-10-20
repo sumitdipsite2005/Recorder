@@ -71,6 +71,15 @@ PLAYLIST_USER_AGENTS = {
 PROVIDER_ADDED_HEADERS = {
     "HOTSTAR": {
         "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.hotstar.com",
+        "Referer": "https://www.hotstar.com/",
+        "Sec-CH-UA": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
         "Sec-GPC": "1",
     },
     "JIO": {},

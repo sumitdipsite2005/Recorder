@@ -27,11 +27,11 @@ Small corrections, experiments, review changes, and intermediate commits are exp
 When the feature or fix has been reviewed, tested, and accepted:
 
 1. Open a pull request from the temporary branch into `dev`.
-2. Squash-merge the pull request so `dev` receives one meaningful commit for the accepted unit of work.
+2. Merge the pull request using **Create a merge commit** so `dev` retains all granular, tested commits grouped under the pull request.
 3. Verify the integrated result on `dev`.
 4. Delete the temporary branch when it is no longer needed.
 
-The purpose is to preserve detailed iteration while work is in progress without carrying every experimental commit into the long-lived integration history.
+The purpose is to preserve complete, tested, granular commit history and traceability on `dev` for targeted debugging and bisecting, while keeping each unit of work grouped by its PR merge commit.
 
 ## Promotion to main
 
@@ -39,7 +39,7 @@ The purpose is to preserve detailed iteration while work is in progress without 
 
 Promotion happens through a pull request from `dev` to `main`. `main` is not an active development branch.
 
-For normal promotion, use a regular merge so the accepted commits already present on `dev` remain traceable on `main`. Because GitHub creates a merge commit for that promotion, `dev` may then appear to be one or more commits behind `main` even though it is not missing the promoted product changes. That is expected and should not be "fixed" merely to make the branch counters match.
+For promotion to `main`, use **Squash and merge** so `main` (production) receives one clean, consolidated commit representing the entire release milestone or feature set, keeping production history concise and linear.
 
 ## Repository enforcement
 
@@ -51,7 +51,7 @@ The following GitHub rulesets are active:
 - Requires changes to reach `main` through a pull request.
 - Requires 0 approving reviews, which keeps the workflow usable for a solo maintainer.
 - Requires the `tests` status check from the `recorder-tests` GitHub Actions workflow to pass before merging.
-- Allows merge, squash, or rebase at the GitHub ruleset level.
+- Enforces **Require linear history** (ensures squash-merges into `main`).
 - Prevents deletion of `main`.
 - Prevents non-fast-forward history rewrites of `main`.
 
@@ -61,7 +61,7 @@ The following GitHub rulesets are active:
 - Requires changes to reach `dev` through a pull request.
 - Requires 0 approving reviews.
 - Requires the `tests` status check from the `recorder-tests` GitHub Actions workflow to pass before merging.
-- Allows **squash merge only**.
+- Leaves **Require linear history disabled** (allows **Create a merge commit** to preserve granular commits).
 - Prevents deletion of `dev`.
 - Prevents non-fast-forward history rewrites of `dev`.
 

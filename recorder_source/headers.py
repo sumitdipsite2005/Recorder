@@ -11,6 +11,14 @@ _HEADER_ALIASES = {
     "useragent": "User-Agent",
     "authorization": "Authorization",
     "accept": "Accept",
+    "accept-language": "Accept-Language",
+    "sec-ch-ua": "Sec-CH-UA",
+    "sec-ch-ua-mobile": "Sec-CH-UA-Mobile",
+    "sec-ch-ua-platform": "Sec-CH-UA-Platform",
+    "sec-fetch-dest": "Sec-Fetch-Dest",
+    "sec-fetch-mode": "Sec-Fetch-Mode",
+    "sec-fetch-site": "Sec-Fetch-Site",
+    "sec-gpc": "Sec-GPC",
 }
 
 def canonicalize_header_name(name: object) -> str:
