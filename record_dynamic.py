@@ -14268,7 +14268,7 @@ def resolve_nm3u8dl_launch_source(
             )
             running_motion_fps = _nm3u8dl_ranking_motion_fps(source)
 
-            # quality upgrade logic reverted by sumit 21st sep 2026
+            # quality upgrade logic reverted 21st sep 2026
             #if quality_upgrade_profile_enabled:
             #    log(
             #        f"Quality upgrade check  : every "

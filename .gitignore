@@ -184,3 +184,4 @@ cython_debug/
 recorder_dynamic_user_config*.py
 AGENTS.md
 .clinerules
+tests/test_privacy_guardrails.py

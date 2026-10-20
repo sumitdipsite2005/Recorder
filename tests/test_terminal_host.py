@@ -20,7 +20,7 @@ class TerminalHostTests(unittest.TestCase):
             worker,
             title="Recorder — Example",
             cwd=Path(r"C:\Recorder"),
-            post_exit_cwd=Path(r"C:\My PC Recordings\Manual Recordings"),
+            post_exit_cwd=Path(r"C:\Recordings\Manual Recordings"),
             platform_name="win32",
             windows_shell="cmd.exe",
         )
@@ -32,7 +32,7 @@ class TerminalHostTests(unittest.TestCase):
         self.assertNotIn("CREATE_NEW_CONSOLE", " ".join(argv))
         self.assertIn("recorder_identity_worker.py", argv[-1])
         self.assertIn(
-            r'cd /d "C:\My PC Recordings\Manual Recordings"',
+            r'cd /d "C:\Recordings\Manual Recordings"',
             argv[-1],
         )
 
@@ -48,7 +48,7 @@ class TerminalHostTests(unittest.TestCase):
             worker,
             title="Recorder — Example",
             cwd=Path(r"C:\Recorder"),
-            post_exit_cwd=Path(r"C:\My PC Recordings\Manual Recordings"),
+            post_exit_cwd=Path(r"C:\Recordings\Manual Recordings"),
             platform_name="win32",
             windows_shell="powershell.exe",
         )
@@ -63,7 +63,7 @@ class TerminalHostTests(unittest.TestCase):
         self.assertIn("try { & ", decoded)
         self.assertIn(
             "} finally { Set-Location -LiteralPath "
-            "'C:\\My PC Recordings\\Manual Recordings' }",
+            "'C:\\Recordings\\Manual Recordings' }",
             decoded,
         )
         self.assertFalse(any("Set-Location" in argument for argument in argv[:-1]))

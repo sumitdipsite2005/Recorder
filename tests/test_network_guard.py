@@ -531,14 +531,27 @@ class RecordDynamicWiringTests(unittest.TestCase):
         self.assertIn('"hard_stall_required": 20,', self.code)
 
     def test_nm3u8dl_fatal_producer_error_wiring_in_static_recorder(self):
-        static_path = Path(__file__).resolve().parent.parent.parent / "WORKSPACE FOR AI AGENTS" / "RECORD.py"
-        if not static_path.exists():
-            static_path = Path("/Users/sumitsinha/Movies/GSE SMART IPTV/Recordings/WORKSPACE FOR AI AGENTS/RECORD.py")
-        if not static_path.exists():
-            static_path = Path(__file__).resolve().parent.parent.parent / "RECORDER CODE FOR ANTIGRAVITY" / "RECORD.py"
-        if not static_path.exists():
-            static_path = Path("/Users/sumitsinha/Movies/GSE SMART IPTV/Recordings/RECORDER CODE FOR ANTIGRAVITY/RECORD.py")
-        if not static_path.exists():
+        env_path = os.environ.get("RECORD_PY_PATH")
+        if env_path and Path(env_path).exists():
+            static_path = Path(env_path)
+        else:
+            static_path = None
+            for parent in Path(__file__).resolve().parents[:4]:
+                try:
+                    for item in parent.iterdir():
+                        if item.is_file() and item.name == "RECORD.py":
+                            static_path = item
+                            break
+                        if item.is_dir() and not item.name.startswith((".", "_")) and item.name != "Recorder":
+                            sub = item / "RECORD.py"
+                            if sub.is_file():
+                                static_path = sub
+                                break
+                    if static_path:
+                        break
+                except (PermissionError, OSError):
+                    continue
+        if not static_path:
             self.skipTest("Static recorder RECORD.py not found in local workspace (CI environment)")
         static_code = static_path.read_text(encoding="utf-8")
 
