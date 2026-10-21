@@ -756,8 +756,12 @@ RAW_EXTERNAL_PATH = None
 
 FFMPEG_PROGRESS_PERIOD = 1   # seconds
 STABILITY_SEC = 15          # minimum good duration in seconds
+STABILITY_WALL_SEC = 25     # minimum wall-clock seconds for speed ratio evaluation
+BURST_RATIO = 3.0           # media-to-wall speed threshold indicating a server replay burst
+DUP_MAX_SEC = 180           # maximum media duration to consider as a replay burst
 BLACK_LEN = 1.0             # use only integers
 FINAL_AUDIO_MIN_KBPS = 192  # minimum audio bitrate for Tier 2 fallback re-encode
+FINAL_AUDIO_KBPS_PER_CHANNEL = 64  # per-channel audio bitrate floor in kbps for Tier 2
 FINAL_MIN_DURATION_RATIO = 0.90  # minimum ratio of expected media duration required to accept final output
 FF_SELECTED_BITRATE_LOG_MIN_DELTA_KBPS = 250
 FF_SELECTED_BITRATE_LOG_MIN_INTERVAL_SEC = 10
@@ -18197,7 +18201,21 @@ def maybe_accept_chunk(state: RecorderState, chunk_path, chunk_name, context):
         min_expected_br = (last_good * 0.40) if last_good else None
 
     bitrate_ok = (br > min_expected_br) if (min_expected_br is not None) else True
-    if dur > STABILITY_SEC and bitrate_ok:
+
+    run_start = state.stats.get("last_run_start")
+    run_wall = max(0.001, time.time() - float(run_start)) if run_start else None
+    is_replay_burst = (
+        DOWNLOAD_MODE != ENGINE_NM3U8DL
+        and state.stats.get("good_chunks", 0) > 0
+        and run_wall is not None
+        and run_wall < STABILITY_WALL_SEC
+        and dur < DUP_MAX_SEC
+        and (dur / run_wall) > BURST_RATIO
+    )
+    if is_replay_burst:
+        log(f"{context}: {chunk_name} REPLAY_BURST ({dur:.0f}s media in {run_wall:.1f}s wall, {dur/run_wall:.1f}x speed) → treating as BAD", level="WARN")
+
+    if dur > STABILITY_SEC and bitrate_ok and not is_replay_burst:
         # Update best resolution/fps from this chunk and track consistency
         w, h, fps = get_video_params(chunk_path)
         log(f"{context}: {chunk_name} params {w}x{h}@{fps}fps")
@@ -19061,7 +19079,7 @@ def finalize_recording(state: RecorderState):
                              if s.get("codec_type") == "audio"] or list(state.audio_layout_ref or [])
             for idx, meta in enumerate(audio_streams):
                 channels = int(meta.get("channels") or 0)
-                base += [f"-b:a:{idx}", f"{max(FINAL_AUDIO_MIN_KBPS, 64 * channels)}k"]
+                base += [f"-b:a:{idx}", f"{max(FINAL_AUDIO_MIN_KBPS, FINAL_AUDIO_KBPS_PER_CHANNEL * channels)}k"]
                 if meta.get("sample_rate"):
                     base += [f"-ar:a:{idx}", str(meta["sample_rate"])]
                 if channels:
@@ -19084,41 +19102,73 @@ def finalize_recording(state: RecorderState):
 
         rc = 1
         last_failure_reason = ""
-        is_truncated_only = False
+        quarantined_partial = None
         for tier in (1, 2):
             tier_desc = "Tier 1 (lossless fast copy)" if tier == 1 else "Tier 2 fallback (lossless video + audio resample/re-encode)"
             log(f"FINALIZE {tier_desc} → {FINAL_FILE}")
             rc = run_ffmpeg_with_capture(_build_final_cmd(tier), CHUNKS_DIR, tag=f"FFmpeg-FINAL-T{tier}")
             ok, why, is_truncated = _validate_final_output() if rc == 0 else (False, f"ffmpeg exit code {rc}", False)
             last_failure_reason = why
-            is_truncated_only = is_truncated
             if rc == 0 and ok:
+                if quarantined_partial and os.path.exists(quarantined_partial):
+                    try:
+                        send2trash(quarantined_partial)
+                    except Exception as e:
+                        log(f"Could not clean up superseded partial file {quarantined_partial}: {e}", level="DEBUG")
+                    quarantined_partial = None
                 break
+
             log(f"FINALIZE Tier {tier} failed: {why}", level="WARN")
-            if os.path.exists(FINAL_FILE):
-                if tier == 1 and not is_truncated_only:
+
+            if tier == 1:
+                if rc == 0 and is_truncated and os.path.exists(FINAL_FILE):
+                    partial_name = os.path.splitext(FINAL_FILE)[0] + ".partial.mkv"
+                    log(f"FINALIZATION: Tier 1 output passed FFmpeg (rc=0) but failed duration gate ({why}) → quarantining to {partial_name} before Tier 2 fallback", level="WARN")
+                    try:
+                        if os.path.exists(partial_name):
+                            send2trash(partial_name)
+                        os.replace(FINAL_FILE, partial_name)
+                        quarantined_partial = partial_name
+                    except OSError as e:
+                        log(f"Could not quarantine partial file {FINAL_FILE} to {partial_name}: {e}", level="WARN")
+                elif os.path.exists(FINAL_FILE):
                     try:
                         os.remove(FINAL_FILE)
                     except OSError as e:
                         log(f"Could not remove incomplete {FINAL_FILE}: {e}", level="WARN")
+            elif tier == 2:
+                if rc == 0 and is_truncated and os.path.exists(FINAL_FILE):
+                    partial_name = os.path.splitext(FINAL_FILE)[0] + ".partial.mkv"
+                    log(f"FINALIZATION: Tier 2 output passed FFmpeg (rc=0) but failed duration gate ({why}) → quarantining to {partial_name}", level="WARN")
+                    try:
+                        if os.path.exists(partial_name):
+                            send2trash(partial_name)
+                        os.replace(FINAL_FILE, partial_name)
+                        quarantined_partial = partial_name
+                    except OSError as e:
+                        log(f"Could not quarantine partial file {FINAL_FILE} to {partial_name}: {e}", level="WARN")
+                elif os.path.exists(FINAL_FILE):
+                    try:
+                        os.remove(FINAL_FILE)
+                    except OSError as e:
+                        log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
             rc = rc or 1
 
         if rc != 0:
-            if is_truncated_only and os.path.exists(FINAL_FILE):
-                partial_name = os.path.splitext(FINAL_FILE)[0] + ".partial.mkv"
-                log(f"FINALIZATION: Output {FINAL_FILE} passed FFmpeg (rc=0) but failed duration gate ({last_failure_reason}) → quarantining to {partial_name}", level="WARN")
-                try:
-                    if os.path.exists(partial_name):
-                        send2trash(partial_name)
-                    os.replace(FINAL_FILE, partial_name)
-                except OSError as e:
-                    log(f"Could not quarantine partial file {FINAL_FILE} to {partial_name}: {e}", level="WARN")
-            elif os.path.exists(FINAL_FILE):
+            if quarantined_partial and os.path.exists(quarantined_partial):
+                log(f"FINALIZATION: Preserved partial recording output at {quarantined_partial} for salvage inspection.", level="WARN")
+            if os.path.exists(FINAL_FILE):
                 try:
                     os.remove(FINAL_FILE)
                 except OSError as e:
                     log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
             log("FINALIZATION FAILED (both tiers) → FFmpeg could not create validated final MKV; keeping chunks folder for inspection.", level="ERROR")
+            state.stats["process_end"] = time.time()
+            black_len = BLACK_LEN
+            sessions = state.stats.get("sessions", [])
+            total_media = sum(s.get("dur_media", 0.0) for s in sessions)
+            est_final_dur = total_media + black_len * max(0, len(sessions) - 1)
+            write_summary_log(state, est_final_dur, finalized=False)
             return
     else:
         log("Mixed params → NOT auto-finalizing. Leaving chunks folder for manual analysis.")

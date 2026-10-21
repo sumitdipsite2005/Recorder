@@ -923,6 +923,7 @@ def load_finalize_function(test_dir: Path):
     logs = []
     commands_run = []
     trashed = []
+    summary_calls = []
 
     def dummy_run(cmd, cwd, tag=""):
         commands_run.append((tag, cmd))
@@ -939,12 +940,14 @@ def load_finalize_function(test_dir: Path):
         "send2trash": lambda p: trashed.append(p),
         "get_file_info": lambda p: (100.0, {}),
         "run_ffmpeg_with_capture": dummy_run,
-        "write_summary_log": lambda state, dur, finalized=True: None,
+        "write_summary_log": lambda state, dur, finalized=True: summary_calls.append((state, dur, finalized)),
+        "summary_calls": summary_calls,
         "LIST_FILE": list_file,
         "FINAL_FILE": final_file,
         "CHUNKS_DIR": chunks_dir,
         "BLACK_LEN": 1.0,
         "FINAL_AUDIO_MIN_KBPS": 192,
+        "FINAL_AUDIO_KBPS_PER_CHANNEL": 64,
         "FINAL_MIN_DURATION_RATIO": 0.90,
         "FFMPEG_PROGRESS_PERIOD": 1.0,
         "RecorderState": object,
@@ -1079,6 +1082,64 @@ class TestTwoTierFinalization(unittest.TestCase):
         self.assertNotIn(str(self.chunks_dir), self.trashed)
         self.assertFalse(self.final_file.exists())
 
+    def test_tier1_quarantined_survives_tier2_crash(self):
+        """When Tier 1 output is truncated, it is quarantined immediately; when Tier 2 crashes, partial survives."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            if tag == "FFmpeg-FINAL-T1":
+                self.final_file.write_bytes(b"tier1_partial_bytes")
+                return 0  # Tier 1 exits 0 but fails duration gate (80s < 90.9s)
+            # Tier 2 crashes or fails with rc=1
+            self.final_file.write_bytes(b"tier2_broken_crash_bytes")
+            return 1
+
+        self.ns["get_file_info"] = lambda p: (80.0, {})
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        # Both tiers ran
+        self.assertEqual(len(self.commands_run), 2)
+        # Tier 1 quarantined partial file MUST survive intact on disk
+        partial_file = self.test_dir / "FINAL.partial.mkv"
+        self.assertTrue(partial_file.exists())
+        self.assertEqual(partial_file.read_bytes(), b"tier1_partial_bytes")
+        # Broken Tier 2 FINAL.mkv must NOT be left on disk
+        self.assertFalse(self.final_file.exists())
+        # Chunks folder must NOT be trashed
+        self.assertNotIn(str(self.chunks_dir), self.trashed)
+        # Process end timing recorded and summary log written with finalized=False
+        self.assertIn("process_end", self.state.stats)
+        self.assertTrue(any(call[2] is False for call in self.ns["summary_calls"]))
+
+    def test_tier1_truncated_tier2_succeeds_cleans_partial(self):
+        """When Tier 1 is truncated and quarantined, but Tier 2 succeeds completely, partial is cleaned up."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            if tag == "FFmpeg-FINAL-T1":
+                self.final_file.write_bytes(b"tier1_partial_bytes")
+                return 0
+            self.final_file.write_bytes(b"full_tier2_valid_bytes")
+            return 0
+
+        # Tier 1 returns 80s (truncated), Tier 2 returns 101s (ok)
+        def mock_probe(p):
+            if len(self.commands_run) == 1:
+                return (80.0, {})
+            return (101.0, {})
+
+        self.ns["get_file_info"] = mock_probe
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        # Both tiers ran
+        self.assertEqual(len(self.commands_run), 2)
+        # Final file exists and chunks dir trashed
+        self.assertTrue(self.final_file.exists())
+        self.assertIn(str(self.chunks_dir), self.trashed)
+        # Superseded partial was sent to trash
+        partial_file = str(self.test_dir / "FINAL.partial.mkv")
+        self.assertIn(partial_file, self.trashed)
+
 
 class TestBackoffPolicy(unittest.TestCase):
     """Verifies Defect 6 parity: backoff cap at 15s and 0s reset on chunks >= 60s."""
@@ -1119,6 +1180,29 @@ class TestBackoffPolicy(unittest.TestCase):
         # Both must reset when chunk_dur >= HEALTHY_CHUNK_RESET_SEC
         self.assertIn("chunk_dur >= HEALTHY_CHUNK_RESET_SEC", record_src)
         self.assertIn("chunk_dur >= HEALTHY_CHUNK_RESET_SEC", dynamic_src)
+
+    def test_record_dynamic_and_static_parity_on_burst_and_constants(self):
+        """Verify record_dynamic.py and RECORD.py have complete parity on burst detection and named constants."""
+        record_path = resolve_record_py_path()
+        dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
+
+        record_src = record_path.read_text(encoding="utf-8")
+        dynamic_src = dynamic_path.read_text(encoding="utf-8")
+
+        # Both must define burst and bitrate constants
+        for const in ("STABILITY_WALL_SEC = 25", "BURST_RATIO = 3.0", "DUP_MAX_SEC = 180", "FINAL_AUDIO_KBPS_PER_CHANNEL = 64"):
+            self.assertIn(const, record_src, f"Missing {const} in RECORD.py")
+            self.assertIn(const, dynamic_src, f"Missing {const} in record_dynamic.py")
+
+        # Both must guard replay burst in maybe_accept_chunk
+        self.assertIn("is_replay_burst = (", record_src)
+        self.assertIn("is_replay_burst = (", dynamic_src)
+        self.assertIn("and not is_replay_burst", record_src)
+        self.assertIn("and not is_replay_burst", dynamic_src)
+
+        # StreamIntegrityMonitor in RECORD.py must define and use WRAPPED_PTS_TOLERANCE
+        self.assertIn("WRAPPED_PTS_TOLERANCE = 450_000", record_src)
+        self.assertIn("self.WRAPPED_PTS_TOLERANCE", record_src)
 
 
 if __name__ == "__main__":
