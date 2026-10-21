@@ -413,6 +413,9 @@ RUNTIME_CONTROLS_REMINDER_SEC = 10 * 60
 DEFAULT_MIN_BACKOFF = 5
 DEFAULT_MAX_BACKOFF = 30
 STREAM_OFF_SLEEP = 15
+BACKOFF_STEP_SEC = 5
+BACKOFF_MAX_SEC = 15
+HEALTHY_CHUNK_RESET_SEC = 60.0
 
 # N_m3u8DL MANIFEST_DEAD retry policy (NM-B)
 MANIFEST_DEAD_MAX_ATTEMPTS_MANUAL_STARTUP = 1
@@ -754,6 +757,8 @@ RAW_EXTERNAL_PATH = None
 FFMPEG_PROGRESS_PERIOD = 1   # seconds
 STABILITY_SEC = 15          # minimum good duration in seconds
 BLACK_LEN = 1.0             # use only integers
+FINAL_AUDIO_MIN_KBPS = 192  # minimum audio bitrate for Tier 2 fallback re-encode
+FINAL_MIN_DURATION_RATIO = 0.90  # minimum ratio of expected media duration required to accept final output
 FF_SELECTED_BITRATE_LOG_MIN_DELTA_KBPS = 250
 FF_SELECTED_BITRATE_LOG_MIN_INTERVAL_SEC = 10
 
@@ -18797,7 +18802,7 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         backoff_sec = DEFAULT_MIN_BACKOFF
     else:
         if result.status != "no_stream":
-            backoff_sec = DEFAULT_MIN_BACKOFF if ok else min(backoff_sec + 5, 15)
+            backoff_sec = DEFAULT_MIN_BACKOFF if ok else min(backoff_sec + BACKOFF_STEP_SEC, BACKOFF_MAX_SEC)
 
     is_corrupt_recycle = (
         result.status == "stream_corrupt_recycle"
@@ -18807,7 +18812,7 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
     if ok and state.stats.get("sessions"):
         chunk_dur = float(state.stats["sessions"][-1].get("dur_media", 0.0))
 
-    if result.status == "stalled" or (is_corrupt_recycle and ok) or (ok and chunk_dur >= 60.0):
+    if result.status == "stalled" or (is_corrupt_recycle and ok) or (ok and chunk_dur >= HEALTHY_CHUNK_RESET_SEC):
         backoff_sec = 0
 
     if state.stop_flag:
@@ -19046,54 +19051,74 @@ def finalize_recording(state: RecorderState):
                 "-map", "0:a?",
             ]
             if tier == 1:
-                base += ["-c", "copy"]
-            else:
-                base += [
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-af", "aresample=async=1:first_pts=0",
-                ]
-                audio_meta = next((s for s in (state.stream_layout_ref or []) if s.get("codec_type") == "audio"), None)
-                if not audio_meta and state.audio_layout_ref:
-                    audio_meta = state.audio_layout_ref[0]
-                if audio_meta:
-                    if audio_meta.get("sample_rate"):
-                        base += ["-ar", str(audio_meta["sample_rate"])]
-                    if audio_meta.get("channels"):
-                        base += ["-ac", str(audio_meta["channels"])]
+                return base + ["-c", "copy", os.path.join("..", FINAL_FILE)]
+            base += [
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-af", "aresample=async=1:first_pts=0",
+            ]
+            audio_streams = [s for s in (state.stream_layout_ref or [])
+                             if s.get("codec_type") == "audio"] or list(state.audio_layout_ref or [])
+            for idx, meta in enumerate(audio_streams):
+                channels = int(meta.get("channels") or 0)
+                base += [f"-b:a:{idx}", f"{max(FINAL_AUDIO_MIN_KBPS, 64 * channels)}k"]
+                if meta.get("sample_rate"):
+                    base += [f"-ar:a:{idx}", str(meta["sample_rate"])]
+                if channels:
+                    base += [f"-ac:a:{idx}", str(channels)]
+            if not audio_streams:
+                base += ["-b:a", f"{FINAL_AUDIO_MIN_KBPS}k"]
             return base + [os.path.join("..", FINAL_FILE)]
 
-        def _validate_final_output() -> tuple[bool, str]:
+        def _validate_final_output() -> tuple[bool, str, bool]:
             if not os.path.exists(FINAL_FILE) or os.path.getsize(FINAL_FILE) <= 0:
-                return False, "missing or 0-byte output file"
+                return False, "missing or 0-byte output file", False
             dur, _ = get_file_info(FINAL_FILE)
             if dur <= 0:
-                return False, "invalid media duration (0s)"
+                return False, "invalid media duration (0s)", False
             sessions = state.stats.get("sessions", [])
             expected = sum(s.get("dur_media", 0.0) for s in sessions) + BLACK_LEN * max(0, len(sessions) - 1)
-            if expected > 0 and dur < (expected * 0.90):
-                return False, f"duration truncated ({dur:.1f}s vs expected {expected:.1f}s)"
-            return True, ""
+            if expected > 0 and dur < (expected * FINAL_MIN_DURATION_RATIO):
+                return False, f"duration truncated ({dur:.1f}s vs expected {expected:.1f}s)", True
+            return True, "", False
 
         rc = 1
+        last_failure_reason = ""
+        is_truncated_only = False
         for tier in (1, 2):
             tier_desc = "Tier 1 (lossless fast copy)" if tier == 1 else "Tier 2 fallback (lossless video + audio resample/re-encode)"
             log(f"FINALIZE {tier_desc} → {FINAL_FILE}")
             rc = run_ffmpeg_with_capture(_build_final_cmd(tier), CHUNKS_DIR, tag=f"FFmpeg-FINAL-T{tier}")
-            ok, why = _validate_final_output() if rc == 0 else (False, f"ffmpeg exit code {rc}")
+            ok, why, is_truncated = _validate_final_output() if rc == 0 else (False, f"ffmpeg exit code {rc}", False)
+            last_failure_reason = why
+            is_truncated_only = is_truncated
             if rc == 0 and ok:
                 break
             log(f"FINALIZE Tier {tier} failed: {why}", level="WARN")
             if os.path.exists(FINAL_FILE):
-                try:
-                    os.remove(FINAL_FILE)
-                except OSError as e:
-                    log(f"Could not remove incomplete {FINAL_FILE}: {e}", level="WARN")
+                if tier == 1 and not is_truncated_only:
+                    try:
+                        os.remove(FINAL_FILE)
+                    except OSError as e:
+                        log(f"Could not remove incomplete {FINAL_FILE}: {e}", level="WARN")
             rc = rc or 1
 
         if rc != 0:
-            log("FINALIZATION FAILED (both tiers) → FFmpeg could not create final MKV; keeping chunks folder for inspection.", level="ERROR")
+            if is_truncated_only and os.path.exists(FINAL_FILE):
+                partial_name = os.path.splitext(FINAL_FILE)[0] + ".partial.mkv"
+                log(f"FINALIZATION: Output {FINAL_FILE} passed FFmpeg (rc=0) but failed duration gate ({last_failure_reason}) → quarantining to {partial_name}", level="WARN")
+                try:
+                    if os.path.exists(partial_name):
+                        send2trash(partial_name)
+                    os.replace(FINAL_FILE, partial_name)
+                except OSError as e:
+                    log(f"Could not quarantine partial file {FINAL_FILE} to {partial_name}: {e}", level="WARN")
+            elif os.path.exists(FINAL_FILE):
+                try:
+                    os.remove(FINAL_FILE)
+                except OSError as e:
+                    log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
+            log("FINALIZATION FAILED (both tiers) → FFmpeg could not create validated final MKV; keeping chunks folder for inspection.", level="ERROR")
             return
     else:
         log("Mixed params → NOT auto-finalizing. Leaving chunks folder for manual analysis.")

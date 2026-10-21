@@ -663,23 +663,31 @@ class TestStreamIntegrityMonitorTwoTier(unittest.TestCase):
             self.assertIn("Protocol DTS > PTS Timestamp Inversion", mon.last_container_error_msg)
 
     def test_18_solo_same_sign_timeline_tear_is_tier1_not_fatal(self):
-        """Verifies solo large discontinuity: compensated offset is benign (no transport defect), uncompensated is Tier 1."""
+        """Verifies solo large discontinuity without codec/container corruption is Tier 1, not fatal."""
         t = [32000.0]
         with patch("time.monotonic", side_effect=lambda: t[0]):
             mon = self.MonitorCls(self.state)
             mon.process_progress({"frame": "5000", "total_size": "50000000", "out_time_us": "100000000"})
-            # Compensated by FFmpeg new offset -> benign (no defect)
-            mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): -3540021667, new offset= 3540021667")
-            mon.evaluate_health()
-            self.assertFalse(mon.transport_defect)
-            self.assertFalse(mon.container_defect)
-
-            # Uncompensated discontinuity -> flags Tier 1 transport defect, but not fatal container defect
-            mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): -3540021667, new offset= 0")
+            # Large discontinuity without codec error -> flags Tier 1 transport defect, but not fatal container defect
+            mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): 70788477689, new offset= -70788477689")
             mon.evaluate_health()
             self.assertTrue(mon.transport_defect)
             self.assertFalse(mon.container_defect)
             self.assertFalse(mon.recycle_requested)
+
+    def test_18b_corroborated_first_tear_latches_fatal(self):
+        """Verifies large discontinuity accompanied by codec corruption immediately latches fatal container defect."""
+        t = [32000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "5000", "total_size": "50000000", "out_time_us": "100000000"})
+            # Codec corruption occurs
+            mon.process_stderr_line("[h264 @ 0x123] missing picture in access unit with POC")
+            # First discontinuity arrives with offset == -delta
+            mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): 70788477689, new offset= -70788477689")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+            self.assertIn("Extreme Timeline Tear", mon.last_container_error_msg)
 
     def test_19_burst_speed_chunk_under_30s_wall_not_mature(self):
         """Verifies 46s media delivered in 4s wall-clock time does not fast-seal because it is not mature."""
@@ -701,20 +709,45 @@ class TestStreamIntegrityMonitorTwoTier(unittest.TestCase):
             self.assertFalse(mon.recycle_requested)
 
     def test_20_same_sign_video_and_audio_discontinuity_pair_not_fatal(self):
-        """Verifies encoder reset hitting both video and audio with same sign within 5s is not fatal."""
+        """Verifies encoder reset hitting both video and audio with same sign within 5s does not latch fatal."""
         t = [34000.0]
         with patch("time.monotonic", side_effect=lambda: t[0]):
             mon = self.MonitorCls(self.state)
             mon.process_progress({"frame": "5000", "total_size": "50000000", "out_time_us": "100000000"})
-            # Both video and audio jump -3540021667 within 100ms with compensating offset
+            # Both video and audio jump with same sign
             mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): -3540021667, new offset= 3540021667")
             t[0] += 0.1
-            mon.process_stderr_line("[aist#0:1/aac] timestamp discontinuity (stream id=257): -3540021667, new offset= 3540021667")
+            mon.process_stderr_line("[aist#0:1/aac] timestamp discontinuity (stream id=257): -3540021667, new offset= 7080043334")
             mon.evaluate_health()
-            # Compensated same-sign pair: neither transport nor container defect latched
-            self.assertFalse(mon.transport_defect)
+            self.assertTrue(mon.transport_defect)
             self.assertFalse(mon.container_defect)
             self.assertFalse(mon.recycle_requested)
+
+    def test_23_rule_2c_nopts_pts_latches_container_defect(self):
+        """Verifies DTS > PTS inversion with NOPTS or negative PTS is not treated as benign wrap."""
+        t = [35000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=-9223372036854775808, dts=8589933432, size=71750")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+            self.assertIn("Protocol DTS > PTS Timestamp Inversion", mon.last_container_error_msg)
+
+    def test_24_missing_last_run_start_does_not_flag_burst(self):
+        """Verifies missing last_run_start sets run_wall=None and does not misfire replay burst filter."""
+        state = WindowDummyState()
+        state.stats = {"good_chunks": 1}
+        run_start = state.stats.get("last_run_start")
+        run_wall = max(0.001, time.time() - float(run_start)) if run_start else None
+        dur = 50.0
+        is_replay_burst = (
+            state.stats.get("good_chunks", 0) > 0
+            and run_wall is not None
+            and run_wall < 25.0
+            and dur < 180.0
+            and (dur / run_wall) > 3.0
+        )
+        self.assertFalse(is_replay_burst)
 
     def test_21_replay_burst_preserves_first_run_cache(self):
         """Verifies 46s burst in 4s wall-clock time is preserved on chunk 1 (good_chunks=0), but rejected on later chunks."""
@@ -911,6 +944,8 @@ def load_finalize_function(test_dir: Path):
         "FINAL_FILE": final_file,
         "CHUNKS_DIR": chunks_dir,
         "BLACK_LEN": 1.0,
+        "FINAL_AUDIO_MIN_KBPS": 192,
+        "FINAL_MIN_DURATION_RATIO": 0.90,
         "FFMPEG_PROGRESS_PERIOD": 1.0,
         "RecorderState": object,
         "DOWNLOAD_MODE": "FFMPEG",
@@ -992,10 +1027,11 @@ class TestTwoTierFinalization(unittest.TestCase):
         self.assertIn("aac", cmd2)
         self.assertIn("-af", cmd2)
         self.assertIn("aresample=async=1:first_pts=0", cmd2)
-        self.assertIn("-ar", cmd2)
+        self.assertIn("-ar:a:0", cmd2)
         self.assertIn("48000", cmd2)
-        self.assertIn("-ac", cmd2)
+        self.assertIn("-ac:a:0", cmd2)
         self.assertIn("2", cmd2)
+        self.assertIn("-b:a:0", cmd2)
         self.assertIn(str(self.chunks_dir), self.trashed)
 
     def test_both_tiers_fail_preserves_chunks_folder(self):
@@ -1009,6 +1045,39 @@ class TestTwoTierFinalization(unittest.TestCase):
 
         self.assertEqual(len(self.commands_run), 2)
         self.assertNotIn(str(self.chunks_dir), self.trashed)
+
+    def test_duration_truncated_quarantines_partial_mkv(self):
+        """When output duration < 90% expected, file is quarantined as .partial.mkv and chunks kept."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            self.final_file.write_bytes(b"truncated_video_bytes")
+            return 0
+
+        # Return 80.0s (expected is 100s + 1s black = 101s; 80 < 101 * 0.90 = 90.9s)
+        self.ns["get_file_info"] = lambda p: (80.0, {})
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        # Chunks folder must NOT be trashed
+        self.assertNotIn(str(self.chunks_dir), self.trashed)
+        # Quarantined partial file must exist
+        partial_file = self.test_dir / "FINAL.partial.mkv"
+        self.assertTrue(partial_file.exists())
+        self.assertFalse(self.final_file.exists())
+
+    def test_duration_zero_fails_and_preserves_chunks(self):
+        """When output duration is 0s, both tiers fail, output is deleted, and chunks are kept."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            self.final_file.write_bytes(b"zero_dur_bytes")
+            return 0
+
+        self.ns["get_file_info"] = lambda p: (0.0, {})
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        self.assertNotIn(str(self.chunks_dir), self.trashed)
+        self.assertFalse(self.final_file.exists())
 
 
 class TestBackoffPolicy(unittest.TestCase):
@@ -1036,20 +1105,20 @@ class TestBackoffPolicy(unittest.TestCase):
         self.assertEqual(backoff, 0)
 
     def test_record_dynamic_and_static_parity_on_backoff(self):
-        """Verify record_dynamic.py and RECORD.py both have the 15s cap and chunk_dur reset in code."""
+        """Verify record_dynamic.py and RECORD.py both have the backoff constants and reset in code."""
         record_path = resolve_record_py_path()
         dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
 
         record_src = record_path.read_text(encoding="utf-8")
         dynamic_src = dynamic_path.read_text(encoding="utf-8")
 
-        # Both must cap backoff at 15
-        self.assertIn("min(backoff_sec + 5, 15)", record_src)
-        self.assertIn("min(backoff_sec + 5, 15)", dynamic_src)
+        # Both must use the module constants for backoff cap
+        self.assertIn("min(backoff_sec + BACKOFF_STEP_SEC, BACKOFF_MAX_SEC)", record_src)
+        self.assertIn("min(backoff_sec + BACKOFF_STEP_SEC, BACKOFF_MAX_SEC)", dynamic_src)
 
-        # Both must reset when chunk_dur >= 60.0
-        self.assertIn("chunk_dur >= 60.0", record_src)
-        self.assertIn("chunk_dur >= 60.0", dynamic_src)
+        # Both must reset when chunk_dur >= HEALTHY_CHUNK_RESET_SEC
+        self.assertIn("chunk_dur >= HEALTHY_CHUNK_RESET_SEC", record_src)
+        self.assertIn("chunk_dur >= HEALTHY_CHUNK_RESET_SEC", dynamic_src)
 
 
 if __name__ == "__main__":
