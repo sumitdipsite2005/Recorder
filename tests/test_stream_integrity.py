@@ -1049,8 +1049,8 @@ class TestTwoTierFinalization(unittest.TestCase):
         self.assertEqual(len(self.commands_run), 2)
         self.assertNotIn(str(self.chunks_dir), self.trashed)
 
-    def test_duration_truncated_quarantines_partial_mkv(self):
-        """When output duration < 90% expected, file is quarantined as .partial.mkv and chunks kept."""
+    def test_duration_truncated_both_tiers_removes_output_and_preserves_chunks(self):
+        """When output duration < 90% expected across both tiers, incomplete output is removed and chunks are kept for manual salvage."""
         def mock_run(cmd, cwd, tag=""):
             self.commands_run.append((tag, cmd))
             self.final_file.write_bytes(b"truncated_video_bytes")
@@ -1061,12 +1061,12 @@ class TestTwoTierFinalization(unittest.TestCase):
         self.ns["run_ffmpeg_with_capture"] = mock_run
         self.finalize_fn(self.state)
 
-        # Chunks folder must NOT be trashed
+        # Chunks folder must NOT be trashed; kept intact for operator
         self.assertNotIn(str(self.chunks_dir), self.trashed)
-        # Quarantined partial file must exist
-        partial_file = self.test_dir / "FINAL.partial.mkv"
-        self.assertTrue(partial_file.exists())
+        # Broken / incomplete final file must be removed
         self.assertFalse(self.final_file.exists())
+        # No partial file created
+        self.assertFalse((self.test_dir / "FINAL.partial.mkv").exists())
 
     def test_duration_zero_fails_and_preserves_chunks(self):
         """When output duration is 0s, both tiers fail, output is deleted, and chunks are kept."""
@@ -1082,12 +1082,12 @@ class TestTwoTierFinalization(unittest.TestCase):
         self.assertNotIn(str(self.chunks_dir), self.trashed)
         self.assertFalse(self.final_file.exists())
 
-    def test_tier1_quarantined_survives_tier2_crash(self):
-        """When Tier 1 output is truncated, it is quarantined immediately; when Tier 2 crashes, partial survives."""
+    def test_tier1_truncated_tier2_crashes_preserves_chunks_and_logs_failure(self):
+        """When Tier 1 is truncated and Tier 2 crashes, incomplete final is removed, chunks are preserved for manual salvage."""
         def mock_run(cmd, cwd, tag=""):
             self.commands_run.append((tag, cmd))
             if tag == "FFmpeg-FINAL-T1":
-                self.final_file.write_bytes(b"tier1_partial_bytes")
+                self.final_file.write_bytes(b"tier1_truncated_bytes")
                 return 0  # Tier 1 exits 0 but fails duration gate (80s < 90.9s)
             # Tier 2 crashes or fails with rc=1
             self.final_file.write_bytes(b"tier2_broken_crash_bytes")
@@ -1099,24 +1099,20 @@ class TestTwoTierFinalization(unittest.TestCase):
 
         # Both tiers ran
         self.assertEqual(len(self.commands_run), 2)
-        # Tier 1 quarantined partial file MUST survive intact on disk
-        partial_file = self.test_dir / "FINAL.partial.mkv"
-        self.assertTrue(partial_file.exists())
-        self.assertEqual(partial_file.read_bytes(), b"tier1_partial_bytes")
-        # Broken Tier 2 FINAL.mkv must NOT be left on disk
+        # Broken FINAL.mkv must NOT be left on disk
         self.assertFalse(self.final_file.exists())
-        # Chunks folder must NOT be trashed
+        # Chunks folder must NOT be trashed; 100% preserved for operator manual salvage
         self.assertNotIn(str(self.chunks_dir), self.trashed)
         # Process end timing recorded and summary log written with finalized=False
         self.assertIn("process_end", self.state.stats)
         self.assertTrue(any(call[2] is False for call in self.ns["summary_calls"]))
 
-    def test_tier1_truncated_tier2_succeeds_cleans_partial(self):
-        """When Tier 1 is truncated and quarantined, but Tier 2 succeeds completely, partial is cleaned up."""
+    def test_tier1_truncated_tier2_succeeds_finalizes(self):
+        """When Tier 1 is truncated, Tier 2 runs and succeeds, creating validated final output and trashing chunks."""
         def mock_run(cmd, cwd, tag=""):
             self.commands_run.append((tag, cmd))
             if tag == "FFmpeg-FINAL-T1":
-                self.final_file.write_bytes(b"tier1_partial_bytes")
+                self.final_file.write_bytes(b"tier1_truncated_bytes")
                 return 0
             self.final_file.write_bytes(b"full_tier2_valid_bytes")
             return 0
@@ -1136,9 +1132,6 @@ class TestTwoTierFinalization(unittest.TestCase):
         # Final file exists and chunks dir trashed
         self.assertTrue(self.final_file.exists())
         self.assertIn(str(self.chunks_dir), self.trashed)
-        # Superseded partial was sent to trash
-        partial_file = str(self.test_dir / "FINAL.partial.mkv")
-        self.assertIn(partial_file, self.trashed)
 
 
 class TestBackoffPolicy(unittest.TestCase):
@@ -1203,6 +1196,80 @@ class TestBackoffPolicy(unittest.TestCase):
         # StreamIntegrityMonitor in RECORD.py must define and use WRAPPED_PTS_TOLERANCE
         self.assertIn("WRAPPED_PTS_TOLERANCE = 450_000", record_src)
         self.assertIn("self.WRAPPED_PTS_TOLERANCE", record_src)
+
+    def test_dynamic_recorder_replay_burst_behaviour(self):
+        """Verify dynamic recorder's maybe_accept_chunk marks burst as BAD and normal chunk as GOOD."""
+        import sys
+        import importlib
+
+        # Provide a temporary dummy user config so record_dynamic can import cleanly
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            state = rd.RecorderState()
+            state.stats["good_chunks"] = 1
+            state.stats["last_run_start"] = time.time() - 4.0  # 4s wall time
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                dummy_chunk = td_path / "dummy.ts"
+                dummy_chunk.write_bytes(b"dummy_chunk_bytes")
+
+                orig_mode = rd.DOWNLOAD_MODE
+                orig_list = rd.LIST_FILE
+                orig_get_info = rd.get_file_info
+                orig_params = rd.get_video_params
+                try:
+                    rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
+                    rd.LIST_FILE = str(td_path / "list.txt")
+                    rd.get_file_info = lambda p: (46.0, 4000.0)
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+
+                    # Replay burst (46s media in 4s wall = 11.5x) must NOT be accepted
+                    accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
+                    self.assertFalse(accepted)
+                    self.assertEqual(state.stats["good_chunks"], 1)
+
+                    # Normal chunk (46s media in 40s wall = 1.15x) is accepted as GOOD
+                    dummy_chunk.write_bytes(b"dummy_chunk_bytes")
+                    state.stats["last_run_start"] = time.time() - 40.0
+                    accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_003.ts", "TEST")
+                    self.assertTrue(accepted)
+                    self.assertEqual(state.stats["good_chunks"], 2)
+                finally:
+                    rd.DOWNLOAD_MODE = orig_mode
+                    rd.LIST_FILE = orig_list
+                    rd.get_file_info = orig_get_info
+                    rd.get_video_params = orig_params
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

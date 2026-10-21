@@ -19102,61 +19102,26 @@ def finalize_recording(state: RecorderState):
 
         rc = 1
         last_failure_reason = ""
-        quarantined_partial = None
         for tier in (1, 2):
+            if getattr(state, "stop_flag", False):
+                break
             tier_desc = "Tier 1 (lossless fast copy)" if tier == 1 else "Tier 2 fallback (lossless video + audio resample/re-encode)"
             log(f"FINALIZE {tier_desc} → {FINAL_FILE}")
             rc = run_ffmpeg_with_capture(_build_final_cmd(tier), CHUNKS_DIR, tag=f"FFmpeg-FINAL-T{tier}")
             ok, why, is_truncated = _validate_final_output() if rc == 0 else (False, f"ffmpeg exit code {rc}", False)
             last_failure_reason = why
             if rc == 0 and ok:
-                if quarantined_partial and os.path.exists(quarantined_partial):
-                    try:
-                        send2trash(quarantined_partial)
-                    except Exception as e:
-                        log(f"Could not clean up superseded partial file {quarantined_partial}: {e}", level="DEBUG")
-                    quarantined_partial = None
                 break
 
             log(f"FINALIZE Tier {tier} failed: {why}", level="WARN")
-
-            if tier == 1:
-                if rc == 0 and is_truncated and os.path.exists(FINAL_FILE):
-                    partial_name = os.path.splitext(FINAL_FILE)[0] + ".partial.mkv"
-                    log(f"FINALIZATION: Tier 1 output passed FFmpeg (rc=0) but failed duration gate ({why}) → quarantining to {partial_name} before Tier 2 fallback", level="WARN")
-                    try:
-                        if os.path.exists(partial_name):
-                            send2trash(partial_name)
-                        os.replace(FINAL_FILE, partial_name)
-                        quarantined_partial = partial_name
-                    except OSError as e:
-                        log(f"Could not quarantine partial file {FINAL_FILE} to {partial_name}: {e}", level="WARN")
-                elif os.path.exists(FINAL_FILE):
-                    try:
-                        os.remove(FINAL_FILE)
-                    except OSError as e:
-                        log(f"Could not remove incomplete {FINAL_FILE}: {e}", level="WARN")
-            elif tier == 2:
-                if rc == 0 and is_truncated and os.path.exists(FINAL_FILE):
-                    partial_name = os.path.splitext(FINAL_FILE)[0] + ".partial.mkv"
-                    log(f"FINALIZATION: Tier 2 output passed FFmpeg (rc=0) but failed duration gate ({why}) → quarantining to {partial_name}", level="WARN")
-                    try:
-                        if os.path.exists(partial_name):
-                            send2trash(partial_name)
-                        os.replace(FINAL_FILE, partial_name)
-                        quarantined_partial = partial_name
-                    except OSError as e:
-                        log(f"Could not quarantine partial file {FINAL_FILE} to {partial_name}: {e}", level="WARN")
-                elif os.path.exists(FINAL_FILE):
-                    try:
-                        os.remove(FINAL_FILE)
-                    except OSError as e:
-                        log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
+            if os.path.exists(FINAL_FILE):
+                try:
+                    os.remove(FINAL_FILE)
+                except OSError as e:
+                    log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
             rc = rc or 1
 
         if rc != 0:
-            if quarantined_partial and os.path.exists(quarantined_partial):
-                log(f"FINALIZATION: Preserved partial recording output at {quarantined_partial} for salvage inspection.", level="WARN")
             if os.path.exists(FINAL_FILE):
                 try:
                     os.remove(FINAL_FILE)
