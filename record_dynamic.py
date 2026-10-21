@@ -1638,7 +1638,12 @@ def log(*args, level="INFO", **print_kwargs):
             return
 
         clear_progress_line()
-        print(terminal_line, **print_kwargs)
+        try:
+            print(terminal_line, **print_kwargs)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+            safe_text = terminal_line.encode(encoding, errors="replace").decode(encoding)
+            print(safe_text, **print_kwargs)
         termcap_write(line)
         TERMINAL_LAST_OUTPUT_WAS_BLANK = output_is_blank
 
@@ -3160,7 +3165,12 @@ def _flush_deferred_terminal_lines_locked():
         if output_is_blank and TERMINAL_LAST_OUTPUT_WAS_BLANK:
             continue
 
-        print(line)
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+            safe_text = line.encode(encoding, errors="replace").decode(encoding)
+            print(safe_text)
         TERMINAL_LAST_OUTPUT_WAS_BLANK = output_is_blank
 
 

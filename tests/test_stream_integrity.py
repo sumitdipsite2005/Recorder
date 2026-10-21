@@ -1239,11 +1239,13 @@ class TestBackoffPolicy(unittest.TestCase):
                 orig_list = rd.LIST_FILE
                 orig_get_info = rd.get_file_info
                 orig_params = rd.get_video_params
+                orig_log = rd.log
                 try:
                     rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
                     rd.LIST_FILE = str(td_path / "list.txt")
                     rd.get_file_info = lambda p: (46.0, 4000.0)
                     rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    rd.log = lambda *a, **k: None
 
                     # Replay burst (46s media in 4s wall = 11.5x) must NOT be accepted
                     accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
@@ -1261,6 +1263,7 @@ class TestBackoffPolicy(unittest.TestCase):
                     rd.LIST_FILE = orig_list
                     rd.get_file_info = orig_get_info
                     rd.get_video_params = orig_params
+                    rd.log = orig_log
         finally:
             if old_cfg:
                 os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
@@ -1352,6 +1355,57 @@ class TestBackoffPolicy(unittest.TestCase):
             finally:
                 rd.get_nm3u8dl_part_a = orig_get_part_a
                 rd.next_chunk_names = orig_next_names
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def test_dynamic_recorder_log_unicode_fallback_on_cp1252(self):
+        """Verify dynamic recorder log() handles non-encodable charmaps without raising UnicodeEncodeError."""
+        import sys
+        import io
+        import importlib
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            class Cp1252Writer(io.TextIOWrapper):
+                def __init__(self):
+                    super().__init__(io.BytesIO(), encoding="cp1252", errors="strict")
+
+            fake_stdout = Cp1252Writer()
+            old_stdout = sys.stdout
+            sys.stdout = fake_stdout
+            try:
+                # Should not raise UnicodeEncodeError even with right arrow
+                rd.log("Testing unicode arrow → in cp1252 charmap")
+            finally:
+                sys.stdout = old_stdout
         finally:
             if old_cfg:
                 os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
