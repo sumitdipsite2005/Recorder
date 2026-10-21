@@ -19103,8 +19103,6 @@ def finalize_recording(state: RecorderState):
         rc = 1
         last_failure_reason = ""
         for tier in (1, 2):
-            if getattr(state, "stop_flag", False):
-                break
             tier_desc = "Tier 1 (lossless fast copy)" if tier == 1 else "Tier 2 fallback (lossless video + audio resample/re-encode)"
             log(f"FINALIZE {tier_desc} → {FINAL_FILE}")
             rc = run_ffmpeg_with_capture(_build_final_cmd(tier), CHUNKS_DIR, tag=f"FFmpeg-FINAL-T{tier}")
