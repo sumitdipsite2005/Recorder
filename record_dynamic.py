@@ -814,14 +814,14 @@ def safe_print(*args, **kwargs):
     try:
         print(*args, **kwargs)
     except (UnicodeEncodeError, LookupError):
-        stream = kwargs.get("file") or sys.stdout
-        encoding = getattr(stream, "encoding", None) or "ascii"
-        sep = kwargs.get("sep", " ")
-        text = sep.join(str(a) for a in args)
-        safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
-        new_kwargs = dict(kwargs)
-        new_kwargs.pop("sep", None)
         try:
+            stream = kwargs.get("file") or sys.stdout
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            sep = kwargs.get("sep", " ")
+            text = sep.join(str(a) for a in args)
+            safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            new_kwargs = dict(kwargs)
+            new_kwargs.pop("sep", None)
             print(safe_text, **new_kwargs)
         except Exception:
             pass
