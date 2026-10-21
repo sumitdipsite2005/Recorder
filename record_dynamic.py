@@ -25,6 +25,16 @@ import time
 import os
 import signal
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
 import json
 import runpy
 import base64
@@ -413,6 +423,9 @@ RUNTIME_CONTROLS_REMINDER_SEC = 10 * 60
 DEFAULT_MIN_BACKOFF = 5
 DEFAULT_MAX_BACKOFF = 30
 STREAM_OFF_SLEEP = 15
+BACKOFF_STEP_SEC = 5
+BACKOFF_MAX_SEC = 15
+HEALTHY_CHUNK_RESET_SEC = 60.0
 
 # N_m3u8DL MANIFEST_DEAD retry policy (NM-B)
 MANIFEST_DEAD_MAX_ATTEMPTS_MANUAL_STARTUP = 1
@@ -753,7 +766,13 @@ RAW_EXTERNAL_PATH = None
 
 FFMPEG_PROGRESS_PERIOD = 1   # seconds
 STABILITY_SEC = 15          # minimum good duration in seconds
+STABILITY_WALL_SEC = 25     # minimum wall-clock seconds for speed ratio evaluation
+BURST_RATIO = 3.0           # media-to-wall speed threshold indicating a server replay burst
+DUP_MAX_SEC = 180           # maximum media duration to consider as a replay burst
 BLACK_LEN = 1.0             # use only integers
+FINAL_AUDIO_MIN_KBPS = 192  # minimum audio bitrate for Tier 2 fallback re-encode
+FINAL_AUDIO_KBPS_PER_CHANNEL = 64  # per-channel audio bitrate floor in kbps for Tier 2
+FINAL_MIN_DURATION_RATIO = 0.90  # minimum ratio of expected media duration required to accept final output
 FF_SELECTED_BITRATE_LOG_MIN_DELTA_KBPS = 250
 FF_SELECTED_BITRATE_LOG_MIN_INTERVAL_SEC = 10
 
@@ -788,6 +807,24 @@ TERMINAL_ACTIVITY_COUNTER = 0
 TERMINAL_LAST_ACTIVITY_ID = None
 TERMINAL_LAST_OUTPUT_WAS_BLANK = False
 TERMINAL_ACTIVITY_LOCAL = threading.local()
+
+
+def safe_print(*args, **kwargs):
+    """Safely print to stdout/stderr, replacing unencodable characters on legacy charmap consoles."""
+    try:
+        print(*args, **kwargs)
+    except (UnicodeEncodeError, LookupError):
+        try:
+            stream = kwargs.get("file") or sys.stdout
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            sep = kwargs.get("sep", " ")
+            text = sep.join(str(a) for a in args)
+            safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            new_kwargs = dict(kwargs)
+            new_kwargs.pop("sep", None)
+            print(safe_text, **new_kwargs)
+        except Exception:
+            pass
 
 
 def set_progress_line_active(active: bool, text: Optional[str] = None):
@@ -904,7 +941,7 @@ def _prepare_terminal_activity(
             separator = (
                 f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [INFO]"
             )
-            print(separator)
+            safe_print(separator)
             termcap_write(separator)
             TERMINAL_LAST_OUTPUT_WAS_BLANK = True
 
@@ -1629,7 +1666,7 @@ def log(*args, level="INFO", **print_kwargs):
             return
 
         clear_progress_line()
-        print(terminal_line, **print_kwargs)
+        safe_print(terminal_line, **print_kwargs)
         termcap_write(line)
         TERMINAL_LAST_OUTPUT_WAS_BLANK = output_is_blank
 
@@ -3051,7 +3088,7 @@ def _console_print_lines(lines, color: Optional[str] = None, colored_indexes=Non
         for idx, line in enumerate(lines):
             text = str(line)
             use_color = color is not None and (colored_indexes is None or idx in colored_indexes)
-            print(_console_color(text, color) if use_color else text)
+            safe_print(_console_color(text, color) if use_color else text)
             termcap_write(text)
             TERMINAL_LAST_OUTPUT_WAS_BLANK = (text == "")
 
@@ -3062,7 +3099,7 @@ def _console_print_timestamped_line(message: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     plain = f"{ts} [INFO] {message}"
     with CONSOLE_OUTPUT_LOCK:
-        print(colorize_terminal_log_line(plain))
+        safe_print(colorize_terminal_log_line(plain))
         termcap_write(plain)
         TERMINAL_LAST_OUTPUT_WAS_BLANK = (str(message) == "")
 
@@ -3075,7 +3112,7 @@ def _print_runtime_controls_reminder():
         clear_progress_line()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         plain = f"{ts} [INFO] Press I for recording information & controls"
-        print(colorize_terminal_log_line(plain))
+        safe_print(colorize_terminal_log_line(plain))
         termcap_write(plain)
 
 
@@ -3151,7 +3188,7 @@ def _flush_deferred_terminal_lines_locked():
         if output_is_blank and TERMINAL_LAST_OUTPUT_WAS_BLANK:
             continue
 
-        print(line)
+        safe_print(line)
         TERMINAL_LAST_OUTPUT_WAS_BLANK = output_is_blank
 
 
@@ -16400,18 +16437,18 @@ def monitor_nm3u8dl_playlist_renewal(
 def print_nm3u8dl_playlist_source_diagnostic():
     source = resolve_nm3u8dl_playlist_source()
 
-    print("")
-    print("=== N_m3u8DL PLAYLIST RESOLUTION TEST ===")
-    print(f'EXTINF: {source["extinf"]}')
-    print(f'Stream URL: {source["stream_url"]}')
-    print(f'Headers: {source["headers"]}')
-    print(f'Keys: {source["keys"]}')
+    safe_print("")
+    safe_print("=== N_m3u8DL PLAYLIST RESOLUTION TEST ===")
+    safe_print(f'EXTINF: {source["extinf"]}')
+    safe_print(f'Stream URL: {source["stream_url"]}')
+    safe_print(f'Headers: {source["headers"]}')
+    safe_print(f'Keys: {source["keys"]}')
     source_quality = format_nm3u8dl_candidate_quality(source)
     if _nm3u8dl_has_quality_evidence(source):
-        print(f'Quality: {source_quality}')
-    print(f'Expiry: {source["expiry"]}')
-    print("========================================")
-    print("")
+        safe_print(f'Quality: {source_quality}')
+    safe_print(f'Expiry: {source["expiry"]}')
+    safe_print("========================================")
+    safe_print("")
     
 def _nm3u8dl_stream_url_from_part_a() -> str:
     match = re.search(r'"(https?://[^"]+)"', NM3U8DL_PART_A)
@@ -18183,7 +18220,21 @@ def maybe_accept_chunk(state: RecorderState, chunk_path, chunk_name, context):
         min_expected_br = (last_good * 0.40) if last_good else None
 
     bitrate_ok = (br > min_expected_br) if (min_expected_br is not None) else True
-    if dur > STABILITY_SEC and bitrate_ok:
+
+    run_start = state.stats.get("last_run_start")
+    run_wall = max(0.001, time.time() - float(run_start)) if run_start else None
+    is_replay_burst = (
+        DOWNLOAD_MODE != ENGINE_NM3U8DL
+        and state.stats.get("good_chunks", 0) > 0
+        and run_wall is not None
+        and run_wall < STABILITY_WALL_SEC
+        and dur < DUP_MAX_SEC
+        and (dur / run_wall) > BURST_RATIO
+    )
+    if is_replay_burst:
+        log(f"{context}: {chunk_name} REPLAY_BURST ({dur:.0f}s media in {run_wall:.1f}s wall, {dur/run_wall:.1f}x speed) → treating as BAD", level="WARN")
+
+    if dur > STABILITY_SEC and bitrate_ok and not is_replay_burst:
         # Update best resolution/fps from this chunk and track consistency
         w, h, fps = get_video_params(chunk_path)
         log(f"{context}: {chunk_name} params {w}x{h}@{fps}fps")
@@ -18788,9 +18839,17 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         backoff_sec = DEFAULT_MIN_BACKOFF
     else:
         if result.status != "no_stream":
-            backoff_sec = DEFAULT_MIN_BACKOFF if ok else min(backoff_sec + 5, DEFAULT_MAX_BACKOFF)
+            backoff_sec = DEFAULT_MIN_BACKOFF if ok else min(backoff_sec + BACKOFF_STEP_SEC, BACKOFF_MAX_SEC)
 
-    if result.status == "stalled":
+    is_corrupt_recycle = (
+        result.status == "stream_corrupt_recycle"
+        or "stream corruption" in str(result.reason or "").lower()
+    )
+    chunk_dur = 0.0
+    if ok and state.stats.get("sessions"):
+        chunk_dur = float(state.stats["sessions"][-1].get("dur_media", 0.0))
+
+    if result.status == "stalled" or (is_corrupt_recycle and ok) or (ok and chunk_dur >= HEALTHY_CHUNK_RESET_SEC):
         backoff_sec = 0
 
     if state.stop_flag:
@@ -19014,27 +19073,86 @@ def finalize_recording(state: RecorderState):
 
     # Decide whether we can avoid re-encoding
     if state.same_params:
-        log(f"All GOOD chunks {state.best_w}x{state.best_h}@{state.best_fps}fps → fast concat (no re-encode) → {FINAL_FILE}")
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            
-            "-nostats",           
-            "-progress", "pipe:2",
-            "-stats_period", str(FFMPEG_PROGRESS_PERIOD), 
-    
-            "-i", os.path.basename(LIST_FILE),
-            
-            # Keep all video + all audio streams from the concatenated input
-            "-map", "0:v",
-            "-map", "0:a?",
-         
-    
-            "-c", "copy",
-            os.path.join("..", FINAL_FILE),
-        ]
+        def _build_final_cmd(tier: int) -> list:
+            base = ["ffmpeg", "-y"]
+            if tier == 2:
+                base += ["-err_detect", "ignore_err", "-fflags", "+genpts+discardcorrupt"]
+            base += [
+                "-f", "concat",
+                "-safe", "0",
+                "-nostats",
+                "-progress", "pipe:2",
+                "-stats_period", str(FFMPEG_PROGRESS_PERIOD),
+                "-i", os.path.basename(LIST_FILE),
+                "-map", "0:v",
+                "-map", "0:a?",
+            ]
+            if tier == 1:
+                return base + ["-c", "copy", os.path.join("..", FINAL_FILE)]
+            base += [
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-af", "aresample=async=1:first_pts=0",
+            ]
+            audio_streams = [s for s in (state.stream_layout_ref or [])
+                             if s.get("codec_type") == "audio"] or list(state.audio_layout_ref or [])
+            for idx, meta in enumerate(audio_streams):
+                channels = int(meta.get("channels") or 0)
+                base += [f"-b:a:{idx}", f"{max(FINAL_AUDIO_MIN_KBPS, FINAL_AUDIO_KBPS_PER_CHANNEL * channels)}k"]
+                if meta.get("sample_rate"):
+                    base += [f"-ar:a:{idx}", str(meta["sample_rate"])]
+                if channels:
+                    base += [f"-ac:a:{idx}", str(channels)]
+            if not audio_streams:
+                base += ["-b:a", f"{FINAL_AUDIO_MIN_KBPS}k"]
+            return base + [os.path.join("..", FINAL_FILE)]
+
+        def _validate_final_output() -> tuple[bool, str, bool]:
+            if not os.path.exists(FINAL_FILE) or os.path.getsize(FINAL_FILE) <= 0:
+                return False, "missing or 0-byte output file", False
+            dur, _ = get_file_info(FINAL_FILE)
+            if dur <= 0:
+                return False, "invalid media duration (0s)", False
+            sessions = state.stats.get("sessions", [])
+            expected = sum(s.get("dur_media", 0.0) for s in sessions) + BLACK_LEN * max(0, len(sessions) - 1)
+            if expected > 0 and dur < (expected * FINAL_MIN_DURATION_RATIO):
+                return False, f"duration truncated ({dur:.1f}s vs expected {expected:.1f}s)", True
+            return True, "", False
+
+        rc = 1
+        last_failure_reason = ""
+        for tier in (1, 2):
+            tier_desc = "Tier 1 (lossless fast copy)" if tier == 1 else "Tier 2 fallback (lossless video + audio resample/re-encode)"
+            log(f"FINALIZE {tier_desc} → {FINAL_FILE}")
+            rc = run_ffmpeg_with_capture(_build_final_cmd(tier), CHUNKS_DIR, tag=f"FFmpeg-FINAL-T{tier}")
+            ok, why, is_truncated = _validate_final_output() if rc == 0 else (False, f"ffmpeg exit code {rc}", False)
+            last_failure_reason = why
+            if rc == 0 and ok:
+                break
+
+            log(f"FINALIZE Tier {tier} failed: {why}", level="WARN")
+            if os.path.exists(FINAL_FILE):
+                try:
+                    os.remove(FINAL_FILE)
+                except OSError as e:
+                    log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
+            rc = rc or 1
+
+        if rc != 0:
+            if os.path.exists(FINAL_FILE):
+                try:
+                    os.remove(FINAL_FILE)
+                except OSError as e:
+                    log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
+            err_suffix = f" (last failure: {last_failure_reason})" if last_failure_reason else ""
+            log(f"FINALIZATION FAILED (both tiers{err_suffix}) → FFmpeg could not create validated final MKV; keeping chunks folder for inspection.", level="ERROR")
+            state.stats["process_end"] = time.time()
+            black_len = BLACK_LEN
+            sessions = state.stats.get("sessions", [])
+            total_media = sum(s.get("dur_media", 0.0) for s in sessions)
+            est_final_dur = total_media + black_len * max(0, len(sessions) - 1)
+            write_summary_log(state, est_final_dur, finalized=False)
+            return
     else:
         log("Mixed params → NOT auto-finalizing. Leaving chunks folder for manual analysis.")
         
@@ -19052,36 +19170,8 @@ def finalize_recording(state: RecorderState):
 
         write_summary_log(state, est_final_dur, finalized=False)
         return
-        # commenting out the below for now. I want to manually handle mixed param cases.
-        #log(f"Mixed params → re-encoding to {state.best_w}x{state.best_h}@{state.best_fps}fps → {FINAL_FILE}")
-        #cmd = [
-        #    "ffmpeg",
-        #    "-y",
-        #    "-f", "concat",
-        #    "-safe", "0",
-        #    "-i", "list.txt",
-        #    "-vf", f"scale={state.best_w}:{state.best_h},fps={state.best_fps}",
-        #    "-c:v", "libx264",
-        #    "-preset", "veryfast",
-        #    "-c:a", "aac",
-        #    "-b:a", "128k",
-        #   os.path.join("..", FINAL_FILE),
-        #]
-    # proc = subprocess.run(cmd, cwd=CHUNKS_DIR)
-    rc = run_ffmpeg_with_capture(cmd, CHUNKS_DIR, tag="FFmpeg-FINAL")
-    if rc != 0:
-        log("FINALIZATION FAILED → FFmpeg could not create final MKV; keeping chunks folder for inspection.")
-        return
-        
-    if not os.path.exists(FINAL_FILE):
-        log("FINAL FILE MISSING after concat → keeping chunks.")
-        return
 
     final_size = os.path.getsize(FINAL_FILE)
-    if final_size <= 0:
-        log("FINAL FILE SIZE 0 → keeping chunks.")
-        return
-
     state.stats["process_end"] = time.time()
     dur, _ = get_file_info(FINAL_FILE)
     if dur <= 0:

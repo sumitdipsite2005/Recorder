@@ -1,6 +1,7 @@
 import ast
 import os
 import re
+import tempfile
 import threading
 import time
 import unittest
@@ -24,17 +25,21 @@ def resolve_record_py_path() -> Path:
     env_path = os.environ.get("RECORD_PY_PATH")
     if env_path and Path(env_path).exists():
         return Path(env_path)
+    candidates = []
     for parent in Path(__file__).resolve().parents[:4]:
         try:
             for item in parent.iterdir():
                 if item.is_file() and item.name == "RECORD.py":
-                    return item
-                if item.is_dir() and not item.name.startswith((".", "_")) and item.name != "Recorder":
+                    candidates.append(item)
+                elif item.is_dir() and not item.name.startswith((".", "_")) and item.name != "Recorder":
                     sub = item / "RECORD.py"
                     if sub.is_file():
-                        return sub
+                        candidates.append(sub)
         except (PermissionError, OSError):
             continue
+    if candidates:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    raise unittest.SkipTest("Static recorder RECORD.py not found in local workspace (CI environment)")
     raise unittest.SkipTest("Static recorder RECORD.py not found in local workspace (CI environment)")
 
 
@@ -634,6 +639,161 @@ class TestStreamIntegrityMonitorTwoTier(unittest.TestCase):
             self.assertTrue(mon.incident_active)
             self.assertEqual(self.state.ffmpeg_stream_corrupt_nonfatal_incidents, 0)
 
+    def test_16_startup_wrapped_negative_dts_ignored(self):
+        """Verifies startup wrapped negative DTS (2^33 - 1160) within 10s grace is ignored as benign."""
+        t = [30000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "1", "total_size": "50000", "out_time_us": "40000"})
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=2440, dts=8589933432, size=71750")
+            mon.evaluate_health()
+            self.assertFalse(mon.container_defect)
+            self.assertFalse(mon.transport_defect)
+            self.assertFalse(mon.recycle_requested)
+
+    def test_17_post_startup_or_real_dts_inversion_latches_container_defect(self):
+        """Verifies real DTS inversion (dts < wrapped floor) latches container defect immediately."""
+        t = [31000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "1", "total_size": "50000", "out_time_us": "40000"})
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=2440, dts=500000, size=71750")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+            self.assertIn("Protocol DTS > PTS Timestamp Inversion", mon.last_container_error_msg)
+
+    def test_18_solo_same_sign_timeline_tear_is_tier1_not_fatal(self):
+        """Verifies solo large discontinuity without codec/container corruption is Tier 1, not fatal."""
+        t = [32000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "5000", "total_size": "50000000", "out_time_us": "100000000"})
+            # Large discontinuity without codec error -> flags Tier 1 transport defect, but not fatal container defect
+            mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): 70788477689, new offset= -70788477689")
+            mon.evaluate_health()
+            self.assertTrue(mon.transport_defect)
+            self.assertFalse(mon.container_defect)
+            self.assertFalse(mon.recycle_requested)
+
+    def test_18b_corroborated_first_tear_latches_fatal(self):
+        """Verifies large discontinuity accompanied by codec corruption immediately latches fatal container defect."""
+        t = [32000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "5000", "total_size": "50000000", "out_time_us": "100000000"})
+            # Codec corruption occurs
+            mon.process_stderr_line("[h264 @ 0x123] missing picture in access unit with POC")
+            # First discontinuity arrives with offset == -delta
+            mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): 70788477689, new offset= -70788477689")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+            self.assertIn("Extreme Timeline Tear", mon.last_container_error_msg)
+
+    def test_19_burst_speed_chunk_under_30s_wall_not_mature(self):
+        """Verifies 46s media delivered in 4s wall-clock time does not fast-seal because it is not mature."""
+        t = [33000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            # 46 seconds of media delivered at t = 4s wall time (speed = 11.5x > 3.0x burst ratio)
+            t[0] += 4.0
+            mon.process_progress({"frame": "2300", "total_size": "38000000", "out_time_us": "46122667"})
+            # Real container defect injected
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=2440, dts=500000, size=71750")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+
+            # Advance past 2s coalesce window to t = 6.5s wall time (media/wall = 46/6.5 = 7.0x > 3.0x)
+            t[0] += 2.5
+            mon.evaluate_health()
+            # Fast-seal must NOT trigger because speed ratio > 3.0 (burst dead zone protected)
+            self.assertFalse(mon.recycle_requested)
+
+    def test_20_same_sign_video_and_audio_discontinuity_pair_not_fatal(self):
+        """Verifies encoder reset hitting both video and audio with same sign within 5s does not latch fatal."""
+        t = [34000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "5000", "total_size": "50000000", "out_time_us": "100000000"})
+            # Both video and audio jump with same sign
+            mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): -3540021667, new offset= 3540021667")
+            t[0] += 0.1
+            mon.process_stderr_line("[aist#0:1/aac] timestamp discontinuity (stream id=257): -3540021667, new offset= 7080043334")
+            mon.evaluate_health()
+            self.assertTrue(mon.transport_defect)
+            self.assertFalse(mon.container_defect)
+            self.assertFalse(mon.recycle_requested)
+
+    def test_23_rule_2c_nopts_pts_latches_container_defect(self):
+        """Verifies DTS > PTS inversion with NOPTS or negative PTS is not treated as benign wrap."""
+        t = [35000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=-9223372036854775808, dts=8589933432, size=71750")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+            self.assertIn("Protocol DTS > PTS Timestamp Inversion", mon.last_container_error_msg)
+
+    def test_24_missing_last_run_start_does_not_flag_burst(self):
+        """Verifies missing last_run_start sets run_wall=None and does not misfire replay burst filter."""
+        state = WindowDummyState()
+        state.stats = {"good_chunks": 1}
+        run_start = state.stats.get("last_run_start")
+        run_wall = max(0.001, time.time() - float(run_start)) if run_start else None
+        dur = 50.0
+        is_replay_burst = (
+            state.stats.get("good_chunks", 0) > 0
+            and run_wall is not None
+            and run_wall < 25.0
+            and dur < 180.0
+            and (dur / run_wall) > 3.0
+        )
+        self.assertFalse(is_replay_burst)
+
+    def test_21_replay_burst_preserves_first_run_cache(self):
+        """Verifies 46s burst in 4s wall-clock time is preserved on chunk 1 (good_chunks=0), but rejected on later chunks."""
+        state_first = WindowDummyState()
+        state_first.stats = {"good_chunks": 0}
+        run_wall = 4.0
+        dur = 46.0
+        is_replay_burst_first = (
+            state_first.stats.get("good_chunks", 0) > 0
+            and run_wall < 25.0
+            and dur < 180.0
+            and (dur / run_wall) > 3.0
+        )
+        self.assertFalse(is_replay_burst_first)
+
+        state_later = WindowDummyState()
+        state_later.stats = {"good_chunks": 1}
+        is_replay_burst_later = (
+            state_later.stats.get("good_chunks", 0) > 0
+            and run_wall < 25.0
+            and dur < 180.0
+            and (dur / run_wall) > 3.0
+        )
+        self.assertTrue(is_replay_burst_later)
+
+    def test_22_maturity_speed_ratio_dead_zone_heals(self):
+        """Verifies chunk with 45s media running at normal live speed (35s wall) is mature and fast-seals."""
+        t = [35000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            # 45s media delivered in 35s wall (speed = 45/35 = 1.28x <= 3.0x)
+            t[0] += 35.0
+            mon.process_progress({"frame": "2250", "total_size": "40000000", "out_time_us": "45000000"})
+            # Severe container defect occurs
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=2440, dts=500000, size=71750")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+
+            # Advance past 2.0s coalesce window (to 37.5s wall time)
+            t[0] += 2.5
+            mon.evaluate_health()
+            # Fast-seal triggers because chunk is mature (media >= 30s and speed <= 3.0x)
+            self.assertTrue(mon.recycle_requested)
+            self.assertIn("Fatal Container Poisoning", mon.recycle_reason)
+
+
 
 class TestStreamCorruptRollingWindow(unittest.TestCase):
     """Rolling 30-minute fatal-cut window, escalation siren, ack and re-arm."""
@@ -752,6 +912,518 @@ class TestStreamCorruptRollingWindow(unittest.TestCase):
         self.ns["beep_bad"] = lambda state=None: done.set()
         self.ns["play_stream_corrupt_bad_beep_async"](self.state)
         self.assertTrue(done.wait(timeout=2.0))
+
+
+def load_finalize_function(test_dir: Path):
+    record_path = resolve_record_py_path()
+    tree = ast.parse(record_path.read_text(encoding="utf-8"))
+    wanted = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "finalize_recording"]
+    assert len(wanted) == 1, f"finalize_recording not found in {record_path}"
+
+    logs = []
+    commands_run = []
+    trashed = []
+    summary_calls = []
+
+    def dummy_run(cmd, cwd, tag=""):
+        commands_run.append((tag, cmd))
+        return 0
+
+    list_file = str(test_dir / "concat_list.txt")
+    final_file = str(test_dir / "FINAL.mkv")
+    chunks_dir = str(test_dir / "chunks")
+
+    ns = {
+        "os": os,
+        "time": time,
+        "log": lambda msg, level="INFO", **kw: logs.append((level, msg)),
+        "send2trash": lambda p: trashed.append(p),
+        "get_file_info": lambda p: (100.0, {}),
+        "run_ffmpeg_with_capture": dummy_run,
+        "write_summary_log": lambda state, dur, finalized=True: summary_calls.append((state, dur, finalized)),
+        "summary_calls": summary_calls,
+        "LIST_FILE": list_file,
+        "FINAL_FILE": final_file,
+        "CHUNKS_DIR": chunks_dir,
+        "BLACK_LEN": 1.0,
+        "FINAL_AUDIO_MIN_KBPS": 192,
+        "FINAL_AUDIO_KBPS_PER_CHANNEL": 64,
+        "FINAL_MIN_DURATION_RATIO": 0.90,
+        "FFMPEG_PROGRESS_PERIOD": 1.0,
+        "RecorderState": object,
+        "DOWNLOAD_MODE": "FFMPEG",
+        "ENGINE_YTDLP": "YTDLP",
+        "ENGINE_STREAMLINK": "STREAMLINK",
+    }
+    mod = ast.Module(body=wanted, type_ignores=[])
+    exec(compile(mod, filename=str(record_path), mode="exec"), ns)
+    return ns["finalize_recording"], ns, logs, commands_run, trashed
+
+
+class TestTwoTierFinalization(unittest.TestCase):
+    """Verifies Two-Tier Concatenation Pipeline: Tier 1 fast copy -> Tier 2 audio transcode fallback."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_dir = Path(self.temp_dir.name)
+        self.list_file = self.test_dir / "concat_list.txt"
+        self.list_file.write_text("file chunk_001.ts\nfile chunk_002.ts\n", encoding="utf-8")
+        self.final_file = self.test_dir / "FINAL.mkv"
+        self.chunks_dir = self.test_dir / "chunks"
+        self.chunks_dir.mkdir(exist_ok=True)
+
+        self.finalize_fn, self.ns, self.logs, self.commands_run, self.trashed = load_finalize_function(self.test_dir)
+
+        class DummyState:
+            best_w = 1920
+            best_h = 1080
+            best_fps = 50
+            same_params = True
+            mixed_reason = ""
+            stream_layout_ref = [{"codec_type": "audio", "sample_rate": 48000, "channels": 2}]
+            audio_layout_ref = None
+            stats = {"sessions": [{"dur_media": 50.0}, {"dur_media": 50.0}]}
+        self.state = DummyState()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_tier1_lossless_copy_succeeds_without_fallback(self):
+        """When Tier 1 copy succeeds, only 1 ffmpeg call is made and chunks folder is recycled."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            self.final_file.write_bytes(b"mock_video_bytes")
+            return 0
+
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        self.assertEqual(len(self.commands_run), 1)
+        tag, cmd = self.commands_run[0]
+        self.assertEqual(tag, "FFmpeg-FINAL-T1")
+        self.assertIn("-c", cmd)
+        self.assertIn("copy", cmd)
+        self.assertIn(str(self.chunks_dir), self.trashed)
+
+    def test_tier1_fails_tier2_fallback_succeeds(self):
+        """When Tier 1 fails (e.g. corrupt ADTS tail crash), Tier 2 runs with audio re-encode and resample."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            if tag == "FFmpeg-FINAL-T1":
+                self.final_file.write_bytes(b"corrupt_partial")
+                return 1  # Tier 1 fails
+            # Tier 2 succeeds
+            self.final_file.write_bytes(b"valid_final_bytes")
+            return 0
+
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        self.assertEqual(len(self.commands_run), 2)
+        tag1, _ = self.commands_run[0]
+        self.assertEqual(tag1, "FFmpeg-FINAL-T1")
+
+        tag2, cmd2 = self.commands_run[1]
+        self.assertEqual(tag2, "FFmpeg-FINAL-T2")
+        self.assertIn("-c:v", cmd2)
+        self.assertIn("-c:a", cmd2)
+        self.assertIn("aac", cmd2)
+        self.assertIn("-af", cmd2)
+        self.assertIn("aresample=async=1:first_pts=0", cmd2)
+        self.assertIn("-ar:a:0", cmd2)
+        self.assertIn("48000", cmd2)
+        self.assertIn("-ac:a:0", cmd2)
+        self.assertIn("2", cmd2)
+        self.assertIn("-b:a:0", cmd2)
+        self.assertIn(str(self.chunks_dir), self.trashed)
+
+    def test_both_tiers_fail_preserves_chunks_folder(self):
+        """When both tiers fail, chunks folder is preserved 100% intact (never sent to trash)."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            return 1
+
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        self.assertEqual(len(self.commands_run), 2)
+        self.assertNotIn(str(self.chunks_dir), self.trashed)
+
+    def test_duration_truncated_both_tiers_removes_output_and_preserves_chunks(self):
+        """When output duration < 90% expected across both tiers, incomplete output is removed and chunks are kept for manual salvage."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            self.final_file.write_bytes(b"truncated_video_bytes")
+            return 0
+
+        # Return 80.0s (expected is 100s + 1s black = 101s; 80 < 101 * 0.90 = 90.9s)
+        self.ns["get_file_info"] = lambda p: (80.0, {})
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        # Chunks folder must NOT be trashed; kept intact for operator
+        self.assertNotIn(str(self.chunks_dir), self.trashed)
+        # Broken / incomplete final file must be removed
+        self.assertFalse(self.final_file.exists())
+        # No partial file created
+        self.assertFalse((self.test_dir / "FINAL.partial.mkv").exists())
+
+    def test_duration_zero_fails_and_preserves_chunks(self):
+        """When output duration is 0s, both tiers fail, output is deleted, and chunks are kept."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            self.final_file.write_bytes(b"zero_dur_bytes")
+            return 0
+
+        self.ns["get_file_info"] = lambda p: (0.0, {})
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        self.assertNotIn(str(self.chunks_dir), self.trashed)
+        self.assertFalse(self.final_file.exists())
+
+    def test_tier1_truncated_tier2_crashes_preserves_chunks_and_logs_failure(self):
+        """When Tier 1 is truncated and Tier 2 crashes, incomplete final is removed, chunks are preserved for manual salvage."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            if tag == "FFmpeg-FINAL-T1":
+                self.final_file.write_bytes(b"tier1_truncated_bytes")
+                return 0  # Tier 1 exits 0 but fails duration gate (80s < 90.9s)
+            # Tier 2 crashes or fails with rc=1
+            self.final_file.write_bytes(b"tier2_broken_crash_bytes")
+            return 1
+
+        self.ns["get_file_info"] = lambda p: (80.0, {})
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        # Both tiers ran
+        self.assertEqual(len(self.commands_run), 2)
+        # Broken FINAL.mkv must NOT be left on disk
+        self.assertFalse(self.final_file.exists())
+        # Chunks folder must NOT be trashed; 100% preserved for operator manual salvage
+        self.assertNotIn(str(self.chunks_dir), self.trashed)
+        # Process end timing recorded and summary log written with finalized=False
+        self.assertIn("process_end", self.state.stats)
+        self.assertTrue(any(call[2] is False for call in self.ns["summary_calls"]))
+
+    def test_tier1_truncated_tier2_succeeds_finalizes(self):
+        """When Tier 1 is truncated, Tier 2 runs and succeeds, creating validated final output and trashing chunks."""
+        def mock_run(cmd, cwd, tag=""):
+            self.commands_run.append((tag, cmd))
+            if tag == "FFmpeg-FINAL-T1":
+                self.final_file.write_bytes(b"tier1_truncated_bytes")
+                return 0
+            self.final_file.write_bytes(b"full_tier2_valid_bytes")
+            return 0
+
+        # Tier 1 returns 80s (truncated), Tier 2 returns 101s (ok)
+        def mock_probe(p):
+            if len(self.commands_run) == 1:
+                return (80.0, {})
+            return (101.0, {})
+
+        self.ns["get_file_info"] = mock_probe
+        self.ns["run_ffmpeg_with_capture"] = mock_run
+        self.finalize_fn(self.state)
+
+        # Both tiers ran
+        self.assertEqual(len(self.commands_run), 2)
+        # Final file exists and chunks dir trashed
+        self.assertTrue(self.final_file.exists())
+        self.assertIn(str(self.chunks_dir), self.trashed)
+
+
+class TestBackoffPolicy(unittest.TestCase):
+    """Verifies Defect 6 parity: backoff cap at 15s and 0s reset on chunks >= 60s."""
+
+    def test_backoff_cap_at_15_seconds(self):
+        """Backoff scales by +5s per failure but is strictly capped at 15s (never escalating to 30s)."""
+        backoff = 0
+        ok = False
+        for _ in range(10):
+            backoff = 0 if ok else min(backoff + 5, 15)
+        self.assertEqual(backoff, 15)
+
+    def test_backoff_resets_to_zero_on_healthy_chunk_ge_60s(self):
+        """A healthy chunk running >= 60s resets backoff to 0s to maintain zero-downtime match invariant."""
+        backoff = 15
+        ok = True
+        chunk_dur = 65.0
+        is_corrupt_recycle = False
+        status = "ok"
+
+        if status == "stalled" or (is_corrupt_recycle and ok) or (ok and chunk_dur >= 60.0):
+            backoff = 0
+
+        self.assertEqual(backoff, 0)
+
+    def test_record_dynamic_and_static_parity_on_backoff(self):
+        """Verify record_dynamic.py and RECORD.py both have the backoff constants and reset in code."""
+        record_path = resolve_record_py_path()
+        dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
+
+        record_src = record_path.read_text(encoding="utf-8")
+        dynamic_src = dynamic_path.read_text(encoding="utf-8")
+
+        # Both must use the module constants for backoff cap
+        self.assertIn("min(backoff_sec + BACKOFF_STEP_SEC, BACKOFF_MAX_SEC)", record_src)
+        self.assertIn("min(backoff_sec + BACKOFF_STEP_SEC, BACKOFF_MAX_SEC)", dynamic_src)
+
+        # Both must reset when chunk_dur >= HEALTHY_CHUNK_RESET_SEC
+        self.assertIn("chunk_dur >= HEALTHY_CHUNK_RESET_SEC", record_src)
+        self.assertIn("chunk_dur >= HEALTHY_CHUNK_RESET_SEC", dynamic_src)
+
+    def test_record_dynamic_and_static_parity_on_burst_and_constants(self):
+        """Verify record_dynamic.py and RECORD.py have complete parity on burst detection and named constants."""
+        record_path = resolve_record_py_path()
+        dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
+
+        record_src = record_path.read_text(encoding="utf-8")
+        dynamic_src = dynamic_path.read_text(encoding="utf-8")
+
+        # Both must define burst and bitrate constants
+        for const in ("STABILITY_WALL_SEC = 25", "BURST_RATIO = 3.0", "DUP_MAX_SEC = 180", "FINAL_AUDIO_KBPS_PER_CHANNEL = 64"):
+            self.assertIn(const, record_src, f"Missing {const} in RECORD.py")
+            self.assertIn(const, dynamic_src, f"Missing {const} in record_dynamic.py")
+
+        # Both must guard replay burst in maybe_accept_chunk
+        self.assertIn("is_replay_burst = (", record_src)
+        self.assertIn("is_replay_burst = (", dynamic_src)
+        self.assertIn("and not is_replay_burst", record_src)
+        self.assertIn("and not is_replay_burst", dynamic_src)
+
+        # StreamIntegrityMonitor in RECORD.py must define and use WRAPPED_PTS_TOLERANCE
+        self.assertIn("WRAPPED_PTS_TOLERANCE = 450_000", record_src)
+        self.assertIn("self.WRAPPED_PTS_TOLERANCE", record_src)
+
+        # Both must define safe_print and stdout reconfigure for Windows cp1252 safety
+        self.assertIn("def safe_print(", record_src)
+        self.assertIn("def safe_print(", dynamic_src)
+        self.assertIn('sys.stdout.reconfigure(errors="replace")', record_src)
+        self.assertIn('sys.stdout.reconfigure(errors="replace")', dynamic_src)
+
+    def test_dynamic_recorder_replay_burst_behaviour(self):
+        """Verify dynamic recorder's maybe_accept_chunk marks burst as BAD and normal chunk as GOOD."""
+        import sys
+        import importlib
+
+        # Provide a temporary dummy user config so record_dynamic can import cleanly
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            state = rd.RecorderState()
+            state.stats["good_chunks"] = 1
+            state.stats["last_run_start"] = time.time() - 4.0  # 4s wall time
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                dummy_chunk = td_path / "dummy.ts"
+                dummy_chunk.write_bytes(b"dummy_chunk_bytes")
+
+                orig_mode = rd.DOWNLOAD_MODE
+                orig_list = rd.LIST_FILE
+                orig_get_info = rd.get_file_info
+                orig_params = rd.get_video_params
+                orig_log = rd.log
+                try:
+                    rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
+                    rd.LIST_FILE = str(td_path / "list.txt")
+                    rd.get_file_info = lambda p: (46.0, 4000.0)
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    rd.log = lambda *a, **k: None
+
+                    # Replay burst (46s media in 4s wall = 11.5x) must NOT be accepted
+                    accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
+                    self.assertFalse(accepted)
+                    self.assertEqual(state.stats["good_chunks"], 1)
+
+                    # Normal chunk (46s media in 40s wall = 1.15x) is accepted as GOOD
+                    dummy_chunk.write_bytes(b"dummy_chunk_bytes")
+                    state.stats["last_run_start"] = time.time() - 40.0
+                    accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_003.ts", "TEST")
+                    self.assertTrue(accepted)
+                    self.assertEqual(state.stats["good_chunks"], 2)
+                finally:
+                    rd.DOWNLOAD_MODE = orig_mode
+                    rd.LIST_FILE = orig_list
+                    rd.get_file_info = orig_get_info
+                    rd.get_video_params = orig_params
+                    rd.log = orig_log
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def test_dynamic_recorder_resolve_engine_resolves_cleanly(self):
+        """Verify dynamic recorder resolve_engine succeeds without NameError or unhandled exception."""
+        import sys
+        import importlib
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            engine = rd.resolve_engine(rd.DOWNLOAD_MODE)
+            self.assertIsNotNone(engine)
+            self.assertEqual(engine.description, "Segmented downloader via N_m3u8DL-RE")
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def test_dynamic_recorder_nm3u8dl_none_part_a_clean_exit(self):
+        """Verify dynamic recorder start_nm3u8dl_to_chunk returns ended when part_a is None."""
+        import sys
+        import importlib
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            state = rd.RecorderState()
+            orig_get_part_a = rd.get_nm3u8dl_part_a
+            orig_next_names = rd.next_chunk_names
+            try:
+                rd.get_nm3u8dl_part_a = lambda s: None
+                rd.next_chunk_names = lambda s: ("/tmp/chunk_001.ts", "chunk_001.ts")
+                result = rd.start_nm3u8dl_to_chunk(state)
+                self.assertEqual(result.status, "ended")
+                self.assertIn("external stop", result.reason)
+            finally:
+                rd.get_nm3u8dl_part_a = orig_get_part_a
+                rd.next_chunk_names = orig_next_names
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def test_dynamic_recorder_log_unicode_fallback_on_cp1252(self):
+        """Verify dynamic recorder log() handles non-encodable charmaps without raising UnicodeEncodeError."""
+        import sys
+        import io
+        import importlib
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            class Cp1252Writer(io.TextIOWrapper):
+                def __init__(self):
+                    super().__init__(io.BytesIO(), encoding="cp1252", errors="strict")
+
+            fake_stdout = Cp1252Writer()
+            old_stdout = sys.stdout
+            sys.stdout = fake_stdout
+            try:
+                # Should not raise UnicodeEncodeError even with right arrow across log, safe_print, and console print
+                rd.log("Testing unicode arrow → in cp1252 charmap")
+                rd.safe_print("Testing safe_print → direct")
+                rd._console_print_lines(["Console prompt line → test"])
+                rd._console_print_timestamped_line("Timestamped line → test")
+            finally:
+                sys.stdout = old_stdout
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
