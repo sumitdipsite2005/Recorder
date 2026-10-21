@@ -634,6 +634,60 @@ class TestStreamIntegrityMonitorTwoTier(unittest.TestCase):
             self.assertTrue(mon.incident_active)
             self.assertEqual(self.state.ffmpeg_stream_corrupt_nonfatal_incidents, 0)
 
+    def test_16_startup_wrapped_negative_dts_ignored(self):
+        """Verifies startup wrapped negative DTS (2^33 - 1160) within 10s grace is ignored as benign."""
+        t = [30000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "1", "total_size": "50000", "out_time_us": "40000"})
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=2440, dts=8589933432, size=71750")
+            mon.evaluate_health()
+            self.assertFalse(mon.container_defect)
+            self.assertFalse(mon.transport_defect)
+            self.assertFalse(mon.recycle_requested)
+
+    def test_17_post_startup_or_real_dts_inversion_latches_container_defect(self):
+        """Verifies real DTS inversion (dts < wrapped floor) latches container defect immediately."""
+        t = [31000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "1", "total_size": "50000", "out_time_us": "40000"})
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=2440, dts=500000, size=71750")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+            self.assertIn("Protocol DTS > PTS Timestamp Inversion", mon.last_container_error_msg)
+
+    def test_18_solo_same_sign_timeline_tear_is_tier1_not_fatal(self):
+        """Verifies solo large discontinuity (e.g. -3540021667) without corroboration is Tier 1, not fatal."""
+        t = [32000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "5000", "total_size": "50000000", "out_time_us": "100000000"})
+            mon.process_stderr_line("[vist#0:0/h264] timestamp discontinuity (stream id=256): -3540021667, new offset= 3540021667")
+            mon.evaluate_health()
+            self.assertTrue(mon.transport_defect)
+            self.assertFalse(mon.container_defect)
+            self.assertFalse(mon.recycle_requested)
+
+    def test_19_burst_speed_chunk_under_30s_wall_not_mature(self):
+        """Verifies 46s media delivered in 4s wall-clock time does not fast-seal because it is not mature."""
+        t = [33000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            # 46 seconds of media delivered at t = 4s wall time
+            t[0] += 4.0
+            mon.process_progress({"frame": "2300", "total_size": "38000000", "out_time_us": "46122667"})
+            # Real container defect injected
+            mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=2440, dts=500000, size=71750")
+            mon.evaluate_health()
+            self.assertTrue(mon.container_defect)
+
+            # Advance past 2s coalesce window to t = 6.5s wall time
+            t[0] += 2.5
+            mon.evaluate_health()
+            # Fast-seal must NOT trigger because wall-clock time (6.5s) < 30.0s and media < 180s
+            self.assertFalse(mon.recycle_requested)
+
 
 class TestStreamCorruptRollingWindow(unittest.TestCase):
     """Rolling 30-minute fatal-cut window, escalation siren, ack and re-arm."""
