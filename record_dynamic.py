@@ -17361,15 +17361,6 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
         chunk_name_without_ext = chunk_name.replace('.ts', '')
         nm3u8dl_part_a = get_nm3u8dl_part_a(state)
 
-        if not (nm3u8dl_part_a or "").strip():
-            log("ERROR: NM3U8DL_PART_A is empty in config! Cannot launch N_m3u8DL-RE.", level="ERROR")
-            return EngineResult(
-                status="fatal_misconfig",
-                reason="NM3U8DL_PART_A is empty in user config",
-                chunk_path=None,
-                chunk_name=None,
-            )
-
         if nm3u8dl_part_a is None:
             return EngineResult(
                 status="ended",
@@ -19433,20 +19424,6 @@ def resolve_engine(mode: str) -> Optional[RecorderEngine]:
     engine = registry.get(mode)
     if not engine:
         log(f"Unknown download mode '{mode}' → exiting.")
-        sys.exit(1)
-
-    if mode == ENGINE_NM3U8DL and not (NM3U8DL_PART_A or "").strip():
-        log("ERROR: DOWNLOAD_MODE is set to 'N_m3u8DL-RE', but NM3U8DL_PART_A is empty in user config!", level="ERROR")
-        log("Please configure NM3U8DL_PART_A in user config (e.g. NM3U8DL_PART_A = 'N_m3u8DL-RE \"<STREAM_URL>\"')", level="ERROR")
-        sys.exit(1)
-    if mode == ENGINE_FFMPEG and not (LIVE_URL or "").strip():
-        log("ERROR: DOWNLOAD_MODE is set to 'ffmpeg', but LIVE_URL is empty in user config!", level="ERROR")
-        sys.exit(1)
-    if mode == ENGINE_YTDLP and not (YTDLP_PART_A or "").strip():
-        log("ERROR: DOWNLOAD_MODE is set to 'yt-dlp', but YTDLP_PART_A is empty in user config!", level="ERROR")
-        sys.exit(1)
-    if mode == ENGINE_STREAMLINK and not (STREAMLINK_PART_A or "").strip():
-        log("ERROR: DOWNLOAD_MODE is set to 'streamlink', but STREAMLINK_PART_A is empty in user config!", level="ERROR")
         sys.exit(1)
     return engine
 

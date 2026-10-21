@@ -1271,6 +1271,97 @@ class TestBackoffPolicy(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_dynamic_recorder_resolve_engine_resolves_cleanly(self):
+        """Verify dynamic recorder resolve_engine succeeds without NameError or unhandled exception."""
+        import sys
+        import importlib
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            engine = rd.resolve_engine(rd.DOWNLOAD_MODE)
+            self.assertIsNotNone(engine)
+            self.assertEqual(engine.description, "Segmented downloader via N_m3u8DL-RE")
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def test_dynamic_recorder_nm3u8dl_none_part_a_clean_exit(self):
+        """Verify dynamic recorder start_nm3u8dl_to_chunk returns ended when part_a is None."""
+        import sys
+        import importlib
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            state = rd.RecorderState()
+            orig_get_part_a = rd.get_nm3u8dl_part_a
+            orig_next_names = rd.next_chunk_names
+            try:
+                rd.get_nm3u8dl_part_a = lambda s: None
+                rd.next_chunk_names = lambda s: ("/tmp/chunk_001.ts", "chunk_001.ts")
+                result = rd.start_nm3u8dl_to_chunk(state)
+                self.assertEqual(result.status, "ended")
+                self.assertIn("external stop", result.reason)
+            finally:
+                rd.get_nm3u8dl_part_a = orig_get_part_a
+                rd.next_chunk_names = orig_next_names
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()
