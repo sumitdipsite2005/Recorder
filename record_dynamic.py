@@ -19014,27 +19014,70 @@ def finalize_recording(state: RecorderState):
 
     # Decide whether we can avoid re-encoding
     if state.same_params:
-        log(f"All GOOD chunks {state.best_w}x{state.best_h}@{state.best_fps}fps → fast concat (no re-encode) → {FINAL_FILE}")
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            
-            "-nostats",           
-            "-progress", "pipe:2",
-            "-stats_period", str(FFMPEG_PROGRESS_PERIOD), 
-    
-            "-i", os.path.basename(LIST_FILE),
-            
-            # Keep all video + all audio streams from the concatenated input
-            "-map", "0:v",
-            "-map", "0:a?",
-         
-    
-            "-c", "copy",
-            os.path.join("..", FINAL_FILE),
-        ]
+        def _build_final_cmd(tier: int) -> list:
+            base = ["ffmpeg", "-y"]
+            if tier == 2:
+                base += ["-err_detect", "ignore_err", "-fflags", "+genpts+discardcorrupt"]
+            base += [
+                "-f", "concat",
+                "-safe", "0",
+                "-nostats",
+                "-progress", "pipe:2",
+                "-stats_period", str(FFMPEG_PROGRESS_PERIOD),
+                "-i", os.path.basename(LIST_FILE),
+                "-map", "0:v",
+                "-map", "0:a?",
+            ]
+            if tier == 1:
+                base += ["-c", "copy"]
+            else:
+                base += [
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-af", "aresample=async=1:first_pts=0",
+                ]
+                audio_meta = next((s for s in (state.stream_layout_ref or []) if s.get("codec_type") == "audio"), None)
+                if not audio_meta and state.audio_layout_ref:
+                    audio_meta = state.audio_layout_ref[0]
+                if audio_meta:
+                    if audio_meta.get("sample_rate"):
+                        base += ["-ar", str(audio_meta["sample_rate"])]
+                    if audio_meta.get("channels"):
+                        base += ["-ac", str(audio_meta["channels"])]
+            return base + [os.path.join("..", FINAL_FILE)]
+
+        def _validate_final_output() -> tuple[bool, str]:
+            if not os.path.exists(FINAL_FILE) or os.path.getsize(FINAL_FILE) <= 0:
+                return False, "missing or 0-byte output file"
+            dur, _ = get_file_info(FINAL_FILE)
+            if dur <= 0:
+                return False, "invalid media duration (0s)"
+            sessions = state.stats.get("sessions", [])
+            expected = sum(s.get("dur_media", 0.0) for s in sessions) + BLACK_LEN * max(0, len(sessions) - 1)
+            if expected > 0 and dur < (expected * 0.90):
+                return False, f"duration truncated ({dur:.1f}s vs expected {expected:.1f}s)"
+            return True, ""
+
+        rc = 1
+        for tier in (1, 2):
+            tier_desc = "Tier 1 (lossless fast copy)" if tier == 1 else "Tier 2 fallback (lossless video + audio resample/re-encode)"
+            log(f"FINALIZE {tier_desc} → {FINAL_FILE}")
+            rc = run_ffmpeg_with_capture(_build_final_cmd(tier), CHUNKS_DIR, tag=f"FFmpeg-FINAL-T{tier}")
+            ok, why = _validate_final_output() if rc == 0 else (False, f"ffmpeg exit code {rc}")
+            if rc == 0 and ok:
+                break
+            log(f"FINALIZE Tier {tier} failed: {why}", level="WARN")
+            if os.path.exists(FINAL_FILE):
+                try:
+                    os.remove(FINAL_FILE)
+                except OSError as e:
+                    log(f"Could not remove incomplete {FINAL_FILE}: {e}", level="WARN")
+            rc = rc or 1
+
+        if rc != 0:
+            log("FINALIZATION FAILED (both tiers) → FFmpeg could not create final MKV; keeping chunks folder for inspection.", level="ERROR")
+            return
     else:
         log("Mixed params → NOT auto-finalizing. Leaving chunks folder for manual analysis.")
         
@@ -19052,36 +19095,8 @@ def finalize_recording(state: RecorderState):
 
         write_summary_log(state, est_final_dur, finalized=False)
         return
-        # commenting out the below for now. I want to manually handle mixed param cases.
-        #log(f"Mixed params → re-encoding to {state.best_w}x{state.best_h}@{state.best_fps}fps → {FINAL_FILE}")
-        #cmd = [
-        #    "ffmpeg",
-        #    "-y",
-        #    "-f", "concat",
-        #    "-safe", "0",
-        #    "-i", "list.txt",
-        #    "-vf", f"scale={state.best_w}:{state.best_h},fps={state.best_fps}",
-        #    "-c:v", "libx264",
-        #    "-preset", "veryfast",
-        #    "-c:a", "aac",
-        #    "-b:a", "128k",
-        #   os.path.join("..", FINAL_FILE),
-        #]
-    # proc = subprocess.run(cmd, cwd=CHUNKS_DIR)
-    rc = run_ffmpeg_with_capture(cmd, CHUNKS_DIR, tag="FFmpeg-FINAL")
-    if rc != 0:
-        log("FINALIZATION FAILED → FFmpeg could not create final MKV; keeping chunks folder for inspection.")
-        return
-        
-    if not os.path.exists(FINAL_FILE):
-        log("FINAL FILE MISSING after concat → keeping chunks.")
-        return
 
     final_size = os.path.getsize(FINAL_FILE)
-    if final_size <= 0:
-        log("FINAL FILE SIZE 0 → keeping chunks.")
-        return
-
     state.stats["process_end"] = time.time()
     dur, _ = get_file_info(FINAL_FILE)
     if dur <= 0:
