@@ -1197,6 +1197,12 @@ class TestBackoffPolicy(unittest.TestCase):
         self.assertIn("WRAPPED_PTS_TOLERANCE = 450_000", record_src)
         self.assertIn("self.WRAPPED_PTS_TOLERANCE", record_src)
 
+        # Both must define safe_print and stdout reconfigure for Windows cp1252 safety
+        self.assertIn("def safe_print(", record_src)
+        self.assertIn("def safe_print(", dynamic_src)
+        self.assertIn('sys.stdout.reconfigure(errors="replace")', record_src)
+        self.assertIn('sys.stdout.reconfigure(errors="replace")', dynamic_src)
+
     def test_dynamic_recorder_replay_burst_behaviour(self):
         """Verify dynamic recorder's maybe_accept_chunk marks burst as BAD and normal chunk as GOOD."""
         import sys
@@ -1402,8 +1408,11 @@ class TestBackoffPolicy(unittest.TestCase):
             old_stdout = sys.stdout
             sys.stdout = fake_stdout
             try:
-                # Should not raise UnicodeEncodeError even with right arrow
+                # Should not raise UnicodeEncodeError even with right arrow across log, safe_print, and console print
                 rd.log("Testing unicode arrow → in cp1252 charmap")
+                rd.safe_print("Testing safe_print → direct")
+                rd._console_print_lines(["Console prompt line → test"])
+                rd._console_print_timestamped_line("Timestamped line → test")
             finally:
                 sys.stdout = old_stdout
         finally:

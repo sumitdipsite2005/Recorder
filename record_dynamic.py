@@ -25,6 +25,16 @@ import time
 import os
 import signal
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
 import json
 import runpy
 import base64
@@ -799,6 +809,24 @@ TERMINAL_LAST_OUTPUT_WAS_BLANK = False
 TERMINAL_ACTIVITY_LOCAL = threading.local()
 
 
+def safe_print(*args, **kwargs):
+    """Safely print to stdout/stderr, replacing unencodable characters on legacy charmap consoles."""
+    try:
+        print(*args, **kwargs)
+    except (UnicodeEncodeError, LookupError):
+        stream = kwargs.get("file") or sys.stdout
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        sep = kwargs.get("sep", " ")
+        text = sep.join(str(a) for a in args)
+        safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        new_kwargs = dict(kwargs)
+        new_kwargs.pop("sep", None)
+        try:
+            print(safe_text, **new_kwargs)
+        except Exception:
+            pass
+
+
 def set_progress_line_active(active: bool, text: Optional[str] = None):
     global PROGRESS_LINE_ACTIVE, PROGRESS_LINE_TEXT
     with PROGRESS_LINE_LOCK:
@@ -913,7 +941,7 @@ def _prepare_terminal_activity(
             separator = (
                 f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [INFO]"
             )
-            print(separator)
+            safe_print(separator)
             termcap_write(separator)
             TERMINAL_LAST_OUTPUT_WAS_BLANK = True
 
@@ -1638,12 +1666,7 @@ def log(*args, level="INFO", **print_kwargs):
             return
 
         clear_progress_line()
-        try:
-            print(terminal_line, **print_kwargs)
-        except UnicodeEncodeError:
-            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
-            safe_text = terminal_line.encode(encoding, errors="replace").decode(encoding)
-            print(safe_text, **print_kwargs)
+        safe_print(terminal_line, **print_kwargs)
         termcap_write(line)
         TERMINAL_LAST_OUTPUT_WAS_BLANK = output_is_blank
 
@@ -3065,7 +3088,7 @@ def _console_print_lines(lines, color: Optional[str] = None, colored_indexes=Non
         for idx, line in enumerate(lines):
             text = str(line)
             use_color = color is not None and (colored_indexes is None or idx in colored_indexes)
-            print(_console_color(text, color) if use_color else text)
+            safe_print(_console_color(text, color) if use_color else text)
             termcap_write(text)
             TERMINAL_LAST_OUTPUT_WAS_BLANK = (text == "")
 
@@ -3076,7 +3099,7 @@ def _console_print_timestamped_line(message: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     plain = f"{ts} [INFO] {message}"
     with CONSOLE_OUTPUT_LOCK:
-        print(colorize_terminal_log_line(plain))
+        safe_print(colorize_terminal_log_line(plain))
         termcap_write(plain)
         TERMINAL_LAST_OUTPUT_WAS_BLANK = (str(message) == "")
 
@@ -3089,7 +3112,7 @@ def _print_runtime_controls_reminder():
         clear_progress_line()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         plain = f"{ts} [INFO] Press I for recording information & controls"
-        print(colorize_terminal_log_line(plain))
+        safe_print(colorize_terminal_log_line(plain))
         termcap_write(plain)
 
 
@@ -3165,12 +3188,7 @@ def _flush_deferred_terminal_lines_locked():
         if output_is_blank and TERMINAL_LAST_OUTPUT_WAS_BLANK:
             continue
 
-        try:
-            print(line)
-        except UnicodeEncodeError:
-            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
-            safe_text = line.encode(encoding, errors="replace").decode(encoding)
-            print(safe_text)
+        safe_print(line)
         TERMINAL_LAST_OUTPUT_WAS_BLANK = output_is_blank
 
 
@@ -16419,18 +16437,18 @@ def monitor_nm3u8dl_playlist_renewal(
 def print_nm3u8dl_playlist_source_diagnostic():
     source = resolve_nm3u8dl_playlist_source()
 
-    print("")
-    print("=== N_m3u8DL PLAYLIST RESOLUTION TEST ===")
-    print(f'EXTINF: {source["extinf"]}')
-    print(f'Stream URL: {source["stream_url"]}')
-    print(f'Headers: {source["headers"]}')
-    print(f'Keys: {source["keys"]}')
+    safe_print("")
+    safe_print("=== N_m3u8DL PLAYLIST RESOLUTION TEST ===")
+    safe_print(f'EXTINF: {source["extinf"]}')
+    safe_print(f'Stream URL: {source["stream_url"]}')
+    safe_print(f'Headers: {source["headers"]}')
+    safe_print(f'Keys: {source["keys"]}')
     source_quality = format_nm3u8dl_candidate_quality(source)
     if _nm3u8dl_has_quality_evidence(source):
-        print(f'Quality: {source_quality}')
-    print(f'Expiry: {source["expiry"]}')
-    print("========================================")
-    print("")
+        safe_print(f'Quality: {source_quality}')
+    safe_print(f'Expiry: {source["expiry"]}')
+    safe_print("========================================")
+    safe_print("")
     
 def _nm3u8dl_stream_url_from_part_a() -> str:
     match = re.search(r'"(https?://[^"]+)"', NM3U8DL_PART_A)
@@ -19126,7 +19144,8 @@ def finalize_recording(state: RecorderState):
                     os.remove(FINAL_FILE)
                 except OSError as e:
                     log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
-            log("FINALIZATION FAILED (both tiers) → FFmpeg could not create validated final MKV; keeping chunks folder for inspection.", level="ERROR")
+            err_suffix = f" (last failure: {last_failure_reason})" if last_failure_reason else ""
+            log(f"FINALIZATION FAILED (both tiers{err_suffix}) → FFmpeg could not create validated final MKV; keeping chunks folder for inspection.", level="ERROR")
             state.stats["process_end"] = time.time()
             black_len = BLACK_LEN
             sessions = state.stats.get("sessions", [])
