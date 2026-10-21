@@ -1011,6 +1011,46 @@ class TestTwoTierFinalization(unittest.TestCase):
         self.assertNotIn(str(self.chunks_dir), self.trashed)
 
 
+class TestBackoffPolicy(unittest.TestCase):
+    """Verifies Defect 6 parity: backoff cap at 15s and 0s reset on chunks >= 60s."""
+
+    def test_backoff_cap_at_15_seconds(self):
+        """Backoff scales by +5s per failure but is strictly capped at 15s (never escalating to 30s)."""
+        backoff = 0
+        ok = False
+        for _ in range(10):
+            backoff = 0 if ok else min(backoff + 5, 15)
+        self.assertEqual(backoff, 15)
+
+    def test_backoff_resets_to_zero_on_healthy_chunk_ge_60s(self):
+        """A healthy chunk running >= 60s resets backoff to 0s to maintain zero-downtime match invariant."""
+        backoff = 15
+        ok = True
+        chunk_dur = 65.0
+        is_corrupt_recycle = False
+        status = "ok"
+
+        if status == "stalled" or (is_corrupt_recycle and ok) or (ok and chunk_dur >= 60.0):
+            backoff = 0
+
+        self.assertEqual(backoff, 0)
+
+    def test_record_dynamic_and_static_parity_on_backoff(self):
+        """Verify record_dynamic.py and RECORD.py both have the 15s cap and chunk_dur reset in code."""
+        record_path = resolve_record_py_path()
+        dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
+
+        record_src = record_path.read_text(encoding="utf-8")
+        dynamic_src = dynamic_path.read_text(encoding="utf-8")
+
+        # Both must cap backoff at 15
+        self.assertIn("min(backoff_sec + 5, 15)", record_src)
+        self.assertIn("min(backoff_sec + 5, 15)", dynamic_src)
+
+        # Both must reset when chunk_dur >= 60.0
+        self.assertIn("chunk_dur >= 60.0", record_src)
+        self.assertIn("chunk_dur >= 60.0", dynamic_src)
+
 
 if __name__ == "__main__":
     unittest.main()

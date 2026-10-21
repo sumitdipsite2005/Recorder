@@ -18797,9 +18797,17 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         backoff_sec = DEFAULT_MIN_BACKOFF
     else:
         if result.status != "no_stream":
-            backoff_sec = DEFAULT_MIN_BACKOFF if ok else min(backoff_sec + 5, DEFAULT_MAX_BACKOFF)
+            backoff_sec = DEFAULT_MIN_BACKOFF if ok else min(backoff_sec + 5, 15)
 
-    if result.status == "stalled":
+    is_corrupt_recycle = (
+        result.status == "stream_corrupt_recycle"
+        or "stream corruption" in str(result.reason or "").lower()
+    )
+    chunk_dur = 0.0
+    if ok and state.stats.get("sessions"):
+        chunk_dur = float(state.stats["sessions"][-1].get("dur_media", 0.0))
+
+    if result.status == "stalled" or (is_corrupt_recycle and ok) or (ok and chunk_dur >= 60.0):
         backoff_sec = 0
 
     if state.stop_flag:
