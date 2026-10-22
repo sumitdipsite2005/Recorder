@@ -1859,7 +1859,11 @@ class NetworkGuard:
                 val = getattr(st, attr, None)
                 if isinstance(val, str) and val.strip():
                     raw.append(val.strip())
-        urls = [u for s in raw for u in _URL_RE.findall(s)]
+        urls = []
+        for s in raw:
+            found = _URL_RE.findall(s)
+            if found:
+                urls.append(found[0])
         exps = [e for e in (self.extract_stream_expiry(u) for u in urls) if e is not None]
         expiry = min(exps) if exps else None
         return (expiry is not None), expiry
@@ -1901,27 +1905,17 @@ class NetworkGuard:
                 candidate,
             ).strip()
 
-        new_exp = self.extract_stream_expiry(new_url)
-
         def _replace_url_in_cmd(cmd_str: str) -> str:
             if not cmd_str:
                 return cmd_str
             if not is_bare_url and cleaned_cmd:
                 return cleaned_cmd
-            if '"http' in cmd_str:
-                updated = re.sub(r'"https?://[^"]+"', f'"{new_url}"', cmd_str, count=1)
-            elif "'http" in cmd_str:
-                updated = re.sub(r"'https?://[^']+'", f"'{new_url}'", cmd_str, count=1)
-            else:
-                updated = re.sub(r'https?://\S+', new_url, cmd_str, count=1)
-            if new_exp is not None:
-                updated = re.sub(
-                    r'(\b(?:exp|expires|expiry)=)\d+',
-                    rf'\g<1>{new_exp}',
-                    updated,
-                    flags=re.IGNORECASE,
-                )
-            return updated
+            # Replace exactly the first URL (the stream URL), the same one _stream_is_token_governed scans,
+            # so quoted secondary URLs (Referer/Origin headers) can never absorb the replacement.
+            first = _URL_RE.search(cmd_str)
+            if first:
+                return cmd_str[:first.start()] + new_url + cmd_str[first.end():]
+            return cmd_str
 
         if self.state:
             setattr(self.state, "token_clock_override_url", None)
@@ -1970,16 +1964,16 @@ class NetworkGuard:
         tokenised, expiry = self._stream_is_token_governed(url, state=st)
         is_playlist = getattr(st, "source_mode", None) == "playlist"
 
-        # 1. Non-tokenized feeds (and static modes): zero probing, immediate unattended resumption
-        if not tokenised and not is_playlist:
-            return _resume(f"NETWORK_GUARD: No expiring token on stream. Route restored via {network_type}. Resuming unattended recording.")
+        # 1. Non-tokenized feeds or dynamic playlist mode: zero probing, immediate unattended resumption
+        if is_playlist or not tokenised:
+            return _resume(f"NETWORK_GUARD: No hold-eligible token on stream (playlist or untokenised). Route restored via {network_type}. Resuming unattended recording.")
 
-        # 2. Tokenized feeds or playlist mode: probe endpoint first (Option B confirmation probe)
+        # 2. Tokenized feeds: probe endpoint first (Option B confirmation probe)
         ok, status = self._probe_stream_status(url)
+        if not ok and status is None:
+            ok, status = self._probe_stream_status(url)                   # one transport retry, no sleep
         if not ok and status in (400, 405, 406, 416, 501):
             ok, status = self._probe_stream_status(url, use_range=False)  # live feed rejects Range
-        elif not ok and status is None:
-            ok, status = self._probe_stream_status(url)                   # one transport retry, no sleep
 
         if ok:
             if expiry is not None and float(expiry) <= time.time() and st is not None:
@@ -1987,15 +1981,14 @@ class NetworkGuard:
             return _resume(f"NETWORK_GUARD: Stream verified via restored {network_type}. Resuming unattended recording.")
 
         # 3. Divert to Token Hold on explicit auth rejection (401/403) or expired signed link (410 on tokenized feed)
-        # Dynamic playlist feeds are exempt from access-refusal holds to allow fresh manifest fetches (Option A)
-        if not is_playlist and (status in (401, 403) or (status == 410 and tokenised)):
+        if status in (401, 403) or (status == 410 and tokenised):
             return _hold(f"NETWORK_GUARD: Stream authorization rejected (HTTP {status}). Diverting to Token Hold...{geo}")
 
         # 4. If timestamp elapsed during outage and probe confirmed 404 (dead link) on non-playlist feed
-        if not is_playlist and expiry is not None and float(expiry) <= time.time() and status == 404:
+        if expiry is not None and float(expiry) <= time.time() and status == 404:
             return _hold(f"NETWORK_GUARD: Stream token expired during outage. Diverting to Token Hold...{geo}")
 
-        # 5. Inconclusive / non-auth probe failure or playlist refresh needed: resume via engine retry
+        # 5. Inconclusive / non-auth probe failure: resume via engine retry
         return _resume(f"NETWORK_GUARD: Post-restoration probe inconclusive ({status or 'timeout'}). Resuming via recorder retry.")
 
     def _redraw_hold_prompt(self) -> None:
@@ -2026,6 +2019,8 @@ class NetworkGuard:
         and accepts updated URL or command.
         Guarantees cleanup of token_hold_active, escape state, and alarm via try...finally (B1).
         """
+        if self.state:
+            setattr(self.state, "token_clock_override_url", None)
         try:
             return self._token_hold_loop(is_startup)
         finally:

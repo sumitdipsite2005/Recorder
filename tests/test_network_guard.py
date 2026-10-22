@@ -1086,12 +1086,12 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         mock_state.active_command = mock_state.nm3u8dl_part_a
         guard = NetworkGuard(required_country="IN", state=mock_state)
 
-        # Case 1: Pasting a bare URL with a new expiry also updates stale exp= in headers
+        # Case 1: Pasting a bare URL updates stream URLs without corrupting command headers
         bare_new_url = f"https://example.com/new.m3u8?exp={new_exp}"
         guard.update_stream_url(bare_new_url)
         self.assertEqual(mock_state.live_url, bare_new_url)
         self.assertEqual(mock_state.active_stream_url, bare_new_url)
-        self.assertIn(f"hdntl=exp={new_exp}", mock_state.nm3u8dl_part_a)
+        self.assertIn(f'"{bare_new_url}"', mock_state.nm3u8dl_part_a)
         self.assertFalse(guard.is_stream_token_expired(lead_time_sec=60.0))
 
         # Case 2: Pasting a full N_m3u8DL-RE command updates headers/keys and strips --save-name
@@ -1104,6 +1104,29 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         self.assertIn("Authorization: Bearer NEW_TOKEN", mock_state.nm3u8dl_part_a)
         self.assertIn("--key 3333:4444", mock_state.nm3u8dl_part_a)
         self.assertNotIn("--save-name", mock_state.nm3u8dl_part_a)
+    def test_update_stream_url_bare_paste_replaces_first_url_not_quoted_header_url(self):
+        mock_state = MagicMock()
+        old_exp = int(time.time()) - 300
+        new_exp = int(time.time()) + 7200
+        old_url = f"https://example.com/old.m3u8?exp={old_exp}"
+        mock_state.live_url = old_url
+        mock_state.active_stream_url = old_url
+        mock_state.nm3u8dl_part_a = f'N_m3u8DL-RE {old_url} -H "Referer: https://site.example/page"'
+        mock_state.active_command = f'ffmpeg -i {old_url} -headers "Origin: https://site.example"'
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+        self.assertTrue(guard.is_stream_token_expired())
+
+        new_url = f"https://example.com/new.m3u8?exp={new_exp}"
+        guard.update_stream_url(new_url)
+
+        self.assertIn(new_url, mock_state.nm3u8dl_part_a)
+        self.assertNotIn(old_url, mock_state.nm3u8dl_part_a)
+        self.assertIn('"Referer: https://site.example/page"', mock_state.nm3u8dl_part_a)
+        self.assertIn(new_url, mock_state.active_command)
+        self.assertIn('"Origin: https://site.example"', mock_state.active_command)
+        self.assertFalse(guard.is_stream_token_expired())
+
+
 
     def test_handle_token_hold_rejects_expired_candidate_and_propagates_timeout_stop(self):
         mock_state = MagicMock()
@@ -1916,6 +1939,7 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         expired_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 100}"
 
         with patch.object(guard, "get_active_source_url", return_value=expired_url), \
+             patch.object(guard, "_probe_stream_status", return_value=(False, 401)), \
              patch.object(guard, "handle_token_hold_state") as mock_hold:
 
             with patch.object(guard, "is_startup_phase", return_value=True):
@@ -1990,17 +2014,17 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         self.assertEqual(expiry, future_exp)
 
     def test_playlist_mode_exempt_from_stale_timestamp_hold(self):
-        # D2: in playlist mode, stale timestamp from past chunk does not hold if probe passes
+        # D3 (Round 3): in playlist mode, resumes immediately without probing (zero-delay rule)
         mock_state = MagicMock()
         mock_state.source_mode = "playlist"
         mock_state.live_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 3600}"
         guard = NetworkGuard(required_country=None, state=mock_state)
 
-        with patch.object(guard, "_probe_stream_status", return_value=(True, 200)) as mock_probe, \
+        with patch.object(guard, "_probe_stream_status") as mock_probe, \
              patch.object(guard, "handle_token_hold_state") as mock_hold:
             res = guard._verify_and_resume_stream()
             self.assertTrue(res)
-            mock_probe.assert_called_once()
+            mock_probe.assert_not_called()
             mock_hold.assert_not_called()
 
     def test_probe_403_and_410_divert_with_geo_logging(self):
@@ -2074,16 +2098,16 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
             self.assertTrue(res)
             mock_probe.assert_not_called()
 
-        # 2. Playlist mode stream: probes endpoint
+        # 2. Dynamic playlist stream: zero probe, resumes unattended for dynamic manifest refresh (D3)
         mock_state_pl = MagicMock()
         mock_state_pl.source_mode = "playlist"
         mock_state_pl.live_url = "https://example.com/stream.m3u8"
         guard_pl = NetworkGuard(required_country=None, state=mock_state_pl)
 
-        with patch.object(guard_pl, "_probe_stream_status", return_value=(True, 200)) as mock_probe:
+        with patch.object(guard_pl, "_probe_stream_status") as mock_probe:
             res = guard_pl._verify_and_resume_stream()
             self.assertTrue(res)
-            mock_probe.assert_called_once()
+            mock_probe.assert_not_called()
 
     def test_expired_clock_option_b_probe_200_overrides_proactive_gate(self):
         # N1: Expired clock plus probe 200 stamps override and passes proactive chunk gate
