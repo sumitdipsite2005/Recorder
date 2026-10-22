@@ -1138,13 +1138,13 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
     def test_verify_and_resume_stream_propagates_false_on_token_hold_failure(self):
         mock_state = MagicMock()
         mock_state.stop_flag = False
-        mock_state.live_url = "https://example.com/DeadToken.m3u8"
+        mock_state.live_url = f"https://example.com/DeadToken.m3u8?exp={int(time.time()) - 100}"
         guard = NetworkGuard(required_country=None, state=mock_state)
         guard.vpn_mode = "UNRESTRICTED"
         guard.is_armed = False
 
         with patch("recorder_runtime.network.NetworkRouteResolver.is_internet_online", return_value=True), \
-             patch.object(guard, "_probe_stream_url", return_value=False), \
+             patch.object(guard, "_probe_stream_status", return_value=(False, 401)), \
              patch.object(guard, "handle_token_hold_state", return_value=False) as mock_token_hold:
             res = guard.handle_internet_hold_state(is_startup=False)
             self.assertFalse(res)
@@ -1913,9 +1913,9 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
     def test_verify_and_resume_passes_dynamic_startup(self):
         mock_state = MagicMock()
         guard = NetworkGuard(required_country=None, state=mock_state)
+        expired_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 100}"
 
-        with patch.object(guard, "get_active_source_url", return_value="https://example.com/live.m3u8"), \
-             patch.object(guard, "_probe_stream_url", return_value=False), \
+        with patch.object(guard, "get_active_source_url", return_value=expired_url), \
              patch.object(guard, "handle_token_hold_state") as mock_hold:
 
             with patch.object(guard, "is_startup_phase", return_value=True):
@@ -1925,6 +1925,288 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
             with patch.object(guard, "is_startup_phase", return_value=False):
                 guard._verify_and_resume_stream()
                 mock_hold.assert_called_with(is_startup=False)
+
+    def test_probe_url_bool_wrapper_preserved(self):
+        mock_state = MagicMock()
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 403)):
+            res = guard._probe_stream_url("https://example.com/test")
+            self.assertIs(res, False)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(True, 200)):
+            res = guard._probe_stream_url("https://example.com/test")
+            self.assertIs(res, True)
+
+    def test_static_untokenised_ts_resumes_without_probe(self):
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        mock_state.live_url = "http://iptv.server:8080/live/user/pass/12345.ts"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+        guard.resume_callback = MagicMock()
+
+        with patch.object(guard, "_probe_stream_status") as mock_probe, \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_not_called()
+            mock_hold.assert_not_called()
+            guard.resume_callback.assert_called_once_with(mock_state)
+
+    def test_token_expired_timestamp_option_b_probe_confirmation(self):
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 50}"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        # 1. Option B: probe returns 200 (clock drift tolerance) -> resumes without hold
+        with patch.object(guard, "_probe_stream_status", return_value=(True, 200)) as mock_probe, \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_called_once()
+            mock_hold.assert_not_called()
+
+        # 2. Option B: probe returns 401/403/410 -> diverts to hold
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 401)) as mock_probe, \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_called_once()
+            mock_hold.assert_called_once()
+
+    def test_token_governed_scans_all_command_material_fields(self):
+        # D1: token present only in active_command while nm3u8dl_part_a is set
+        mock_state = MagicMock()
+        mock_state.live_url = "https://example.com/base.m3u8"
+        mock_state.nm3u8dl_part_a = "N_m3u8DL-RE --save-name test"
+        future_exp = int(time.time()) + 3600
+        mock_state.active_command = f'ffmpeg -i "https://example.com/base.m3u8?exp={future_exp}"'
+        mock_state.active_stream_url = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        tokenised, expiry = guard._stream_is_token_governed(mock_state.live_url)
+        self.assertTrue(tokenised)
+        self.assertEqual(expiry, future_exp)
+
+    def test_playlist_mode_exempt_from_stale_timestamp_hold(self):
+        # D2: in playlist mode, stale timestamp from past chunk does not hold if probe passes
+        mock_state = MagicMock()
+        mock_state.source_mode = "playlist"
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 3600}"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(True, 200)) as mock_probe, \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_called_once()
+            mock_hold.assert_not_called()
+
+    def test_probe_403_and_410_divert_with_geo_logging(self):
+        # D3 & D4 & N4: HTTP 403 and 410 divert to token hold and log Launch egress & Required country
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        future_exp = int(time.time()) + 3600
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={future_exp}"
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+        guard.launch_country = "IN"
+
+        logged_messages = []
+        guard.log_fn = lambda msg, level="INFO": logged_messages.append((msg, level))
+
+        # Test 403
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 403)), \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            logged_messages.clear()
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_hold.assert_called_once()
+            self.assertTrue(any("HTTP 403" in m[0] and "Launch egress: IN" in m[0] and "Required: IN" in m[0] for m in logged_messages))
+
+        # Test 410 (D4) on tokenized feed
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 410)), \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            logged_messages.clear()
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_hold.assert_called_once()
+            self.assertTrue(any("HTTP 410" in m[0] and "Launch egress: IN" in m[0] for m in logged_messages))
+
+    def test_probe_410_on_untokenised_playlist_resumes_without_hold(self):
+        # D4: 410 on untokenised playlist feed is inconclusive and resumes
+        mock_state = MagicMock()
+        mock_state.source_mode = "playlist"
+        mock_state.live_url = "https://example.com/live.m3u8"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 410)), \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_hold.assert_not_called()
+
+    def test_probe_timeout_416_500_resumes_via_retry(self):
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={int(time.time()) + 3600}"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+        guard.resume_callback = MagicMock()
+
+        for status_code in (None, 416, 400, 500, 503):
+            with patch.object(guard, "_probe_stream_status", return_value=(False, status_code)), \
+                 patch.object(guard, "handle_token_hold_state") as mock_hold:
+                guard.resume_callback.reset_mock()
+                res = guard._verify_and_resume_stream()
+                self.assertTrue(res)
+                mock_hold.assert_not_called()
+                guard.resume_callback.assert_called_once_with(mock_state)
+
+    def test_stream_mode_playlist_probes_while_static_resumes(self):
+        # 1. Static untokenised stream: zero probe, resumes
+        mock_state_static = MagicMock()
+        mock_state_static.source_mode = "static"
+        mock_state_static.live_url = "https://example.com/stream.mkv"
+        guard_static = NetworkGuard(required_country=None, state=mock_state_static)
+
+        with patch.object(guard_static, "_probe_stream_status") as mock_probe:
+            res = guard_static._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_not_called()
+
+        # 2. Playlist mode stream: probes endpoint
+        mock_state_pl = MagicMock()
+        mock_state_pl.source_mode = "playlist"
+        mock_state_pl.live_url = "https://example.com/stream.m3u8"
+        guard_pl = NetworkGuard(required_country=None, state=mock_state_pl)
+
+        with patch.object(guard_pl, "_probe_stream_status", return_value=(True, 200)) as mock_probe:
+            res = guard_pl._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_called_once()
+
+    def test_expired_clock_option_b_probe_200_overrides_proactive_gate(self):
+        # N1: Expired clock plus probe 200 stamps override and passes proactive chunk gate
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        expired_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 100}"
+        mock_state.live_url = expired_url
+        mock_state.active_stream_url = expired_url
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        mock_state.token_clock_override_url = None
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(True, 200)):
+            res = guard._verify_and_resume_stream(mock_state)
+            self.assertTrue(res)
+            self.assertEqual(mock_state.token_clock_override_url, expired_url)
+
+        # Pre-launch gate check must now pass without hold
+        with patch.object(guard, "handle_token_hold_state") as mock_hold:
+            gate_res = guard._proactive_token_gate_check()
+            self.assertTrue(gate_res)
+            mock_hold.assert_not_called()
+
+    def test_expired_clock_probe_416_fallback_without_range_resumes(self):
+        # N2: Range-rejecting stream (416) falls back to Range-less probe and resumes on 200
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        expired_url = f"https://example.com/live.ts?exp={int(time.time()) - 50}"
+        mock_state.live_url = expired_url
+        mock_state.active_stream_url = expired_url
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        def mock_probe(url, timeout=3.0, use_range=True):
+            if use_range:
+                return False, 416
+            return True, 200
+
+        with patch.object(guard, "_probe_stream_status", side_effect=mock_probe), \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream(mock_state)
+            self.assertTrue(res)
+            mock_hold.assert_not_called()
+            self.assertEqual(mock_state.token_clock_override_url, expired_url)
+
+    def test_expired_clock_probe_timeout_resumes_via_retry_without_hold(self):
+        # N2: Expired clock plus post-outage probe timeout falls through to recorder retry (no false hold)
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        expired_url = f"https://example.com/live.ts?exp={int(time.time()) - 50}"
+        mock_state.live_url = expired_url
+        mock_state.active_stream_url = expired_url
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(False, None)), \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream(mock_state)
+            self.assertTrue(res)
+            mock_hold.assert_not_called()
+
+    def test_expired_clock_probe_403_diverts_and_clears_override(self):
+        # N1 & N2: Probe 403 on expired token diverts to hold and clears override
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        expired_url = f"https://example.com/live.ts?exp={int(time.time()) - 50}"
+        mock_state.live_url = expired_url
+        mock_state.active_stream_url = expired_url
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        mock_state.token_clock_override_url = expired_url
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 403)), \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            res = guard._verify_and_resume_stream(mock_state)
+            self.assertTrue(res)
+            mock_hold.assert_called_once()
+            self.assertIsNone(mock_state.token_clock_override_url)
+
+    def test_header_only_exp_ignored_by_token_governed_scan(self):
+        # N5: Numeric exp= inside headers or cookies is ignored; only URLs are scanned
+        mock_state = MagicMock()
+        mock_state.live_url = "https://example.com/feed.ts"
+        mock_state.active_stream_url = "https://example.com/feed.ts"
+        mock_state.nm3u8dl_part_a = 'ffmpeg -headers "Cookie: exp=1730000000" -i "https://example.com/feed.ts"'
+        mock_state.active_command = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        tokenised, expiry = guard._stream_is_token_governed(mock_state.live_url)
+        self.assertFalse(tokenised)
+        self.assertIsNone(expiry)
+
+    def test_playlist_mode_access_refusal_resumes_unattended_for_refresh(self):
+        # N6 Option A: In playlist mode, 401/403 resumes unattended so playlist manager fetches fresh manifest
+        mock_state = MagicMock()
+        mock_state.source_mode = "playlist"
+        mock_state.live_url = "https://example.com/chunklist.m3u8?token=xyz"
+        mock_state.active_stream_url = "https://example.com/chunklist.m3u8?token=xyz"
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        for status_code in (401, 403):
+            with patch.object(guard, "_probe_stream_status", return_value=(False, status_code)), \
+                 patch.object(guard, "handle_token_hold_state") as mock_hold:
+                res = guard._verify_and_resume_stream(mock_state)
+                self.assertTrue(res)
+                mock_hold.assert_not_called()
+
+    def test_update_stream_url_clears_clock_override(self):
+        # N1: Updating stream URL resets token_clock_override_url
+        mock_state = MagicMock()
+        mock_state.live_url = "https://example.com/old.m3u8"
+        mock_state.token_clock_override_url = "https://example.com/old.m3u8"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        guard.update_stream_url("https://example.com/new.m3u8")
+        self.assertIsNone(mock_state.token_clock_override_url)
+        self.assertEqual(mock_state.live_url, "https://example.com/new.m3u8")
 
 
 if __name__ == "__main__":

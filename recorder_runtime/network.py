@@ -41,6 +41,9 @@ TOKEN_HOLD_COUNTDOWN_LOG_SEC = 30.0
 # Terminal output serialization lock (B4)
 _CONSOLE_LOCK = threading.RLock()
 
+# Module-level URL extractor for token discovery across commands and URLs (N5)
+_URL_RE = re.compile(r'https?://[^\s"\']+')
+
 
 def default_log(msg: str, level: str = "INFO", **kwargs) -> None:
     """Fallback console logger when caller does not provide an orchestrator logger."""
@@ -1352,7 +1355,8 @@ class NetworkGuard:
         """Evaluate stream token validity before chunk launch, bypassing dynamic playlist mode."""
         source_mode = getattr(self.state, "source_mode", None)
         if source_mode != "playlist":
-            if self.is_stream_token_expired(lead_time_sec=0.0):
+            if self.is_stream_token_expired(lead_time_sec=0.0) and \
+                    getattr(self.state, "token_clock_override_url", None) != self.get_active_source_url():
                 is_startup = self.is_startup_phase()
                 self.log_fn(
                     "NETWORK_GUARD: Stream authentication token already expired! "
@@ -1776,13 +1780,13 @@ class NetworkGuard:
     def extract_stream_expiry(url_or_cmd: Optional[str]) -> Optional[int]:
         """
         Extract token expiry epoch timestamp from URL or command string.
-        Supports query params: exp, expires, expiry. Normalizes 13-digit ms to seconds.
+        Supports query params: exp, expires, expiry, expire. Normalizes 13-digit ms to seconds.
         """
         if not url_or_cmd:
             return None
         expiries = []
         for match in re.finditer(
-            r'(?:^|[?&~=;])(?:exp|expires|expiry)=(\d+)',
+            r'(?:^|[?&~=;])(?:exp(?:ires?|iry)?)=(\d+)',
             str(url_or_cmd),
             flags=re.IGNORECASE,
         ):
@@ -1798,27 +1802,28 @@ class NetworkGuard:
         Check if the active stream token is already expired (default: no future runway).
         Returns False if no expiry parameter is present.
         """
-        url = self.get_active_source_url() or self.get_active_source_material()
-        expiry = self.extract_stream_expiry(url)
-        if expiry is None:
+        tokenised, expiry = self._stream_is_token_governed(self.get_active_source_url() or "", state=self.state)
+        if not tokenised or expiry is None:
             return False
         return float(expiry) <= (time.time() + lead_time_sec)
 
-    def _probe_stream_url(self, url: str, timeout: float = 3.0) -> bool:
+    def _probe_stream_status(self, url: str, timeout: float = 3.0, use_range: bool = True) -> Tuple[bool, Optional[int]]:
         """
-        Probe stream URL via HTTP GET with Range request.
-        Returns True if HTTP 200/206, False if 401/403/404/410 or connection failure.
+        Probe stream URL via HTTP GET with optional Range request.
+        Returns:
+            (True, status_code) on HTTP 200/206.
+            (False, status_code) on HTTP error (e.g. 401, 403, 404, 416).
+            (False, None) on network timeout or connection failure.
         """
         if not url:
-            return False
+            return False, None
         try:
-            req = Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-                    "Range": "bytes=0-100",
-                },
-            )
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+            }
+            if use_range:
+                headers["Range"] = "bytes=0-100"
+            req = Request(url, headers=headers)
             opener = None
             if self.vpn_mode == "WIREPROXY" and self.wireproxy_manager and self.wireproxy_manager.is_running():
                 proxy_handler = ProxyHandler({
@@ -1831,14 +1836,33 @@ class NetworkGuard:
             with open_fn(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", None) or getattr(resp, "code", None)
                 if status in (200, 206):
-                    return True
+                    return True, status
+                return False, status
         except HTTPError as e:
-            if e.code in (401, 403, 404, 410):
-                return False
-            return False
+            return False, e.code
         except Exception:
-            return False
-        return False
+            return False, None
+
+    def _probe_stream_url(self, url: str, timeout: float = 3.0) -> bool:
+        """Bool wrapper preserved for the operator re-paste path and legacy callers."""
+        return self._probe_stream_status(url, timeout)[0]
+
+    def _stream_is_token_governed(self, url: str, state=None) -> Tuple[bool, Optional[int]]:
+        """
+        Evaluate if a stream is governed by an expiring authentication token.
+        Scans URLs found in the stream URL and all active source material fields for expiration timestamps (N5).
+        """
+        st = state or self.state
+        raw = [url] if url else []
+        if st:
+            for attr in ("nm3u8dl_part_a", "active_command", "live_url", "active_stream_url"):
+                val = getattr(st, attr, None)
+                if isinstance(val, str) and val.strip():
+                    raw.append(val.strip())
+        urls = [u for s in raw for u in _URL_RE.findall(s)]
+        exps = [e for e in (self.extract_stream_expiry(u) for u in urls) if e is not None]
+        expiry = min(exps) if exps else None
+        return (expiry is not None), expiry
 
     def update_stream_url(self, new_input: str) -> None:
         """
@@ -1900,6 +1924,7 @@ class NetworkGuard:
             return updated
 
         if self.state:
+            setattr(self.state, "token_clock_override_url", None)
             setattr(self.state, "active_stream_url", new_url)
             setattr(self.state, "live_url", new_url)
 
@@ -1912,26 +1937,66 @@ class NetworkGuard:
 
     def _verify_and_resume_stream(self, state=None) -> bool:
         """
-        Unattended Resumption Protocol:
-        Probes existing URL. If valid, resumes automatically.
-        If expired / 403, diverts to 30-minute Token Hold state.
+        Unattended Resumption Protocol (token-aware, format-agnostic):
+        - Feeds without expiring tokens: Resumes unattended recording immediately without probing.
+        - Dynamic playlist mode: Exempt from clock-based holds; resumes unattended for dynamic manifest refresh.
+        - Feeds with expiring tokens:
+          * Probes endpoint (Question 1 Option B confirmation probe with Range fallback & transport retry).
+          * Diverts to Token Hold on HTTP 401, 403, or 410 (non-playlist feeds).
+          * Inconclusive probe results (timeout, 5xx, 416): Resumes recording via engine retry.
         """
+        st = state or self.state
         url = self.get_active_source_url()
-        if not url:
+
+        def _resume(msg: str) -> bool:
+            self.log_fn(msg, level="INFO")
             if self.resume_callback:
-                self.resume_callback(self.state)
+                self.resume_callback(st)
             return True
 
-        is_valid = self._probe_stream_url(url)
-        if is_valid:
-            network_type = "VPN" if self.is_armed else "internet connection"
-            self.log_fn(f"NETWORK_GUARD: Stream verified via restored {network_type}. Resuming unattended recording.", level="INFO")
-            if self.resume_callback:
-                self.resume_callback(self.state)
-            return True
-        else:
-            self.log_fn("NETWORK_GUARD: Stream token expired during outage. Diverting to Token Hold...", level="WARN")
+        def _hold(msg: str) -> bool:
+            if st is not None:
+                setattr(st, "token_clock_override_url", None)
+            self.log_fn(msg, level="WARN")
             return self.handle_token_hold_state(is_startup=self.is_startup_phase())
+
+        if not url:
+            if self.resume_callback:
+                self.resume_callback(st)
+            return True
+
+        network_type = "VPN" if self.is_armed else "internet connection"
+        geo = f" [Launch egress: {getattr(self, 'launch_country', None) or 'Unknown'} | Required: {getattr(self, 'required_country', None) or 'ANY'}]"
+        tokenised, expiry = self._stream_is_token_governed(url, state=st)
+        is_playlist = getattr(st, "source_mode", None) == "playlist"
+
+        # 1. Non-tokenized feeds (and static modes): zero probing, immediate unattended resumption
+        if not tokenised and not is_playlist:
+            return _resume(f"NETWORK_GUARD: No expiring token on stream. Route restored via {network_type}. Resuming unattended recording.")
+
+        # 2. Tokenized feeds or playlist mode: probe endpoint first (Option B confirmation probe)
+        ok, status = self._probe_stream_status(url)
+        if not ok and status in (400, 405, 406, 416, 501):
+            ok, status = self._probe_stream_status(url, use_range=False)  # live feed rejects Range
+        elif not ok and status is None:
+            ok, status = self._probe_stream_status(url)                   # one transport retry, no sleep
+
+        if ok:
+            if expiry is not None and float(expiry) <= time.time() and st is not None:
+                setattr(st, "token_clock_override_url", url)              # probe beat the clock (Option B)
+            return _resume(f"NETWORK_GUARD: Stream verified via restored {network_type}. Resuming unattended recording.")
+
+        # 3. Divert to Token Hold on explicit auth rejection (401/403) or expired signed link (410 on tokenized feed)
+        # Dynamic playlist feeds are exempt from access-refusal holds to allow fresh manifest fetches (Option A)
+        if not is_playlist and (status in (401, 403) or (status == 410 and tokenised)):
+            return _hold(f"NETWORK_GUARD: Stream authorization rejected (HTTP {status}). Diverting to Token Hold...{geo}")
+
+        # 4. If timestamp elapsed during outage and probe confirmed 404 (dead link) on non-playlist feed
+        if not is_playlist and expiry is not None and float(expiry) <= time.time() and status == 404:
+            return _hold(f"NETWORK_GUARD: Stream token expired during outage. Diverting to Token Hold...{geo}")
+
+        # 5. Inconclusive / non-auth probe failure or playlist refresh needed: resume via engine retry
+        return _resume(f"NETWORK_GUARD: Post-restoration probe inconclusive ({status or 'timeout'}). Resuming via recorder retry.")
 
     def _redraw_hold_prompt(self) -> None:
         try:
