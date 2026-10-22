@@ -549,9 +549,9 @@ class TestStreamIntegrityMonitorTwoTier(unittest.TestCase):
         t = [12000.0]
         with patch("time.monotonic", side_effect=lambda: t[0]):
             mon = self.MonitorCls(self.state)
-            for step in range(70):
-                # Alternating small discontinuities (+5s / -5s) every second
-                delta = 5000000 if (step % 2 == 0) else -5000000
+            for step in range(75):
+                # Sustained discontinuities (+5s) every second (transport storm)
+                delta = 5000000
                 mon.process_stderr_line(f"[vist] timestamp discontinuity: {delta}, new offset= 0")
                 mon.evaluate_health()
                 t[0] += 1.0
@@ -733,6 +733,134 @@ class TestStreamIntegrityMonitorTwoTier(unittest.TestCase):
             self.assertTrue(mon.container_defect)
             self.assertIn("Protocol DTS > PTS Timestamp Inversion", mon.last_container_error_msg)
 
+    def test_25_paired_clock_reset_does_not_latch_container_defect(self):
+        """
+        Replays exact Chunk 6 incident from 21-Oct-2026 Fox Cricket PFTV run:
+        Upstream resets PTS to 0. Audio logs -620544000, Video logs +620544000 1ms later.
+        FFmpeg compensates internally at 50fps 1.0x speed.
+        Verifies that paired clock reset does NOT poison container, does NOT request recycle,
+        and clears solo transport_defect.
+        """
+        t = [36000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "31037", "fps": "50.16", "total_size": "330985552", "out_time_us": "620536000", "speed": "1.0x"})
+
+            # Leg 1: Audio discontinuity (-620.544s)
+            mon.process_stderr_line("[aist#0:1/ac3 @ 0x1d9fd1f5840] timestamp discontinuity (stream id=257): -620544000, new offset= 620544000")
+            # Leg 2: Video discontinuity (+620.544s) arrives 1ms later
+            t[0] += 0.001
+            mon.process_stderr_line("[vist#0:0/hevc @ 0x1d9fdaca040] timestamp discontinuity (stream id=256): 620544000, new offset= 0")
+            mon.evaluate_health()
+
+            self.assertFalse(mon.container_defect)
+            self.assertFalse(mon.recycle_requested)
+            self.assertFalse(mon.transport_defect)
+            self.assertIsNone(mon.last_transport_delta)
+
+    def test_26_asymmetric_tear_latches_container_defect(self):
+        """Verifies asymmetric audio/video drift (span >= 54s, diff > 2.0s) latches fatal container defect."""
+        t = [37000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+            mon.process_progress({"frame": "1000", "total_size": "10000000", "out_time_us": "20000000"})
+
+            # Asymmetric: Audio jumps -100s, Video jumps +10s (difference is 90s >> 2s)
+            mon.process_stderr_line("[aist#0:1/ac3] timestamp discontinuity: -100000000, new offset= 100000000")
+            t[0] += 0.01
+            mon.process_stderr_line("[vist#0:0/hevc] timestamp discontinuity: 10000000, new offset= 0")
+            mon.evaluate_health()
+
+            self.assertTrue(mon.container_defect)
+            self.assertIn("Opposing A/V Timeline Tear", mon.last_container_error_msg)
+
+    def test_27_container_error_deduplication_and_clamping(self):
+        """Verifies repeated errors increment counter and clamp to <= 200 characters without blowing up."""
+        mon = self.MonitorCls(self.state)
+        now = 1000.0
+        for i in range(50):
+            # Slightly drifting microsecond delta numbers simulated
+            mon._latch_container_defect(now + i, f"Opposing A/V Timeline Tear (-6205440{i:02d} vs +620544000)")
+
+        self.assertTrue(mon.container_defect)
+        self.assertLessEqual(len(mon.last_container_error_msg), 200)
+        self.assertIn("Opposing A/V Timeline Tear [x50]", mon.last_container_error_msg)
+
+    def test_28_timing_warning_burst_throttling_and_summary_flush(self):
+        """
+        Verifies Item 3A: Repetitive timing warnings (Non-monotonic DTS / timestamp discontinuity)
+        show first 2 occurrences on the screen, suppress subsequent lines during burst,
+        and flush a concise periodic summary notice after 3 seconds.
+        """
+        t = [50000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+
+            # First 2 timing warnings in burst: displayed on screen (return False)
+            res1 = mon.process_stderr_line("[mpegts @ 0x1] Non-monotonic DTS in output stream 0:1; previous: 100, current: 100; changing to 101.")
+            self.assertFalse(res1)
+            t[0] += 0.05
+            res2 = mon.process_stderr_line("[mpegts @ 0x1] Non-monotonic DTS in output stream 0:1; previous: 101, current: 101; changing to 102.")
+            self.assertFalse(res2)
+
+            # Lines 3 to 10 in burst: suppressed from screen (return True)
+            for i in range(3, 11):
+                t[0] += 0.05
+                res = mon.process_stderr_line(f"[mpegts @ 0x1] Non-monotonic DTS in output stream 0:1; previous: {100+i}, current: {100+i}; changing to {101+i}.")
+                self.assertTrue(res)
+
+            self.assertEqual(mon.timing_suppressed_count, 8)
+
+            # Less than 3.0 seconds elapsed: check_flush_timing_summary returns None
+            self.assertIsNone(mon.check_flush_timing_summary())
+
+            # Advance time past 3.0s window
+            t[0] += 3.5
+            summary = mon.check_flush_timing_summary()
+            self.assertIsNotNone(summary)
+            self.assertIn("Timing warning burst (suppressed 8 repetitive lines from screen)", summary)
+            self.assertEqual(mon.timing_suppressed_count, 0)
+            self.assertIsNone(mon.check_flush_timing_summary())
+
+            # Now verify a SECOND burst occurring 60 seconds later:
+            t[0] += 60.0
+            # Lines 1 & 2 of new burst should display (return False)
+            self.assertFalse(mon.process_stderr_line("[mpegts @ 0x1] Non-monotonic DTS in output stream 0:1; previous: 200, current: 200; changing to 201."))
+            t[0] += 0.05
+            self.assertFalse(mon.process_stderr_line("[mpegts @ 0x1] Non-monotonic DTS in output stream 0:1; previous: 201, current: 201; changing to 202."))
+            # Line 3 of new burst should suppress (return True)
+            t[0] += 0.05
+            self.assertTrue(mon.process_stderr_line("[mpegts @ 0x1] Non-monotonic DTS in output stream 0:1; previous: 202, current: 202; changing to 203."))
+            self.assertEqual(mon.timing_suppressed_count, 1)
+
+            # Must NOT prematurely flush at 0.1s!
+            self.assertIsNone(mon.check_flush_timing_summary())
+
+            # Only flushes after full 3.0s window has passed
+            t[0] += 3.1
+            summary2 = mon.check_flush_timing_summary()
+            self.assertIsNotNone(summary2)
+            self.assertIn("Timing warning burst (suppressed 1 repetitive lines from screen)", summary2)
+            self.assertEqual(mon.timing_suppressed_count, 0)
+
+    def test_29_non_monotonic_pts_and_forced_summary_flush(self):
+        """Verifies Non-monotonic PTS throttling and forced summary flush on process exit."""
+        t = [60000.0]
+        with patch("time.monotonic", side_effect=lambda: t[0]):
+            mon = self.MonitorCls(self.state)
+
+            # 5 non-monotonic PTS lines
+            for i in range(5):
+                t[0] += 0.01
+                mon.process_stderr_line(f"[mpegts @ 0x2] Non-monotonic PTS in output stream 0:0; previous: {i}, current: {i}.")
+
+            self.assertEqual(mon.timing_suppressed_count, 3)
+            # Forced flush on FFmpeg exit flushes immediately regardless of elapsed time
+            summary = mon.check_flush_timing_summary(force=True)
+            self.assertIsNotNone(summary)
+            self.assertIn("suppressed 3 repetitive lines", summary)
+            self.assertEqual(mon.timing_suppressed_count, 0)
+
     def test_24_missing_last_run_start_does_not_flag_burst(self):
         """Verifies missing last_run_start sets run_wall=None and does not misfire replay burst filter."""
         state = WindowDummyState()
@@ -774,22 +902,22 @@ class TestStreamIntegrityMonitorTwoTier(unittest.TestCase):
         self.assertTrue(is_replay_burst_later)
 
     def test_22_maturity_speed_ratio_dead_zone_heals(self):
-        """Verifies chunk with 45s media running at normal live speed (35s wall) is mature and fast-seals."""
+        """Verifies chunk with 65s media running at normal live speed (50s wall) is mature and fast-seals."""
         t = [35000.0]
         with patch("time.monotonic", side_effect=lambda: t[0]):
             mon = self.MonitorCls(self.state)
-            # 45s media delivered in 35s wall (speed = 45/35 = 1.28x <= 3.0x)
-            t[0] += 35.0
-            mon.process_progress({"frame": "2250", "total_size": "40000000", "out_time_us": "45000000"})
+            # 65s media delivered in 50s wall (speed = 65/50 = 1.3x <= 3.0x)
+            t[0] += 50.0
+            mon.process_progress({"frame": "3250", "total_size": "55000000", "out_time_us": "65000000"})
             # Severe container defect occurs
             mon.process_stderr_line("[mpegts @ 0x123] Invalid timestamps stream=0, pts=2440, dts=500000, size=71750")
             mon.evaluate_health()
             self.assertTrue(mon.container_defect)
 
-            # Advance past 2.0s coalesce window (to 37.5s wall time)
+            # Advance past 2.0s coalesce window (to 52.5s wall time)
             t[0] += 2.5
             mon.evaluate_health()
-            # Fast-seal triggers because chunk is mature (media >= 30s and speed <= 3.0x)
+            # Fast-seal triggers because chunk is mature (media >= 60s and speed <= 3.0x)
             self.assertTrue(mon.recycle_requested)
             self.assertIn("Fatal Container Poisoning", mon.recycle_reason)
 
@@ -1203,6 +1331,325 @@ class TestBackoffPolicy(unittest.TestCase):
         self.assertIn('sys.stdout.reconfigure(errors="replace")', record_src)
         self.assertIn('sys.stdout.reconfigure(errors="replace")', dynamic_src)
 
+    def test_30_record_dynamic_and_static_parity_on_timing_burst_throttling(self):
+        """Verify record_dynamic.py and RECORD.py have complete parity on timing warning burst throttling and termcap capture."""
+        record_path = resolve_record_py_path()
+        dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
+
+        record_src = record_path.read_text(encoding="utf-8")
+        dynamic_src = dynamic_path.read_text(encoding="utf-8")
+
+        # Both must define check_flush_timing_summary
+        self.assertIn("def check_flush_timing_summary(", record_src)
+        self.assertIn("def check_flush_timing_summary(", dynamic_src)
+
+        # Both must flush the standard burst summary string
+        self.assertIn("FFmpeg: Timing warning burst (suppressed", record_src)
+        self.assertIn("FFmpeg: Timing warning burst (suppressed", dynamic_src)
+
+        # Both must preserve suppressed lines to termcap for full on-disk fidelity (Item 3B)
+        self.assertIn('termcap_write(f"{ts_str} [INFO] FFmpeg: {s}")', record_src)
+        self.assertIn('termcap_write(f"{ts_str} [INFO] FFmpeg: {s}")', dynamic_src)
+
+    def test_31_concat_finalization_flags_and_bsf_tier_hardening(self):
+        """
+        Verifies Items 4A & 4B: Matroska concat command line construction across RECORD.py and record_dynamic.py:
+        1. Demuxer input error tolerance: -err_detect ignore_err -fflags +genpts+igndts+discardcorrupt before -f concat.
+        2. Tier 1 output flags: -avoid_negative_ts make_zero -max_interleave_delta 0.
+        3. Tier 2 timestamp synthesis: -bsf:v setts=ts='if(eq(PTS,NOPTS),PREV_OUTPTS+1,PTS)':dts='if(eq(DTS,NOPTS),PREV_OUTDTS+1,DTS)'
+           and -avoid_negative_ts make_zero -max_interleave_delta 0.
+        """
+        record_path = resolve_record_py_path()
+        dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
+
+        record_src = record_path.read_text(encoding="utf-8")
+        dynamic_src = dynamic_path.read_text(encoding="utf-8")
+
+        for src, name in ((record_src, "RECORD.py"), (dynamic_src, "record_dynamic.py")):
+            # Input error tolerance flags before -f concat
+            self.assertIn('"-err_detect", "ignore_err"', src, f"Missing -err_detect ignore_err in {name}")
+            self.assertIn('"-fflags", "+genpts+igndts+discardcorrupt"', src, f"Missing +genpts+igndts+discardcorrupt in {name}")
+            # Output flags
+            self.assertIn('"-avoid_negative_ts", "make_zero"', src, f"Missing -avoid_negative_ts make_zero in {name}")
+            self.assertIn('"-max_interleave_delta", "0"', src, f"Missing -max_interleave_delta 0 in {name}")
+            # Tier 2 bitstream filter for NOPTS synthesis
+            self.assertIn(
+                '"-bsf:v", "setts=ts=\'if(eq(PTS,NOPTS),PREV_OUTPTS+1,PTS)\':dts=\'if(eq(DTS,NOPTS),PREV_OUTDTS+1,DTS)\'"',
+                src,
+                f"Missing setts bitstream filter in {name}",
+            )
+
+    def test_32_summary_report_dynamic_header_and_failure_propagation(self):
+        """
+        Verifies Item 5: Dynamic summary report header and failure propagation:
+        1. Summary header distinguishes mixed params from assembly failures.
+        2. finalize_recording sets state.last_finalization_failure on failure.
+        """
+        record_path = resolve_record_py_path()
+        dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
+
+        record_src = record_path.read_text(encoding="utf-8")
+        dynamic_src = dynamic_path.read_text(encoding="utf-8")
+
+        for src, name in ((record_src, "RECORD.py"), (dynamic_src, "record_dynamic.py")):
+            # Dynamic header checks in write_summary_log
+            self.assertIn('lines.append(f"Recording summary (NOT finalized - mixed params: {reason}) for {FINAL_FILE}")', src, f"Missing mixed params header in {name}")
+            self.assertIn('lines.append(f"Recording summary (NOT finalized - {failure_msg}) for {FINAL_FILE}")', src, f"Missing failure header in {name}")
+            # Failure reason assignment in finalize_recording
+            self.assertIn('state.last_finalization_failure = last_failure_reason or "ffmpeg concat failure"', src, f"Missing failure reason propagation in {name}")
+
+    def test_33_quality_downgrade_alarm_state_machine_and_recovery(self):
+        """
+        Verifies Items 6A, 6B, 6C, 6D: Quality downgrade alarm state machine, acknowledgment, baseline elevation & recovery.
+        """
+        import sys
+        import importlib
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            state = rd.RecorderState()
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                dummy_chunk = td_path / "dummy.ts"
+                dummy_chunk.write_bytes(b"dummy_chunk_bytes")
+
+                orig_mode = rd.DOWNLOAD_MODE
+                orig_list = rd.LIST_FILE
+                orig_get_info = rd.get_file_info
+                orig_params = rd.get_video_params
+                orig_log = rd.log
+                alarms_started = []
+                alarms_stopped = []
+                beeps = []
+
+                orig_alarm_start = rd.shared_alarm_start
+                orig_alarm_stop = rd.shared_alarm_stop
+                orig_beep_good = rd.beep_good
+
+                try:
+                    rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
+                    rd.LIST_FILE = str(td_path / "list.txt")
+                    rd.get_file_info = lambda p: (100.0, 4000.0)
+                    rd.log = lambda *a, **k: None
+
+                    def fake_alarm_start(s, alarm_type=None, incident=None):
+                        alarms_started.append(alarm_type)
+                        s.shared_alarm_type = alarm_type
+
+                    def fake_alarm_stop(s):
+                        alarms_stopped.append(True)
+                        s.shared_alarm_type = None
+
+                    def fake_beep_good(s=None):
+                        beeps.append(True)
+
+                    rd.shared_alarm_start = fake_alarm_start
+                    rd.shared_alarm_stop = fake_alarm_stop
+                    rd.beep_good = fake_beep_good
+
+                    # 1. Chunk 1 starts at 720p emergency slate (Item 6D)
+                    rd.get_video_params = lambda p: (1280, 720, 25.0)
+                    rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_001.ts", "TEST")
+                    self.assertEqual(state.baseline_video_params, (1280, 720, 25.0))
+
+                    # 2. Chunk 2 upgrades to 1080p50 match feed -> baseline must elevate to 1080p50
+                    dummy_chunk.write_bytes(b"chunk2")
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
+                    self.assertEqual(state.baseline_video_params, (1920, 1080, 50.0))
+
+                    # 3. Chunk 3 drops back to 720p25 -> must trigger quality downgrade alarm (Item 6A)
+                    dummy_chunk.write_bytes(b"chunk3")
+                    rd.get_video_params = lambda p: (1280, 720, 25.0)
+                    rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_003.ts", "TEST")
+                    self.assertIn("quality_downgrade", alarms_started)
+                    self.assertEqual(state.last_downgraded_quality_params, (1280, 720, 25.0))
+                    self.assertFalse(state.same_params)
+
+                    # 4. Operator acknowledges downgrade with 'A' (Item 6B)
+                    state.shared_alarm_type = "quality_downgrade"
+                    state.quality_downgrade_alarm_active = True
+                    acked = rd.acknowledge_quality_downgrade_alarm(state)
+                    self.assertTrue(acked)
+                    self.assertFalse(state.quality_downgrade_alarm_active)
+                    self.assertEqual(state.acknowledged_quality_params, (1280, 720, 25.0))
+
+                    # 5. Chunk 4 at same 720p25 -> must NOT re-alarm (Item 6B)
+                    alarms_started.clear()
+                    dummy_chunk.write_bytes(b"chunk4")
+                    rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_004.ts", "TEST")
+                    self.assertNotIn("quality_downgrade", alarms_started)
+
+                    # 6. Chunk 5 restores to baseline 1080p50 -> stops alarm, clears ack params, beeps good (Item 6C)
+                    dummy_chunk.write_bytes(b"chunk5")
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    beeps.clear()
+                    rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_005.ts", "TEST")
+                    self.assertIsNone(state.acknowledged_quality_params)
+                    self.assertIsNone(state.last_downgraded_quality_params)
+                    self.assertGreaterEqual(len(beeps), 1)
+
+                finally:
+                    rd.DOWNLOAD_MODE = orig_mode
+                    rd.LIST_FILE = orig_list
+                    rd.get_file_info = orig_get_info
+                    rd.get_video_params = orig_params
+                    rd.log = orig_log
+                    rd.shared_alarm_start = orig_alarm_start
+                    rd.shared_alarm_stop = orig_alarm_stop
+                    rd.beep_good = orig_beep_good
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def test_34_two_tier_chunk_acceptance_and_short_downgrade_discard(self):
+        """
+        Verifies Items 7A & 7B: Two-Tier chunk duration thresholds:
+        1. Mid-run flapping chunk (< 60s, e.g. 35s) without intentional stop is rejected as BAD.
+        2. Clean boundary (duration_reached / stop_flag) chunk >= 15s (e.g. 20s winning overs) is accepted as GOOD.
+        3. Short chunk (< 60s) on clean boundary with downgraded quality below baseline is rejected as BAD (Item 7B).
+        """
+        import sys
+        import importlib
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        old_cfg = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                rd = sys.modules["record_dynamic"]
+            else:
+                rd = importlib.import_module("record_dynamic")
+
+            state = rd.RecorderState()
+            state.baseline_video_params = (1920, 1080, 50.0)
+            state.best_w, state.best_h, state.best_fps = 1920, 1080, 50.0
+            state.stats["good_chunks"] = 1
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                dummy_chunk = td_path / "dummy.ts"
+
+                orig_mode = rd.DOWNLOAD_MODE
+                orig_list = rd.LIST_FILE
+                orig_get_info = rd.get_file_info
+                orig_params = rd.get_video_params
+                orig_log = rd.log
+
+                try:
+                    rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
+                    rd.LIST_FILE = str(td_path / "list.txt")
+                    rd.log = lambda *a, **k: None
+
+                    # Scenario 1: Mid-run flapping chunk of 35s (< 60s) -> REJECTED as BAD (Item 7A)
+                    dummy_chunk.write_bytes(b"flap")
+                    rd.get_file_info = lambda p: (35.0, 4000.0)
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
+                    self.assertFalse(accepted)
+
+                    # Scenario 2: Clean boundary (stop_flag=True), 25s chunk at 1080p50 -> ACCEPTED as GOOD (Item 7A winning overs protection)
+                    dummy_chunk.write_bytes(b"winning_overs")
+                    state.stop_flag = True
+                    accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
+                    self.assertTrue(accepted)
+                    self.assertEqual(state.stats["good_chunks"], 2)
+
+                    # Scenario 3: Clean boundary (stop_flag=True), but 25s chunk with downgraded quality 720p25 -> REJECTED as BAD (Item 7B)
+                    dummy_chunk.write_bytes(b"emergency_slate")
+                    rd.get_video_params = lambda p: (1280, 720, 25.0)
+                    accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_003.ts", "TEST")
+                    self.assertFalse(accepted)
+
+                finally:
+                    rd.DOWNLOAD_MODE = orig_mode
+                    rd.LIST_FILE = orig_list
+                    rd.get_file_info = orig_get_info
+                    rd.get_video_params = orig_params
+                    rd.log = orig_log
+        finally:
+            if old_cfg:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = old_cfg
+            else:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def test_35_record_dynamic_and_static_parity_on_quality_alarms_and_durations(self):
+        """
+        Verifies Item 8: Complete parity between RECORD.py and record_dynamic.py for:
+        1. MIN_ACCEPTED_CHUNK_SECONDS = 60
+        2. quality_downgrade alarm functions and state fields
+        3. Two-tier duration acceptance and short downgrade discard logic
+        4. Headless terminal key listener error handling
+        """
+        record_path = resolve_record_py_path()
+        dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
+
+        record_src = record_path.read_text(encoding="utf-8")
+        dynamic_src = dynamic_path.read_text(encoding="utf-8")
+
+        for src, name in ((record_src, "RECORD.py"), (dynamic_src, "record_dynamic.py")):
+            # Constant
+            self.assertIn("MIN_ACCEPTED_CHUNK_SECONDS = 60", src, f"Missing MIN_ACCEPTED_CHUNK_SECONDS in {name}")
+            # State fields
+            self.assertIn("quality_downgrade_alarm_active: bool = False", src, f"Missing state field in {name}")
+            self.assertIn("baseline_video_params: Optional[tuple] = None", src, f"Missing state field in {name}")
+            self.assertIn("last_downgraded_quality_params: Optional[tuple] = None", src, f"Missing state field in {name}")
+            self.assertIn("acknowledged_quality_params: Optional[tuple] = None", src, f"Missing state field in {name}")
+            # Functions
+            self.assertIn("def quality_downgrade_alarm_start(", src, f"Missing alarm start in {name}")
+            self.assertIn("def quality_downgrade_alarm_stop(", src, f"Missing alarm stop in {name}")
+            self.assertIn("def acknowledge_quality_downgrade_alarm(", src, f"Missing ack alarm in {name}")
+            # Two-tier acceptance in maybe_accept_chunk
+            self.assertIn("effective_min_dur = (", src, f"Missing effective_min_dur in {name}")
+            self.assertIn("is_short_downgrade = False", src, f"Missing is_short_downgrade in {name}")
+            # Terminal listener headless guard
+            self.assertIn("except (termios.error, io.UnsupportedOperation, AttributeError, Exception) as exc:", src, f"Missing terminal headless guard in {name}")
+
     def test_dynamic_recorder_replay_burst_behaviour(self):
         """Verify dynamic recorder's maybe_accept_chunk marks burst as BAD and normal chunk as GOOD."""
         import sys
@@ -1249,18 +1696,18 @@ class TestBackoffPolicy(unittest.TestCase):
                 try:
                     rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
                     rd.LIST_FILE = str(td_path / "list.txt")
-                    rd.get_file_info = lambda p: (46.0, 4000.0)
+                    rd.get_file_info = lambda p: (75.0, 4000.0)
                     rd.get_video_params = lambda p: (1920, 1080, 50.0)
                     rd.log = lambda *a, **k: None
 
-                    # Replay burst (46s media in 4s wall = 11.5x) must NOT be accepted
+                    # Replay burst (75s media in 4s wall = 18.75x) must NOT be accepted
                     accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
                     self.assertFalse(accepted)
                     self.assertEqual(state.stats["good_chunks"], 1)
 
-                    # Normal chunk (46s media in 40s wall = 1.15x) is accepted as GOOD
+                    # Normal chunk (75s media in 70s wall = 1.07x) is accepted as GOOD
                     dummy_chunk.write_bytes(b"dummy_chunk_bytes")
-                    state.stats["last_run_start"] = time.time() - 40.0
+                    state.stats["last_run_start"] = time.time() - 70.0
                     accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_003.ts", "TEST")
                     self.assertTrue(accepted)
                     self.assertEqual(state.stats["good_chunks"], 2)

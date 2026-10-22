@@ -166,3 +166,31 @@ def acknowledge_token_expired_alarm(
     return True
 
 
+def acknowledge_quality_downgrade_alarm(
+    state,
+    *,
+    log_fn: Optional[Callable] = None,
+    alarm_stop_fn: Optional[Callable] = None,
+) -> bool:
+    """Acknowledge the quality downgrade alarm immediately."""
+    alarm_type = getattr(state, "shared_alarm_type", None)
+    if not (
+        getattr(state, "quality_downgrade_alarm_active", False)
+        or alarm_type == "quality_downgrade"
+    ):
+        return False
+
+    alarm_activity_id = getattr(state, "shared_alarm_activity_id", None)
+    state.quality_downgrade_alarm_active = False
+    if getattr(state, "last_downgraded_quality_params", None) is not None:
+        state.acknowledged_quality_params = state.last_downgraded_quality_params
+    state.alarm_ack_requested = False
+    state.alarm_linger_until = None
+    if log_fn:
+        log_fn("ALARM_ACK", activity_id=alarm_activity_id)
+        log_fn("ALARM_QUALITY_DOWNGRADE_STOP reason=ack", activity_id=alarm_activity_id)
+    if alarm_stop_fn and alarm_type == "quality_downgrade":
+        alarm_stop_fn(state)
+    return True
+
+

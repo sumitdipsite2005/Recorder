@@ -564,6 +564,13 @@ class RecorderState:
     best_fps: float = 0.0
     same_params: bool = True
     mixed_reason: str = ""
+    last_finalization_failure: str = ""
+
+    # Quality downgrade alarm & baseline tracking
+    quality_downgrade_alarm_active: bool = False
+    baseline_video_params: Optional[tuple] = None
+    last_downgraded_quality_params: Optional[tuple] = None
+    acknowledged_quality_params: Optional[tuple] = None
 
     # Audio / A/V stream-layout consistency tracking (locked after first GOOD chunk)
     audio_expected: Optional[bool] = None
@@ -766,6 +773,7 @@ RAW_EXTERNAL_PATH = None
 
 FFMPEG_PROGRESS_PERIOD = 1   # seconds
 STABILITY_SEC = 15          # minimum good duration in seconds
+MIN_ACCEPTED_CHUNK_SECONDS = 60  # minimum duration for mid-run flapping chunks
 STABILITY_WALL_SEC = 25     # minimum wall-clock seconds for speed ratio evaluation
 BURST_RATIO = 3.0           # media-to-wall speed threshold indicating a server replay burst
 DUP_MAX_SEC = 180           # maximum media duration to consider as a replay burst
@@ -2329,6 +2337,7 @@ def is_alarm_active(state: RecorderState) -> bool:
             getattr(state, "nm3u8dl_alarm_active", False),
             getattr(state, "ffmpeg_alarm_active", False),
             getattr(state, "ffmpeg_off_alarm_active", False),
+            getattr(state, "quality_downgrade_alarm_active", False),
         )
     )
     
@@ -2397,7 +2406,8 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
                 or getattr(state, "internet_hold_active", False)
                 or getattr(state, "token_hold_active", False)
                 or getattr(state, "lenient_alarm_active", False)
-                or getattr(state, "shared_alarm_type", None) in ("vpn_drop", "internet_drop", "token_expired", "critical")
+                or getattr(state, "quality_downgrade_alarm_active", False)
+                or getattr(state, "shared_alarm_type", None) in ("vpn_drop", "internet_drop", "token_expired", "critical", "quality_downgrade")
             )
 
             if alarm_active:
@@ -2430,6 +2440,11 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
                     )
                 elif getattr(state, "nm3u8dl_alarm_active", False):
                     acknowledge_nm3u8dl_stall_alarm(state)
+                elif (
+                    getattr(state, "quality_downgrade_alarm_active", False)
+                    or getattr(state, "shared_alarm_type", None) == "quality_downgrade"
+                ):
+                    acknowledge_quality_downgrade_alarm(state)
                 elif (
                     getattr(state, "lenient_alarm_active", False)
                     or getattr(state, "network_guard_hold_active", False)
@@ -2469,19 +2484,20 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
 
         return
 
-    # macOS
-    if sys.platform == "darwin":
+    # macOS & Linux terminal listener
+    if sys.platform in ("darwin", "linux"):
         try:
             import select
             import termios
             import tty
             import atexit
+            import io
 
             fd = sys.stdin.fileno()
             old_settings = termios.tcgetattr(fd)
 
-        except Exception as exc:
-            log(f"Mac keyboard listener unavailable: {exc}", level="WARN")
+        except (termios.error, io.UnsupportedOperation, AttributeError, Exception) as exc:
+            log(f"Terminal keyboard listener unavailable: {exc}", level="WARN")
             return
 
         def restore_terminal():
@@ -2504,11 +2520,15 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
 
                     if ready:
                         ch = sys.stdin.read(1)
+                        if not ch:
+                            break
                         handle_key(ch)
 
                 except Exception:
                     time.sleep(0.05)
 
+        except (termios.error, io.UnsupportedOperation, AttributeError, OSError, Exception) as exc:
+            log(f"Terminal keyboard listener unavailable: {exc}", level="WARN")
         finally:
             restore_terminal()
 
@@ -2733,6 +2753,11 @@ def _auto_silence_shared_alarm(state, alarm_type: str):
     elif alarm_type == "token_expired":
         state.token_expired_post_ack_silent = True
         log("ALARM_TOKEN_EXPIRED_STOP reason=timeout", level="WARN")
+    elif alarm_type == "quality_downgrade":
+        state.quality_downgrade_alarm_active = False
+        if getattr(state, "last_downgraded_quality_params", None) is not None:
+            state.acknowledged_quality_params = state.last_downgraded_quality_params
+        log("ALARM_QUALITY_DOWNGRADE_STOP reason=timeout", level="WARN")
 
     shared_alarm_stop(state)
 
@@ -2921,6 +2946,34 @@ def acknowledge_vpn_drop_alarm(state) -> bool:
 def acknowledge_internet_drop_alarm(state) -> bool:
     """Acknowledge the internet drop alarm immediately."""
     return runtime_sound.acknowledge_internet_drop_alarm(
+        state,
+        log_fn=log,
+        alarm_stop_fn=shared_alarm_stop,
+    )
+
+
+def quality_downgrade_alarm_start(state: RecorderState) -> None:
+    shared_alarm_start(state, alarm_type="quality_downgrade", incident=None)
+    state.quality_downgrade_alarm_active = (
+        getattr(state, "shared_alarm_type", None) == "quality_downgrade"
+    )
+    if state.quality_downgrade_alarm_active:
+        log("ALARM_QUALITY_DOWNGRADE_START", level="WARN")
+
+
+def quality_downgrade_alarm_stop(state: RecorderState, reason: str = "recovered") -> None:
+    was_active = getattr(state, "quality_downgrade_alarm_active", False) or (
+        getattr(state, "shared_alarm_type", None) == "quality_downgrade"
+    )
+    state.quality_downgrade_alarm_active = False
+    if getattr(state, "shared_alarm_type", None) == "quality_downgrade":
+        shared_alarm_stop(state)
+    if was_active:
+        log(f"ALARM_QUALITY_DOWNGRADE_STOP reason={reason}", level="INFO")
+
+
+def acknowledge_quality_downgrade_alarm(state: RecorderState) -> bool:
+    return runtime_sound.acknowledge_quality_downgrade_alarm(
         state,
         log_fn=log,
         alarm_stop_fn=shared_alarm_stop,
@@ -3850,15 +3903,27 @@ def get_video_params(path):
             timeout=5,
         ).decode()
         data = json.loads(out)["streams"][0]
-        w = int(data.get("width", 1920))
-        h = int(data.get("height", 1080))
-       
-        fps_str = data.get("avg_frame_rate", data.get("r_frame_rate", "50/1"))  # default 50fps
-        
-        num, den = fps_str.split("/")
-        fps = int(round(float(num) / float(den)))
+        w = int(data.get("width") or 1920)
+        h = int(data.get("height") or 1080)
+
+        fps = 50
+        for rate_key in ("avg_frame_rate", "r_frame_rate"):
+            fps_str = str(data.get(rate_key) or "").strip()
+            if not fps_str or fps_str in ("0/0", "0", "N/A"):
+                continue
+            if "/" in fps_str:
+                num, den = fps_str.split("/", 1)
+                den_f = float(den)
+                if den_f > 0 and float(num) > 0:
+                    fps = int(round(float(num) / den_f))
+                    break
+            else:
+                val_f = float(fps_str)
+                if val_f > 0:
+                    fps = int(round(val_f))
+                    break
         return w, h, fps
-    except:
+    except Exception:
         return 1920, 1080, 50
         
 def get_audio_layout(path):
@@ -4247,6 +4312,34 @@ def run_ffmpeg_with_capture(cmd, cwd, tag="FFmpeg"):
 
     def monitor_thread():
         nonlocal last_progress_line, progress_line_active, kv
+        timing_burst_count = 0
+        timing_suppressed_count = 0
+        last_timing_warning_mono = 0.0
+        last_timing_summary_mono = 0.0
+
+        def check_flush_timing_summary(force=False):
+            nonlocal timing_burst_count, timing_suppressed_count
+            nonlocal last_timing_warning_mono, last_timing_summary_mono
+            if timing_suppressed_count <= 0:
+                return None
+            now_m = time.monotonic()
+            burst_idle = (now_m - last_timing_warning_mono) >= 3.0
+            should_flush = (
+                force
+                or burst_idle
+                or (last_timing_summary_mono > 0 and (now_m - last_timing_summary_mono) >= 3.0)
+            )
+            if not should_flush:
+                return None
+            count = timing_suppressed_count
+            timing_suppressed_count = 0
+            if force or burst_idle:
+                timing_burst_count = 0
+                last_timing_summary_mono = 0.0
+            else:
+                last_timing_summary_mono = now_m
+            return f"{tag}: Timing warning burst (suppressed {count} repetitive lines from screen)"
+
         try:
             while True:
                 line = proc.stderr.readline()
@@ -4258,6 +4351,12 @@ def run_ffmpeg_with_capture(cmd, cwd, tag="FFmpeg"):
                     k, v = m.group(1), m.group(2)
                     kv[k] = v
                     if k == "progress":
+                        burst_sum = check_flush_timing_summary()
+                        if burst_sum:
+                            if progress_line_active:
+                                clear_progress_line()
+                                progress_line_active = False
+                            log(burst_sum)
                         parts = []
                         for key in ("frame", "fps", "total_size", "out_time", "bitrate", "speed"):
                             if key in kv:
@@ -4269,13 +4368,58 @@ def run_ffmpeg_with_capture(cmd, cwd, tag="FFmpeg"):
                             last_progress_line = prog
                         kv = {}
                     continue
-                if progress_line_active:
-                    clear_progress_line()
-                    progress_line_active = False
-                if s:
-                    log(f"{tag}: {s}")
+
+                burst_sum = check_flush_timing_summary()
+                if burst_sum:
+                    if progress_line_active:
+                        clear_progress_line()
+                        progress_line_active = False
+                    log(burst_sum)
+
+                s_lower = s.lower()
+                is_timing_warning = (
+                    "non-monotonic dts" in s_lower
+                    or "non-monotonic pts" in s_lower
+                    or "timestamp discontinuity" in s_lower
+                )
+                suppress_from_terminal = False
+                now_m = time.monotonic()
+
+                if is_timing_warning:
+                    if last_timing_warning_mono == 0.0 or (now_m - last_timing_warning_mono) > 3.0:
+                        timing_burst_count = 1
+                        last_timing_warning_mono = now_m
+                        last_timing_summary_mono = 0.0
+                    else:
+                        timing_burst_count += 1
+                        last_timing_warning_mono = now_m
+                        if timing_burst_count > 2:
+                            timing_suppressed_count += 1
+                            if last_timing_summary_mono == 0.0:
+                                last_timing_summary_mono = now_m
+                            suppress_from_terminal = True
+
+                if suppress_from_terminal:
+                    ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    termcap_write(f"{ts_str} [INFO] {tag}: {s}")
+                else:
+                    if progress_line_active:
+                        clear_progress_line()
+                        progress_line_active = False
+                    if s:
+                        log(f"{tag}: {s}")
         except Exception as e:
             log(f"{tag} monitor error: {e}")
+        finally:
+            try:
+                burst_sum = check_flush_timing_summary(force=True)
+                if burst_sum:
+                    if progress_line_active:
+                        clear_progress_line()
+                        progress_line_active = False
+                    log(burst_sum)
+            except Exception:
+                pass
 
     t = threading.Thread(target=monitor_thread, daemon=True)
     t.start()
@@ -4454,6 +4598,33 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
         nonlocal ff_expected_kbps, ff_expected_source, ff_progress_kbps
         nonlocal last_bitrate_log_kbps, last_bitrate_log_ts
         kv = {}
+        timing_burst_count = 0
+        timing_suppressed_count = 0
+        last_timing_warning_mono = 0.0
+        last_timing_summary_mono = 0.0
+
+        def check_flush_timing_summary(force=False):
+            nonlocal timing_burst_count, timing_suppressed_count
+            nonlocal last_timing_warning_mono, last_timing_summary_mono
+            if timing_suppressed_count <= 0:
+                return None
+            now_m = time.monotonic()
+            burst_idle = (now_m - last_timing_warning_mono) >= 3.0
+            should_flush = (
+                force
+                or burst_idle
+                or (last_timing_summary_mono > 0 and (now_m - last_timing_summary_mono) >= 3.0)
+            )
+            if not should_flush:
+                return None
+            count = timing_suppressed_count
+            timing_suppressed_count = 0
+            if force or burst_idle:
+                timing_burst_count = 0
+                last_timing_summary_mono = 0.0
+            else:
+                last_timing_summary_mono = now_m
+            return f"FFmpeg: Timing warning burst (suppressed {count} repetitive lines from screen)"
         try:
             while True:
                 line = p.stderr.readline()
@@ -4486,6 +4657,10 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
                     k, v = m.group(1), m.group(2)
                     kv[k] = v
                     if k == "progress":
+                        burst_sum = check_flush_timing_summary()
+                        if burst_sum:
+                            flush_progress_line()
+                            log(burst_sum)
                         if "bitrate" in kv:
                             parsed_kbps = parse_progress_bitrate(kv["bitrate"])
                             if parsed_kbps:
@@ -4535,16 +4710,57 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
                         kv = {}
                     continue
                 
-                # Non-progress line: end the progress line once, then log message
-                if progress_line_active:
-                    clear_progress_line()
-                    progress_line_active = False
-                    last_progress_len = 0
+                burst_sum = check_flush_timing_summary()
+                if burst_sum:
+                    flush_progress_line()
+                    log(burst_sum)
 
-                if s:
-                    log(f"FFmpeg: {s}")
+                s_lower = s.lower()
+                is_timing_warning = (
+                    "non-monotonic dts" in s_lower
+                    or "non-monotonic pts" in s_lower
+                    or "timestamp discontinuity" in s_lower
+                )
+                suppress_from_terminal = False
+                now_m = time.monotonic()
+
+                if is_timing_warning:
+                    if last_timing_warning_mono == 0.0 or (now_m - last_timing_warning_mono) > 3.0:
+                        timing_burst_count = 1
+                        last_timing_warning_mono = now_m
+                        last_timing_summary_mono = 0.0
+                    else:
+                        timing_burst_count += 1
+                        last_timing_warning_mono = now_m
+                        if timing_burst_count > 2:
+                            timing_suppressed_count += 1
+                            if last_timing_summary_mono == 0.0:
+                                last_timing_summary_mono = now_m
+                            suppress_from_terminal = True
+
+                if suppress_from_terminal:
+                    # Item 3B: Retain 100% on-disk fidelity in terminal capture
+                    ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    termcap_write(f"{ts_str} [INFO] FFmpeg: {s}")
+                else:
+                    # Non-progress line: end the progress line once, then log message
+                    if progress_line_active:
+                        clear_progress_line()
+                        progress_line_active = False
+                        last_progress_len = 0
+
+                    if s:
+                        log(f"FFmpeg: {s}")
         except Exception as e:
             log(f"FFmpeg stderr monitor error: {e}")
+        finally:
+            try:
+                burst_sum = check_flush_timing_summary(force=True)
+                if burst_sum:
+                    flush_progress_line()
+                    log(burst_sum)
+            except Exception:
+                pass
 
     t = threading.Thread(target=monitor_ffmpeg, args=(proc,), daemon=True)
     t.start()
@@ -18234,10 +18450,76 @@ def maybe_accept_chunk(state: RecorderState, chunk_path, chunk_name, context):
     if is_replay_burst:
         log(f"{context}: {chunk_name} REPLAY_BURST ({dur:.0f}s media in {run_wall:.1f}s wall, {dur/run_wall:.1f}x speed) → treating as BAD", level="WARN")
 
-    if dur > STABILITY_SEC and bitrate_ok and not is_replay_burst:
+    is_intentional_boundary = bool(
+        getattr(state, "stop_flag", False)
+        or getattr(state, "manual_stop_requested", False)
+        or getattr(state, "normal_terminal_reason", None) in ("duration_reached", "live_stream_ended")
+        or getattr(state, "nm3u8dl_renewal_rollover_requested", False)
+        or recording_deadline_reached(state)
+    )
+    effective_min_dur = (
+        STABILITY_SEC
+        if (state.stats.get("good_chunks", 0) == 0 or is_intentional_boundary)
+        else MIN_ACCEPTED_CHUNK_SECONDS
+    )
+
+    probed_video_params = None
+    is_short_downgrade = False
+    if (
+        dur < MIN_ACCEPTED_CHUNK_SECONDS
+        and getattr(state, "baseline_video_params", None) is not None
+        and dur > effective_min_dur
+    ):
+        probed_video_params = get_video_params(chunk_path)
+        probe_w, probe_h, probe_fps = probed_video_params
+        base_w, base_h, base_fps = state.baseline_video_params
+        if (probe_w < base_w) or (probe_h < base_h) or (probe_fps < (base_fps - 5.0)):
+            is_short_downgrade = True
+            log(
+                f"{context}: {chunk_name} REJECTED ({dur:.1f}s < {MIN_ACCEPTED_CHUNK_SECONDS}s "
+                f"with downgraded quality {probe_w}x{probe_h}@{probe_fps}fps below baseline {base_w}x{base_h}@{base_fps}fps) → treating as BAD",
+                level="WARN",
+            )
+
+    if dur > effective_min_dur and bitrate_ok and not is_replay_burst and not is_short_downgrade:
         # Update best resolution/fps from this chunk and track consistency
-        w, h, fps = get_video_params(chunk_path)
+        w, h, fps = probed_video_params if probed_video_params is not None else get_video_params(chunk_path)
         log(f"{context}: {chunk_name} params {w}x{h}@{fps}fps")
+
+        # Item 6: Quality Downgrade Alarm & Baseline Tracking
+        if state.baseline_video_params is None:
+            state.baseline_video_params = (w, h, fps)
+        else:
+            base_w, base_h, base_fps = state.baseline_video_params
+            is_downgrade = (w < base_w) or (h < base_h) or (fps < (base_fps - 5.0))
+            is_upgrade = (h > base_h) or (h == base_h and w > base_w) or (h == base_h and w == base_w and fps > (base_fps + 5.0))
+
+            if is_upgrade:
+                # Stream upgraded above initial baseline (e.g. 720p -> 1080p50); lock new high-water baseline
+                state.baseline_video_params = (w, h, fps)
+                if state.quality_downgrade_alarm_active or state.acknowledged_quality_params is not None:
+                    quality_downgrade_alarm_stop(state, reason="upgraded")
+                    state.acknowledged_quality_params = None
+                    state.last_downgraded_quality_params = None
+                    log_good_beep("quality_upgraded")
+                    beep_good(state)
+            elif is_downgrade:
+                if state.stats.get("good_chunks", 0) > 0:
+                    state.same_params = False
+                downgrade_msg = f"Quality downgraded: {w}x{h}@{fps}fps (baseline {base_w}x{base_h}@{base_fps}fps)"
+                state.mixed_reason = downgrade_msg
+                state.last_downgraded_quality_params = (w, h, fps)
+                if state.acknowledged_quality_params != (w, h, fps):
+                    log(f"[ALARM] QUALITY DOWNGRADE DETECTED: {downgrade_msg} (Press 'A' to ACK)", level="WARN")
+                    quality_downgrade_alarm_start(state)
+            else:
+                if state.quality_downgrade_alarm_active or state.acknowledged_quality_params is not None:
+                    quality_downgrade_alarm_stop(state, reason="restored")
+                    state.acknowledged_quality_params = None
+                    state.last_downgraded_quality_params = None
+                    log_good_beep("quality_restored")
+                    beep_good(state)
+                    log(f"Broadcast quality restored to baseline {base_w}x{base_h}@{base_fps}fps")
 
         if state.stats["good_chunks"] == 0:
             # first GOOD chunk defines reference params
@@ -18319,7 +18601,7 @@ def maybe_accept_chunk(state: RecorderState, chunk_path, chunk_name, context):
         dur_media = dur
 
         # Wall-clock duration of this FFmpeg run
-        run_start = state.stats.get("last_run_start", time.time())
+        run_start = state.stats.get("last_run_start") or time.time()
         dur_run = time.time() - run_start
 
         # For "GOOD time" we want wall-clock FFmpeg running time
@@ -18446,6 +18728,12 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         state.stop_flag = True
         #return backoff_sec # # DO NOT return yet — we still want to accept the last chunk and write concat_list.txt
 
+    if result.metrics and engine.name == ENGINE_NM3U8DL:
+        if result.metrics.get("live_stream_ended"):
+            state.normal_terminal_reason = "live_stream_ended"
+        if result.metrics.get("renewal_rollover"):
+            state.nm3u8dl_renewal_rollover_requested = True
+
     ok = False
     if result.chunk_path and result.chunk_name:
         if engine.name == ENGINE_NM3U8DL:
@@ -18525,6 +18813,7 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
             state.nm3u8dl_pending_source = None
             state.nm3u8dl_renewal_rollover_requested = False
             state.nm3u8dl_rollover_reason = None
+            state.normal_terminal_reason = None
             return 0
 
         log(
@@ -18538,6 +18827,7 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         engine.name == ENGINE_NM3U8DL
         and result.metrics.get("renewal_rollover")
     ):
+        state.nm3u8dl_renewal_rollover_requested = False
         # A planned rollover is not proof of recovery. Keep every outstanding
         # N failure counter and any stall-alarm incident intact until the
         # replacement itself produces confirmed healthy growth.
@@ -18911,7 +19201,12 @@ def write_summary_log(state, dur, finalized=True):
         if finalized:
             lines.append(f"Recording summary for {FINAL_FILE}")
         else:
-            lines.append(f"Recording summary (NOT finalized - mixed params) for {FINAL_FILE}")
+            if not getattr(state, "same_params", True):
+                reason = getattr(state, "mixed_reason", "") or "stream parameters differ across chunks"
+                lines.append(f"Recording summary (NOT finalized - mixed params: {reason}) for {FINAL_FILE}")
+            else:
+                failure_msg = getattr(state, "last_finalization_failure", "") or "assembly failed"
+                lines.append(f"Recording summary (NOT finalized - {failure_msg}) for {FINAL_FILE}")
         lines.append("=" * 68)
         lines.append("")
         
@@ -19074,10 +19369,10 @@ def finalize_recording(state: RecorderState):
     # Decide whether we can avoid re-encoding
     if state.same_params:
         def _build_final_cmd(tier: int) -> list:
-            base = ["ffmpeg", "-y"]
-            if tier == 2:
-                base += ["-err_detect", "ignore_err", "-fflags", "+genpts+discardcorrupt"]
-            base += [
+            base = [
+                "ffmpeg", "-y",
+                "-err_detect", "ignore_err",
+                "-fflags", "+genpts+igndts+discardcorrupt",
                 "-f", "concat",
                 "-safe", "0",
                 "-nostats",
@@ -19088,11 +19383,19 @@ def finalize_recording(state: RecorderState):
                 "-map", "0:a?",
             ]
             if tier == 1:
-                return base + ["-c", "copy", os.path.join("..", FINAL_FILE)]
+                return base + [
+                    "-c", "copy",
+                    "-avoid_negative_ts", "make_zero",
+                    "-max_interleave_delta", "0",
+                    os.path.join("..", FINAL_FILE),
+                ]
             base += [
                 "-c:v", "copy",
+                "-bsf:v", "setts=ts='if(eq(PTS,NOPTS),PREV_OUTPTS+1,PTS)':dts='if(eq(DTS,NOPTS),PREV_OUTDTS+1,DTS)'",
                 "-c:a", "aac",
                 "-af", "aresample=async=1:first_pts=0",
+                "-avoid_negative_ts", "make_zero",
+                "-max_interleave_delta", "0",
             ]
             audio_streams = [s for s in (state.stream_layout_ref or [])
                              if s.get("codec_type") == "audio"] or list(state.audio_layout_ref or [])
@@ -19146,6 +19449,7 @@ def finalize_recording(state: RecorderState):
                     log(f"Could not remove failed {FINAL_FILE}: {e}", level="WARN")
             err_suffix = f" (last failure: {last_failure_reason})" if last_failure_reason else ""
             log(f"FINALIZATION FAILED (both tiers{err_suffix}) → FFmpeg could not create validated final MKV; keeping chunks folder for inspection.", level="ERROR")
+            state.last_finalization_failure = last_failure_reason or "ffmpeg concat failure"
             state.stats["process_end"] = time.time()
             black_len = BLACK_LEN
             sessions = state.stats.get("sessions", [])
@@ -19519,6 +19823,8 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
                 state.ffmpeg_off_post_ack_silent = True
                 state.alarm_ack_requested = False
                 state.alarm_linger_until = None
+            elif getattr(state, "quality_downgrade_alarm_active", False) or alarm_type == "quality_downgrade":
+                acknowledge_quality_downgrade_alarm(state)
             else:
                 alarm_activity_id = getattr(
                     state,
