@@ -21,26 +21,26 @@ HELPER_CONSTANTS = ("STREAM_CORRUPT_WINDOW_SEC", "STREAM_CORRUPT_ALARM_THRESHOLD
 
 
 def resolve_record_py_path() -> Path:
-    """Resolve RECORD.py: RECORD_PY_PATH env -> parent/sibling search -> skip in CI."""
-    env_path = os.environ.get("RECORD_PY_PATH")
+    """Resolve record_static.py: RECORD_STATIC_PY_PATH env -> parent/sibling search -> skip in CI."""
+    env_path = os.environ.get("RECORD_STATIC_PY_PATH")
     if env_path and Path(env_path).exists():
         return Path(env_path)
     candidates = []
     for parent in Path(__file__).resolve().parents[:4]:
         try:
             for item in parent.iterdir():
-                if item.is_file() and item.name == "RECORD.py":
+                if item.is_file() and item.name == "record_static.py":
                     candidates.append(item)
                 elif item.is_dir() and not item.name.startswith((".", "_")) and item.name != "Recorder":
-                    sub = item / "RECORD.py"
+                    sub = item / "record_static.py"
                     if sub.is_file():
                         candidates.append(sub)
         except (PermissionError, OSError):
             continue
     if candidates:
         return max(candidates, key=lambda p: p.stat().st_mtime)
-    raise unittest.SkipTest("Static recorder RECORD.py not found in local workspace (CI environment)")
-    raise unittest.SkipTest("Static recorder RECORD.py not found in local workspace (CI environment)")
+    raise unittest.SkipTest("Static recorder record_static.py not found in local workspace (CI environment)")
+    raise unittest.SkipTest("Static recorder record_static.py not found in local workspace (CI environment)")
 
 
 class WindowDummyState:
@@ -60,7 +60,7 @@ class WindowDummyState:
 
 
 def load_window_helpers():
-    """Extract the rolling-window constants and helpers from RECORD.py AST (no module import)."""
+    """Extract the rolling-window constants and helpers from record_static.py AST (no module import)."""
     record_path = resolve_record_py_path()
     tree = ast.parse(record_path.read_text(encoding="utf-8"))
     wanted = []
@@ -112,7 +112,7 @@ def load_window_helpers():
 
 
 def load_monitor_class():
-    """Extract StreamIntegrityMonitor directly from RECORD.py AST for fast isolated unit testing."""
+    """Extract StreamIntegrityMonitor directly from record_static.py AST for fast isolated unit testing."""
     record_path = str(resolve_record_py_path())
 
     with open(record_path, "r", encoding="utf-8") as f:
@@ -1287,7 +1287,7 @@ class TestBackoffPolicy(unittest.TestCase):
         self.assertEqual(backoff, 0)
 
     def test_record_dynamic_and_static_parity_on_backoff(self):
-        """Verify record_dynamic.py and RECORD.py both have the backoff constants and reset in code."""
+        """Verify record_dynamic.py and record_static.py both have the backoff constants and reset in code."""
         record_path = resolve_record_py_path()
         dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
 
@@ -1303,7 +1303,7 @@ class TestBackoffPolicy(unittest.TestCase):
         self.assertIn("chunk_dur >= HEALTHY_CHUNK_RESET_SEC", dynamic_src)
 
     def test_record_dynamic_and_static_parity_on_burst_and_constants(self):
-        """Verify record_dynamic.py and RECORD.py have complete parity on burst detection and named constants."""
+        """Verify record_dynamic.py and record_static.py have complete parity on burst detection and named constants."""
         record_path = resolve_record_py_path()
         dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
 
@@ -1312,7 +1312,7 @@ class TestBackoffPolicy(unittest.TestCase):
 
         # Both must define burst and bitrate constants
         for const in ("STABILITY_WALL_SEC = 25", "BURST_RATIO = 3.0", "DUP_MAX_SEC = 180", "FINAL_AUDIO_KBPS_PER_CHANNEL = 64"):
-            self.assertIn(const, record_src, f"Missing {const} in RECORD.py")
+            self.assertIn(const, record_src, f"Missing {const} in record_static.py")
             self.assertIn(const, dynamic_src, f"Missing {const} in record_dynamic.py")
 
         # Both must guard replay burst in maybe_accept_chunk
@@ -1321,7 +1321,7 @@ class TestBackoffPolicy(unittest.TestCase):
         self.assertIn("and not is_replay_burst", record_src)
         self.assertIn("and not is_replay_burst", dynamic_src)
 
-        # StreamIntegrityMonitor in RECORD.py must define and use WRAPPED_PTS_TOLERANCE
+        # StreamIntegrityMonitor in record_static.py must define and use WRAPPED_PTS_TOLERANCE
         self.assertIn("WRAPPED_PTS_TOLERANCE = 450_000", record_src)
         self.assertIn("self.WRAPPED_PTS_TOLERANCE", record_src)
 
@@ -1332,7 +1332,7 @@ class TestBackoffPolicy(unittest.TestCase):
         self.assertIn('sys.stdout.reconfigure(errors="replace")', dynamic_src)
 
     def test_30_record_dynamic_and_static_parity_on_timing_burst_throttling(self):
-        """Verify record_dynamic.py and RECORD.py have complete parity on timing warning burst throttling and termcap capture."""
+        """Verify record_dynamic.py and record_static.py have complete parity on timing warning burst throttling and termcap capture."""
         record_path = resolve_record_py_path()
         dynamic_path = Path(__file__).resolve().parent.parent / "record_dynamic.py"
 
@@ -1353,7 +1353,7 @@ class TestBackoffPolicy(unittest.TestCase):
 
     def test_31_concat_finalization_flags_and_bsf_tier_hardening(self):
         """
-        Verifies Items 4A & 4B: Matroska concat command line construction across RECORD.py and record_dynamic.py:
+        Verifies Items 4A & 4B: Matroska concat command line construction across record_static.py and record_dynamic.py:
         1. Demuxer input error tolerance: -err_detect ignore_err -fflags +genpts+igndts+discardcorrupt before -f concat.
         2. Tier 1 output flags: -avoid_negative_ts make_zero -max_interleave_delta 0.
         3. Tier 2 timestamp synthesis: -bsf:v setts=ts='if(eq(PTS,NOPTS),PREV_OUTPTS+1,PTS)':dts='if(eq(DTS,NOPTS),PREV_OUTDTS+1,DTS)'
@@ -1365,7 +1365,7 @@ class TestBackoffPolicy(unittest.TestCase):
         record_src = record_path.read_text(encoding="utf-8")
         dynamic_src = dynamic_path.read_text(encoding="utf-8")
 
-        for src, name in ((record_src, "RECORD.py"), (dynamic_src, "record_dynamic.py")):
+        for src, name in ((record_src, "record_static.py"), (dynamic_src, "record_dynamic.py")):
             # Input error tolerance flags before -f concat
             self.assertIn('"-err_detect", "ignore_err"', src, f"Missing -err_detect ignore_err in {name}")
             self.assertIn('"-fflags", "+genpts+igndts+discardcorrupt"', src, f"Missing +genpts+igndts+discardcorrupt in {name}")
@@ -1391,7 +1391,7 @@ class TestBackoffPolicy(unittest.TestCase):
         record_src = record_path.read_text(encoding="utf-8")
         dynamic_src = dynamic_path.read_text(encoding="utf-8")
 
-        for src, name in ((record_src, "RECORD.py"), (dynamic_src, "record_dynamic.py")):
+        for src, name in ((record_src, "record_static.py"), (dynamic_src, "record_dynamic.py")):
             # Dynamic header checks in write_summary_log
             self.assertIn('lines.append(f"Recording summary (NOT finalized - mixed params: {reason}) for {FINAL_FILE}")', src, f"Missing mixed params header in {name}")
             self.assertIn('lines.append(f"Recording summary (NOT finalized - {failure_msg}) for {FINAL_FILE}")', src, f"Missing failure header in {name}")
@@ -1620,7 +1620,7 @@ class TestBackoffPolicy(unittest.TestCase):
 
     def test_35_record_dynamic_and_static_parity_on_quality_alarms_and_durations(self):
         """
-        Verifies Item 8: Complete parity between RECORD.py and record_dynamic.py for:
+        Verifies Item 8: Complete parity between record_static.py and record_dynamic.py for:
         1. MIN_ACCEPTED_CHUNK_SECONDS = 60
         2. quality_downgrade alarm functions and state fields
         3. Two-tier duration acceptance and short downgrade discard logic
@@ -1632,7 +1632,7 @@ class TestBackoffPolicy(unittest.TestCase):
         record_src = record_path.read_text(encoding="utf-8")
         dynamic_src = dynamic_path.read_text(encoding="utf-8")
 
-        for src, name in ((record_src, "RECORD.py"), (dynamic_src, "record_dynamic.py")):
+        for src, name in ((record_src, "record_static.py"), (dynamic_src, "record_dynamic.py")):
             # Constant
             self.assertIn("MIN_ACCEPTED_CHUNK_SECONDS = 60", src, f"Missing MIN_ACCEPTED_CHUNK_SECONDS in {name}")
             # State fields

@@ -532,7 +532,7 @@ class RecordDynamicWiringTests(unittest.TestCase):
         self.assertIn('"hard_stall_required": 20,', self.code)
 
     def test_nm3u8dl_fatal_producer_error_wiring_in_static_recorder(self):
-        env_path = os.environ.get("RECORD_PY_PATH")
+        env_path = os.environ.get("RECORD_STATIC_PY_PATH")
         if env_path and Path(env_path).exists():
             static_path = Path(env_path)
         else:
@@ -540,11 +540,11 @@ class RecordDynamicWiringTests(unittest.TestCase):
             for parent in Path(__file__).resolve().parents[:4]:
                 try:
                     for item in parent.iterdir():
-                        if item.is_file() and item.name == "RECORD.py":
+                        if item.is_file() and item.name == "record_static.py":
                             static_path = item
                             break
                         if item.is_dir() and not item.name.startswith((".", "_")) and item.name != "Recorder":
-                            sub = item / "RECORD.py"
+                            sub = item / "record_static.py"
                             if sub.is_file():
                                 static_path = sub
                                 break
@@ -553,7 +553,7 @@ class RecordDynamicWiringTests(unittest.TestCase):
                 except (PermissionError, OSError):
                     continue
         if not static_path:
-            self.skipTest("Static recorder RECORD.py not found in local workspace (CI environment)")
+            self.skipTest("Static recorder record_static.py not found in local workspace (CI environment)")
         static_code = static_path.read_text(encoding="utf-8")
 
         # 1. Function definition exists
@@ -573,7 +573,7 @@ class RecordDynamicWiringTests(unittest.TestCase):
         self.assertIn("if is_nm3u8dl_fatal_producer_error(stripped):", monitor_sub)
         self.assertIn('state.nm3u8dl_stall_reason = "playlist_producer_timeout"', monitor_sub)
 
-        # 4. Callsite of extract_nm3u8dl_startup_info in RECORD.py passes state=state
+        # 4. Callsite of extract_nm3u8dl_startup_info in record_static.py passes state=state
         start_call = static_code.find("startup_data = extract_nm3u8dl_startup_info(")
         call_sub = static_code[start_call:start_call + 300]
         self.assertIn("state=state", call_sub)
