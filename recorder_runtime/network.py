@@ -34,6 +34,15 @@ RATE_LIMIT_WINDOW_SEC = 30.0
 VPN_HOLD_TIMEOUT_SEC = 30 * 60.0
 INTERNET_HOLD_TIMEOUT_SEC = 30 * 60.0
 TOKEN_HOLD_TIMEOUT_SEC = 30 * 60.0
+STARTUP_SILENT_WINDOW_SEC = 120.0
+TOKEN_REPLACEMENT_PROBE_BYPASS_SEC = 45.0
+TOKEN_HOLD_COUNTDOWN_LOG_SEC = 30.0
+
+# Terminal output serialization lock (B4)
+_CONSOLE_LOCK = threading.RLock()
+
+# Module-level URL extractor for token discovery across commands and URLs (N5)
+_URL_RE = re.compile(r'https?://[^\s"\']+')
 
 
 def default_log(msg: str, level: str = "INFO", **kwargs) -> None:
@@ -923,6 +932,8 @@ class NetworkGuard:
         self.blocked_403_ip: Optional[str] = None
         self.last_403_incident_mono: float = 0.0
         self.token_expiry_count: int = 0
+        # Initialize startup window timestamp explicitly at launch (B5)
+        self._last_token_gate_pass_mono: Optional[float] = time.monotonic()
 
 
         # Double-VPN runtime tracking
@@ -1315,17 +1326,45 @@ class NetworkGuard:
                 return True, provider
         return False, ""
 
+    def mark_startup_begin(self) -> None:
+        """Restart the silent startup window at the moment the first chunk launch is attempted (D3)."""
+        self._last_token_gate_pass_mono = time.monotonic()
+
+    def is_startup_phase(self) -> bool:
+        """
+        Check if recorder is in initial startup phase (silent hold window).
+        True strictly when zero good chunks have been recorded AND within STARTUP_SILENT_WINDOW_SEC
+        of launch / last token gate pass. Once first chunk is safely sealed or 120s elapses, returns False.
+        """
+        good = 0
+        if self.state and hasattr(self.state, "stats"):
+            try:
+                good = int(self.state.stats.get("good_chunks", 0) or 0)
+            except Exception:
+                good = 0
+        if good > 0:
+            return False
+        last = self._last_token_gate_pass_mono
+        if last is None:
+            # Fallback lazy initialization if engine did not explicitly seed timestamp (B5)
+            self._last_token_gate_pass_mono = time.monotonic()
+            return True
+        return (time.monotonic() - last) < STARTUP_SILENT_WINDOW_SEC
+
     def _proactive_token_gate_check(self) -> bool:
         """Evaluate stream token validity before chunk launch, bypassing dynamic playlist mode."""
         source_mode = getattr(self.state, "source_mode", None)
         if source_mode != "playlist":
-            if self.is_stream_token_expired(lead_time_sec=60.0):
+            if self.is_stream_token_expired(lead_time_sec=0.0) and \
+                    getattr(self.state, "token_clock_override_url", None) != self.get_active_source_url():
+                is_startup = self.is_startup_phase()
                 self.log_fn(
-                    "NETWORK_GUARD: Stream authentication token expired or expiring within 60s! "
+                    "NETWORK_GUARD: Stream authentication token already expired! "
                     "Diverting to Token Hold before chunk launch...",
                     level="WARN",
                 )
-                return self.handle_token_hold_state()
+                return self.handle_token_hold_state(is_startup=is_startup)
+        self._last_token_gate_pass_mono = time.monotonic()
         return True
 
     def inter_chunk_gate_check(self, temp_dir: Optional[str] = None) -> bool:
@@ -1741,13 +1780,13 @@ class NetworkGuard:
     def extract_stream_expiry(url_or_cmd: Optional[str]) -> Optional[int]:
         """
         Extract token expiry epoch timestamp from URL or command string.
-        Supports query params: exp, expires, expiry. Normalizes 13-digit ms to seconds.
+        Supports query params: exp, expires, expiry, expire. Normalizes 13-digit ms to seconds.
         """
         if not url_or_cmd:
             return None
         expiries = []
         for match in re.finditer(
-            r'(?:^|[?&~=;])(?:exp|expires|expiry)=(\d+)',
+            r'(?:^|[?&~=;])(?:exp(?:ires?|iry)?)=(\d+)',
             str(url_or_cmd),
             flags=re.IGNORECASE,
         ):
@@ -1758,32 +1797,33 @@ class NetworkGuard:
                 expiries.append(raw_val)
         return min(expiries) if expiries else None
 
-    def is_stream_token_expired(self, lead_time_sec: float = 60.0) -> bool:
+    def is_stream_token_expired(self, lead_time_sec: float = 0.0) -> bool:
         """
-        Check if the active stream token is already expired or expiring within lead_time_sec.
+        Check if the active stream token is already expired (default: no future runway).
         Returns False if no expiry parameter is present.
         """
-        url = self.get_active_source_url() or self.get_active_source_material()
-        expiry = self.extract_stream_expiry(url)
-        if expiry is None:
+        tokenised, expiry = self._stream_is_token_governed(self.get_active_source_url() or "", state=self.state)
+        if not tokenised or expiry is None:
             return False
         return float(expiry) <= (time.time() + lead_time_sec)
 
-    def _probe_stream_url(self, url: str, timeout: float = 3.0) -> bool:
+    def _probe_stream_status(self, url: str, timeout: float = 3.0, use_range: bool = True) -> Tuple[bool, Optional[int]]:
         """
-        Probe stream URL via HTTP GET with Range request.
-        Returns True if HTTP 200/206, False if 401/403/404/410 or connection failure.
+        Probe stream URL via HTTP GET with optional Range request.
+        Returns:
+            (True, status_code) on HTTP 200/206.
+            (False, status_code) on HTTP error (e.g. 401, 403, 404, 416).
+            (False, None) on network timeout or connection failure.
         """
         if not url:
-            return False
+            return False, None
         try:
-            req = Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-                    "Range": "bytes=0-100",
-                },
-            )
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+            }
+            if use_range:
+                headers["Range"] = "bytes=0-100"
+            req = Request(url, headers=headers)
             opener = None
             if self.vpn_mode == "WIREPROXY" and self.wireproxy_manager and self.wireproxy_manager.is_running():
                 proxy_handler = ProxyHandler({
@@ -1796,14 +1836,37 @@ class NetworkGuard:
             with open_fn(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", None) or getattr(resp, "code", None)
                 if status in (200, 206):
-                    return True
+                    return True, status
+                return False, status
         except HTTPError as e:
-            if e.code in (401, 403, 404, 410):
-                return False
-            return False
+            return False, e.code
         except Exception:
-            return False
-        return False
+            return False, None
+
+    def _probe_stream_url(self, url: str, timeout: float = 3.0) -> bool:
+        """Bool wrapper preserved for the operator re-paste path and legacy callers."""
+        return self._probe_stream_status(url, timeout)[0]
+
+    def _stream_is_token_governed(self, url: str, state=None) -> Tuple[bool, Optional[int]]:
+        """
+        Evaluate if a stream is governed by an expiring authentication token.
+        Scans URLs found in the stream URL and all active source material fields for expiration timestamps (N5).
+        """
+        st = state or self.state
+        raw = [url] if url else []
+        if st:
+            for attr in ("nm3u8dl_part_a", "active_command", "live_url", "active_stream_url"):
+                val = getattr(st, attr, None)
+                if isinstance(val, str) and val.strip():
+                    raw.append(val.strip())
+        urls = []
+        for s in raw:
+            found = _URL_RE.findall(s)
+            if found:
+                urls.append(found[0])
+        exps = [e for e in (self.extract_stream_expiry(u) for u in urls) if e is not None]
+        expiry = min(exps) if exps else None
+        return (expiry is not None), expiry
 
     def update_stream_url(self, new_input: str) -> None:
         """
@@ -1842,29 +1905,20 @@ class NetworkGuard:
                 candidate,
             ).strip()
 
-        new_exp = self.extract_stream_expiry(new_url)
-
         def _replace_url_in_cmd(cmd_str: str) -> str:
             if not cmd_str:
                 return cmd_str
             if not is_bare_url and cleaned_cmd:
                 return cleaned_cmd
-            if '"http' in cmd_str:
-                updated = re.sub(r'"https?://[^"]+"', f'"{new_url}"', cmd_str, count=1)
-            elif "'http" in cmd_str:
-                updated = re.sub(r"'https?://[^']+'", f"'{new_url}'", cmd_str, count=1)
-            else:
-                updated = re.sub(r'https?://\S+', new_url, cmd_str, count=1)
-            if new_exp is not None:
-                updated = re.sub(
-                    r'(\b(?:exp|expires|expiry)=)\d+',
-                    rf'\g<1>{new_exp}',
-                    updated,
-                    flags=re.IGNORECASE,
-                )
-            return updated
+            # Replace exactly the first URL (the stream URL), the same one _stream_is_token_governed scans,
+            # so quoted secondary URLs (Referer/Origin headers) can never absorb the replacement.
+            first = _URL_RE.search(cmd_str)
+            if first:
+                return cmd_str[:first.start()] + new_url + cmd_str[first.end():]
+            return cmd_str
 
         if self.state:
+            setattr(self.state, "token_clock_override_url", None)
             setattr(self.state, "active_stream_url", new_url)
             setattr(self.state, "live_url", new_url)
 
@@ -1877,33 +1931,116 @@ class NetworkGuard:
 
     def _verify_and_resume_stream(self, state=None) -> bool:
         """
-        Unattended Resumption Protocol:
-        Probes existing URL. If valid, resumes automatically.
-        If expired / 403, diverts to 30-minute Token Hold state.
+        Unattended Resumption Protocol (token-aware, format-agnostic):
+        - Feeds without expiring tokens: Resumes unattended recording immediately without probing.
+        - Dynamic playlist mode: Exempt from clock-based holds; resumes unattended for dynamic manifest refresh.
+        - Feeds with expiring tokens:
+          * Probes endpoint (Question 1 Option B confirmation probe with Range fallback & transport retry).
+          * Diverts to Token Hold on HTTP 401, 403, or 410 (non-playlist feeds).
+          * Inconclusive probe results (timeout, 5xx, 416): Resumes recording via engine retry.
         """
+        st = state or self.state
         url = self.get_active_source_url()
+
+        def _resume(msg: str) -> bool:
+            self.log_fn(msg, level="INFO")
+            if self.resume_callback:
+                self.resume_callback(st)
+            return True
+
+        def _hold(msg: str) -> bool:
+            if st is not None:
+                setattr(st, "token_clock_override_url", None)
+            self.log_fn(msg, level="WARN")
+            return self.handle_token_hold_state(is_startup=self.is_startup_phase())
+
         if not url:
             if self.resume_callback:
-                self.resume_callback(self.state)
+                self.resume_callback(st)
             return True
 
-        is_valid = self._probe_stream_url(url)
-        if is_valid:
-            network_type = "VPN" if self.is_armed else "internet connection"
-            self.log_fn(f"NETWORK_GUARD: Stream verified via restored {network_type}. Resuming unattended recording.", level="INFO")
-            if self.resume_callback:
-                self.resume_callback(self.state)
-            return True
-        else:
-            self.log_fn("NETWORK_GUARD: Stream token expired during outage. Diverting to Token Hold...", level="WARN")
-            return self.handle_token_hold_state()
+        network_type = "VPN" if self.is_armed else "internet connection"
+        geo = f" [Launch egress: {getattr(self, 'launch_country', None) or 'Unknown'} | Required: {getattr(self, 'required_country', None) or 'ANY'}]"
+        tokenised, expiry = self._stream_is_token_governed(url, state=st)
+        is_playlist = getattr(st, "source_mode", None) == "playlist"
 
-    def handle_token_hold_state(self) -> bool:
+        # 1. Non-tokenized feeds or dynamic playlist mode: zero probing, immediate unattended resumption
+        if is_playlist or not tokenised:
+            return _resume(f"NETWORK_GUARD: No hold-eligible token on stream (playlist or untokenised). Route restored via {network_type}. Resuming unattended recording.")
+
+        # 2. Tokenized feeds: probe endpoint first (Option B confirmation probe)
+        ok, status = self._probe_stream_status(url)
+        if not ok and status is None:
+            ok, status = self._probe_stream_status(url)                   # one transport retry, no sleep
+        if not ok and status in (400, 405, 406, 416, 501):
+            ok, status = self._probe_stream_status(url, use_range=False)  # live feed rejects Range
+
+        if ok:
+            if expiry is not None and float(expiry) <= time.time() and st is not None:
+                setattr(st, "token_clock_override_url", url)              # probe beat the clock (Option B)
+            return _resume(f"NETWORK_GUARD: Stream verified via restored {network_type}. Resuming unattended recording.")
+
+        # 3. Divert to Token Hold on explicit auth rejection (401/403) or expired signed link (410 on tokenized feed)
+        if status in (401, 403) or (status == 410 and tokenised):
+            return _hold(f"NETWORK_GUARD: Stream authorization rejected (HTTP {status}). Diverting to Token Hold...{geo}")
+
+        # 4. If timestamp elapsed during outage and probe confirmed 404 (dead link) on non-playlist feed
+        if expiry is not None and float(expiry) <= time.time() and status == 404:
+            return _hold(f"NETWORK_GUARD: Stream token expired during outage. Diverting to Token Hold...{geo}")
+
+        # 5. Inconclusive / non-auth probe failure: resume via engine retry
+        return _resume(f"NETWORK_GUARD: Post-restoration probe inconclusive ({status or 'timeout'}). Resuming via recorder retry.")
+
+    def _redraw_hold_prompt(self) -> None:
+        try:
+            with _CONSOLE_LOCK:
+                buf = getattr(self.state, "token_hold_input_buffer", "") if self.state else ""
+                if not isinstance(buf, str):
+                    buf = ""
+                sys.stdout.write("TOKEN_HOLD> " + buf)
+                sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _hold_log(self, msg: str, level: str = "INFO") -> None:
+        try:
+            with _CONSOLE_LOCK:
+                self.clear_progress_fn()  # "\r\x1b[2K": wipe partial prompt line (B3)
+                self.log_fn(msg, level=level)
+                self._redraw_hold_prompt()
+        except (OSError, ValueError):
+            pass
+
+    def handle_token_hold_state(self, is_startup: bool = False) -> bool:
         """
         30-Minute Stream Token Expiry Hold State:
-        Safely halts downstream attempts, sounds token_expired alarm,
-        renders live countdown, and prompts operator to paste updated stream URL or command.
+        Safely halts downstream attempts, manages alarm (silent on manual startup,
+        audible mid-match/scheduled), displays clean prompt with 30s countdown logs,
+        and accepts updated URL or command.
+        Guarantees cleanup of token_hold_active, escape state, and alarm via try...finally (B1).
         """
+        if self.state:
+            setattr(self.state, "token_clock_override_url", None)
+        try:
+            return self._token_hold_loop(is_startup)
+        finally:
+            if self.state:
+                setattr(self.state, "token_hold_active", False)
+                setattr(self.state, "_hold_esc_state", None)
+                setattr(self.state, "_hold_esc_ts", 0.0)
+                setattr(self.state, "token_hold_input_buffer", "")
+                setattr(self.state, "token_hold_submitted_url", None)
+                setattr(self.state, "_last_submit_ch", "")
+            try:
+                if self.alarm_stop_fn:
+                    self.alarm_stop_fn(self.state)
+            except Exception as exc:
+                try:
+                    self.log_fn(f"NETWORK_GUARD: [TOKEN_HOLD] alarm_stop failed during cleanup: {exc}", level="WARN")
+                except Exception:
+                    pass  # never let a logging failure mask the original exception
+
+    def _token_hold_loop(self, is_startup: bool = False) -> bool:
         self.token_expiry_count += 1
         if not sys.stdin.isatty():
             self.log_fn(
@@ -1920,36 +2057,58 @@ class NetworkGuard:
             setattr(self.state, "token_hold_active", True)
             setattr(self.state, "token_hold_input_buffer", "")
             setattr(self.state, "token_hold_submitted_url", None)
+            setattr(self.state, "_hold_esc_state", None)
+            setattr(self.state, "_hold_esc_ts", 0.0)
 
+        is_scheduled_run = bool(self.state and getattr(self.state, "is_scheduled", False))
+        should_alarm = (is_scheduled_run if is_startup else True)
         already_silenced = bool(self.state and getattr(self.state, "token_expired_post_ack_silent", False))
+        alarm_wanted = should_alarm and not already_silenced
+        good = 0
+        if self.state and hasattr(self.state, "stats"):
+            try:
+                good = int(self.state.stats.get("good_chunks", 0) or 0)
+            except Exception:
+                good = 0
 
         banner = [
             "====================================================================",
             "[TOKEN_HOLD] Stream authentication token expired!",
             "Outbound VPN and internet verified healthy.",
-            "Active chunk safely sealed to disk.",
-            "Holding for up to 30 minutes for updated stream URL.",
-            "Paste updated URL or full command and press ENTER to resume.",
         ]
-        if not already_silenced:
-            banner.append("Press 'A' to silence audio alarm.")
-        else:
-            banner.append("Audio alarm already silenced by operator.")
-        banner.append("====================================================================")
+        if good > 0:
+            banner.append("Active chunk safely sealed to disk.")
+        banner += [
+            "Holding for up to 30 minutes for updated stream URL.",
+            "Paste updated URL or full N_m3u8DL-RE command and press ENTER to resume.",
+            "Press 'A' to silence audio alarm." if alarm_wanted
+            else "Audio alarm inactive (manual startup; sounds after 120s without response / already silenced).",
+            "====================================================================",
+        ]
 
         for b_line in banner:
             self.log_fn(b_line, level="WARN")
 
-        if not already_silenced and self.alarm_start_fn:
-            self.alarm_start_fn(self.state, alarm_type="token_expired")
-        elif not already_silenced and self.beep_bad_fn:
-            self.beep_bad_fn(self.state)
+        if alarm_wanted:
+            if self.alarm_start_fn:
+                self.alarm_start_fn(self.state, alarm_type="token_expired")
+            elif self.beep_bad_fn:
+                self.beep_bad_fn(self.state)
 
-        last_wait_len = 0
+        self._redraw_hold_prompt()
+
         alarm_silenced = already_silenced
+        escalated = False
+        last_countdown_log_mono = hold_start_mono
+        attended_mono = hold_start_mono
+        last_seen_buf = ""
 
         while True:
             now = time.monotonic()
+            cur_buf = getattr(self.state, "token_hold_input_buffer", "") if self.state else ""
+            if isinstance(cur_buf, str) and cur_buf != last_seen_buf:
+                last_seen_buf = cur_buf
+                attended_mono = now          # operator is typing/pasting
 
             if self.state and getattr(self.state, "stop_flag", False):
                 if self.state:
@@ -1976,10 +2135,18 @@ class NetworkGuard:
                 setattr(self.state, "alarm_ack_requested", False)
                 setattr(self.state, "token_expired_post_ack_silent", True)
                 alarm_silenced = True
-                self.clear_progress_fn()
-                self.log_fn("ALARM_ACK (Token Expiry Hold audio alarm silenced by operator)", level="INFO")
+                self._hold_log("ALARM_ACK (Token Expiry Hold audio alarm silenced by operator)", level="INFO")
 
             elapsed = now - hold_start_mono
+            if (not should_alarm and not alarm_silenced and not escalated
+                    and (now - attended_mono) >= STARTUP_SILENT_WINDOW_SEC):
+                escalated = True
+                alarm_wanted = True
+                self._hold_log(f"NETWORK_GUARD: [TOKEN_HOLD] No operator response for {int(STARTUP_SILENT_WINDOW_SEC)}s. Sounding alarm.", level="WARN")
+                if self.alarm_start_fn:
+                    self.alarm_start_fn(self.state, alarm_type="token_expired")
+                elif self.beep_bad_fn:
+                    self.beep_bad_fn(self.state)
             if elapsed >= self.hold_timeout_sec:
                 if self.state:
                     setattr(self.state, "token_hold_active", False)
@@ -1992,54 +2159,90 @@ class NetworkGuard:
 
             submitted = getattr(self.state, "token_hold_submitted_url", None) if self.state else None
             if submitted:
+                attended_mono = now
                 setattr(self.state, "token_hold_submitted_url", None)
                 candidate = submitted.strip()
-                self.clear_progress_fn()
-                self.log_fn("[TOKEN_HOLD] Operator entered candidate stream URL / command. Verifying connectivity...", level="INFO")
+                self._hold_log("[TOKEN_HOLD] Operator entered candidate stream URL / command. Verifying connectivity...", level="INFO")
 
-                probe_url = ""
-                if candidate.startswith("http://") or candidate.startswith("https://"):
-                    probe_url = candidate.split()[0]
-                else:
-                    m = re.search(r'["\'](https?://[^"\']+)["\']', candidate)
-                    if m:
-                        probe_url = m.group(1)
+                try:
+                    probe_url = ""
+                    if candidate.startswith("http://") or candidate.startswith("https://"):
+                        probe_url = candidate.split()[0]
                     else:
-                        m2 = re.search(r'(https?://\S+)', candidate)
-                        if m2:
-                            probe_url = m2.group(1)
+                        m = re.search(r'["\'](https?://[^"\']+)["\']', candidate)
+                        if m:
+                            probe_url = m.group(1)
+                        else:
+                            m2 = re.search(r'(https?://\S+)', candidate)
+                            if m2:
+                                probe_url = m2.group(1)
 
-                cand_exp = self.extract_stream_expiry(candidate)
-                if cand_exp is not None and float(cand_exp) <= (time.time() + 60.0):
-                    self.log_fn(
-                        "NETWORK_GUARD: [TOKEN_HOLD] Submitted URL token is already expired or expiring within 60s. "
-                        "Please paste a freshly generated stream URL or command:",
+                    cand_exp = self.extract_stream_expiry(candidate)
+                    now_ts = time.time()
+                    if cand_exp is not None and float(cand_exp) <= now_ts:
+                        self._hold_log(
+                            "NETWORK_GUARD: [TOKEN_HOLD] Submitted URL token is already expired. "
+                            "Please paste a freshly generated stream URL or command:",
+                            level="WARN",
+                        )
+                    else:
+                        bypass_probe = bool(
+                            probe_url and cand_exp is not None
+                            and (float(cand_exp) - now_ts) < TOKEN_REPLACEMENT_PROBE_BYPASS_SEC
+                        )
+                        if bypass_probe or (probe_url and self._probe_stream_url(probe_url)):
+                            self.update_stream_url(candidate)  # only pre-commit step allowed to trigger re-paste path
+                            self._last_token_gate_pass_mono = time.monotonic()
+                            if self.state:
+                                setattr(self.state, "token_hold_active", False)
+                                setattr(self.state, "token_expired_post_ack_silent", False)
+                                setattr(self.state, "_hold_esc_state", None)
+                                setattr(self.state, "_hold_esc_ts", 0.0)
+                            # Post-commit side effects: URL already applied, so failures here must never resume the hold.
+                            post_actions = []
+                            if self.alarm_stop_fn:
+                                post_actions.append(lambda: self.alarm_stop_fn(self.state))
+                            if self.log_good_beep_fn:
+                                post_actions.append(lambda: self.log_good_beep_fn("stream_token_renewed"))
+                            if self.beep_good_fn:
+                                post_actions.append(lambda: self.beep_good_fn(self.state))
+                            for post_action in post_actions:
+                                try:
+                                    post_action()
+                                except Exception as post_exc:
+                                    try:
+                                        self.log_fn(
+                                            f"NETWORK_GUARD: [TOKEN_HOLD] post-renewal action failed (ignored): {post_exc}",
+                                            level="WARN",
+                                        )
+                                    except Exception:
+                                        pass
+                            self.log_fn("NETWORK_GUARD: Stream token verified and updated successfully! Resuming recording.", level="INFO")
+                            return True
+                        else:
+                            self._hold_log(
+                                "NETWORK_GUARD: Candidate URL failed verification probe (HTTP 401/403/404 or connection error). "
+                                "Please paste a valid, active stream URL or command:",
+                                level="WARN",
+                            )
+                except Exception as exc:
+                    self._hold_log(
+                        f"NETWORK_GUARD: [TOKEN_HOLD] Candidate processing failed ({type(exc).__name__}: {exc}). "
+                        "Please paste a valid, active stream URL or command:",
                         level="WARN",
                     )
-                elif probe_url and self._probe_stream_url(probe_url):
-                    self.update_stream_url(candidate)
-                    if self.state:
-                        setattr(self.state, "token_hold_active", False)
-                        setattr(self.state, "token_expired_post_ack_silent", False)
-                    if self.alarm_stop_fn:
-                        self.alarm_stop_fn(self.state)
-                    if self.log_good_beep_fn:
-                        self.log_good_beep_fn("stream_token_renewed")
-                    if self.beep_good_fn:
-                        self.beep_good_fn(self.state)
-                    self.log_fn("NETWORK_GUARD: Stream token verified and updated successfully! Resuming recording.", level="INFO")
-                    return True
-                else:
-                    self.log_fn("NETWORK_GUARD: Candidate URL failed verification probe (HTTP 401/403/404 or connection error).", level="WARN")
-                    self.log_fn("Please paste a valid, active stream URL or command:", level="WARN")
 
             rem = max(0.0, self.hold_timeout_sec - elapsed)
-            alarm_hint = " (Alarm silenced)" if (alarm_silenced or (self.state and getattr(self.state, "token_expired_post_ack_silent", False))) else " (Press 'A' to silence alarm)"
-            hold_text = f"[TOKEN_HOLD] Waiting for updated stream URL... Timeout remaining: {fmt_hms(rem)}{alarm_hint}"
-            pad = max(0, last_wait_len - len(hold_text))
-            if not (self.state and getattr(self.state, "token_hold_input_buffer", "")):
-                self.render_progress_fn(hold_text, pad=pad)
-                last_wait_len = len(hold_text)
+            post_ack = bool(self.state and getattr(self.state, "token_expired_post_ack_silent", False))
+            if alarm_silenced or post_ack:
+                alarm_hint = " (Alarm silenced)"
+            elif not alarm_wanted:
+                alarm_hint = " (Alarm inactive - manual startup)"
+            else:
+                alarm_hint = " (Press 'A' to silence alarm)"
+            if now - last_countdown_log_mono >= TOKEN_HOLD_COUNTDOWN_LOG_SEC:
+                last_countdown_log_mono = now
+                self._hold_log(f"[TOKEN_HOLD] Waiting for updated stream URL... Timeout remaining: {fmt_hms(rem)}{alarm_hint}", level="INFO")
 
             time.sleep(1.0)
 
@@ -2093,7 +2296,7 @@ class NetworkGuard:
             f"403 classified as STREAM_TOKEN_EXPIRED. Diverting to Token Hold...",
             level="WARN",
         )
-        recovered = self.handle_token_hold_state()
+        recovered = self.handle_token_hold_state(is_startup=is_startup)
         if recovered:
             self.has_403_error = False
             self.blocked_403_ip = None

@@ -86,6 +86,7 @@ from recorder_runtime.network import (
     RATE_LIMIT_WINDOW_SEC,
     VPN_HOLD_TIMEOUT_SEC,
     INTERNET_HOLD_TIMEOUT_SEC,
+    _CONSOLE_LOCK,
     is_wireproxy_active,
     create_network_guard,
 )
@@ -2353,41 +2354,94 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
 
     def handle_key(ch):
         if getattr(state, "token_hold_active", False):
+            esc = getattr(state, "_hold_esc_state", None)
+            if esc:
+                if time.monotonic() - getattr(state, "_hold_esc_ts", 0.0) > 0.25:
+                    esc = None                      # stale partial sequence: abandon it
+                    state._hold_esc_state = None
+            if esc == "esc":
+                if ch in ("[", "O"):
+                    state._hold_esc_state = "csi"
+                    state._hold_esc_ts = time.monotonic()
+                    return
+                state._hold_esc_state = None        # not a sequence: fall through and process ch normally
+            elif esc == "csi":
+                if "@" <= ch <= "~":
+                    state._hold_esc_state = None
+                    return
+                if ch < " ":                        # control byte: sequence aborted, reprocess ch
+                    state._hold_esc_state = None
+                else:
+                    state._hold_esc_ts = time.monotonic()
+                    return                          # parameter/intermediate byte (0x20-0x3F)
+            if ch == "\x1b":
+                state._hold_esc_state = "esc"
+                state._hold_esc_ts = time.monotonic()
+                return
+            # N7: \b \b cannot rewind across terminal-wrapped lines (>500 chars); accepted console UI limitation.
+            if ch == "\x15":                    # Ctrl-U clears the line
+                try:
+                    with _CONSOLE_LOCK:
+                        buf = getattr(state, "token_hold_input_buffer", "")
+                        if buf:
+                            state.token_hold_input_buffer = ""
+                            sys.stdout.write("\b \b" * len(buf))
+                            sys.stdout.flush()
+                except (OSError, ValueError):
+                    pass
+                return
+
+            # Hotkey 'a' / 'A' on empty buffer acknowledges token hold alarm (silences siren).
+            # Accepted risk: a pasted command starting with 'a'/'A' on an empty buffer triggers ack;
+            # standard stream URLs (http...) and commands (N_m3u8DL-RE) do not start with 'a'/'A'.
             if not getattr(state, "token_hold_input_buffer", "") and ch in ("a", "A"):
                 state.alarm_ack_requested = True
                 acknowledge_token_expired_alarm(state, log_fn=log, alarm_stop_fn=shared_alarm_stop)
                 return
 
             if ch in ("\r", "\n"):
-                buf = getattr(state, "token_hold_input_buffer", "").strip()
-                if buf:
-                    sys.stdout.write("\r\n")
-                    sys.stdout.flush()
-                    state.token_hold_submitted_url = buf
-                    state.token_hold_input_buffer = ""
+                state._hold_esc_state = None
+                state._hold_esc_ts = 0.0
+                if getattr(state, "_last_submit_ch", "") == "\r" and ch == "\n":
+                    state._last_submit_ch = ""
+                    return
+                state._last_submit_ch = ch
+                try:
+                    with _CONSOLE_LOCK:
+                        buf = getattr(state, "token_hold_input_buffer", "").strip()
+                        if buf:
+                            state.token_hold_submitted_url = buf
+                            state.token_hold_input_buffer = ""
+                            sys.stdout.write("\r\n")
+                            sys.stdout.flush()
+                except (OSError, ValueError):
+                    pass
                 return
+            state._last_submit_ch = ""
 
             if ch in ("\x08", "\x7f"):
-                buf = getattr(state, "token_hold_input_buffer", "")
-                if buf:
-                    state.token_hold_input_buffer = buf[:-1]
-                    sys.stdout.write("\b \b")
-                    sys.stdout.flush()
+                try:
+                    with _CONSOLE_LOCK:
+                        buf = getattr(state, "token_hold_input_buffer", "")
+                        if buf:
+                            state.token_hold_input_buffer = buf[:-1]
+                            sys.stdout.write("\b \b")
+                            sys.stdout.flush()
+                except (OSError, ValueError):
+                    pass
                 return
 
-            if ch == "\x1b":
-                buf = getattr(state, "token_hold_input_buffer", "")
-                if buf:
-                    sys.stdout.write("\b \b" * len(buf))
-                    sys.stdout.flush()
-                    state.token_hold_input_buffer = ""
-                return
-
+            if ch == "\t":
+                ch = " "
             if ch.isprintable():
-                buf = getattr(state, "token_hold_input_buffer", "")
-                state.token_hold_input_buffer = buf + ch
-                sys.stdout.write(ch)
-                sys.stdout.flush()
+                try:
+                    with _CONSOLE_LOCK:
+                        # Buffer mutation and echo are atomic vs. _hold_log redraws (D2).
+                        state.token_hold_input_buffer = getattr(state, "token_hold_input_buffer", "") + ch
+                        sys.stdout.write(ch)
+                        sys.stdout.flush()
+                except (OSError, ValueError):
+                    pass
                 return
 
             return
@@ -2475,18 +2529,28 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
     if msvcrt is not None:
         while not stop_event.is_set():
             try:
-                if msvcrt.kbhit():
-                    handle_key(msvcrt.getwch())
+                drained = 0
+                while msvcrt.kbhit() and drained < 4096:
+                    ch = msvcrt.getwch()
+                    drained += 1
+                    # N5: \xe0 is both Windows scan-code prefix and latin 'à'. Stream URLs are ASCII, so swallow scan-code is accepted platform risk.
+                    if ch in ("\x00", "\xe0"):      # special key prefix: swallow scan code
+                        if msvcrt.kbhit():
+                            msvcrt.getwch()
+                        continue
+                    handle_key(ch)
             except Exception:
                 pass
 
-            time.sleep(0.05)
+            time.sleep(0.02)
 
         return
 
     # macOS & Linux terminal listener
     if sys.platform in ("darwin", "linux"):
         try:
+            import codecs
+            import os
             import select
             import termios
             import tty
@@ -2513,16 +2577,20 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
             # Discard any keystrokes entered while a scheduled recording was waiting.
             termios.tcflush(fd, termios.TCIFLUSH)
             tty.setcbreak(fd)
+            decoder = codecs.getincrementaldecoder("utf-8")("ignore")
 
             while not stop_event.is_set():
                 try:
-                    ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    ready, _, _ = select.select([fd], [], [], 0.05)
 
                     if ready:
-                        ch = sys.stdin.read(1)
-                        if not ch:
+                        raw = os.read(fd, 4096)
+                        if not raw:
                             break
-                        handle_key(ch)
+                        text = decoder.decode(raw)
+                        text = text.replace("\x1b[200~", "").replace("\x1b[201~", "")
+                        for ch in text:
+                            handle_key(ch)
 
                 except Exception:
                     time.sleep(0.05)
@@ -18789,7 +18857,11 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         )
         if has_403:
             state.network_guard.has_403_error = False
-            is_startup = (state.stats.get("good_chunks", 0) == 0)
+            is_startup = (
+                state.network_guard.is_startup_phase()
+                if hasattr(state.network_guard, "is_startup_phase")
+                else (state.stats.get("good_chunks", 0) == 0)
+            )
             res = state.network_guard.handle_403_recovery(is_startup=is_startup)
             if not res:
                 state.stop_flag = True
@@ -19862,6 +19934,11 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
         # Check inter-chunk network route gate before launching next chunk
         if getattr(state, "network_guard", None) and not state.stop_flag:
             if hasattr(state.network_guard, "inter_chunk_gate_check"):
+                # D3: start the silent startup window at the first launch attempt, not at guard construction.
+                if not getattr(state, "_startup_window_marked", False):
+                    state._startup_window_marked = True
+                    if hasattr(state.network_guard, "mark_startup_begin"):
+                        state.network_guard.mark_startup_begin()
                 if not state.network_guard.inter_chunk_gate_check(temp_dir=CHUNKS_DIR):
                     break
             elif state.network_guard.is_armed:

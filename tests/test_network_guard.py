@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 import unittest
@@ -1085,12 +1086,12 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         mock_state.active_command = mock_state.nm3u8dl_part_a
         guard = NetworkGuard(required_country="IN", state=mock_state)
 
-        # Case 1: Pasting a bare URL with a new expiry also updates stale exp= in headers
+        # Case 1: Pasting a bare URL updates stream URLs without corrupting command headers
         bare_new_url = f"https://example.com/new.m3u8?exp={new_exp}"
         guard.update_stream_url(bare_new_url)
         self.assertEqual(mock_state.live_url, bare_new_url)
         self.assertEqual(mock_state.active_stream_url, bare_new_url)
-        self.assertIn(f"hdntl=exp={new_exp}", mock_state.nm3u8dl_part_a)
+        self.assertIn(f'"{bare_new_url}"', mock_state.nm3u8dl_part_a)
         self.assertFalse(guard.is_stream_token_expired(lead_time_sec=60.0))
 
         # Case 2: Pasting a full N_m3u8DL-RE command updates headers/keys and strips --save-name
@@ -1103,6 +1104,29 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         self.assertIn("Authorization: Bearer NEW_TOKEN", mock_state.nm3u8dl_part_a)
         self.assertIn("--key 3333:4444", mock_state.nm3u8dl_part_a)
         self.assertNotIn("--save-name", mock_state.nm3u8dl_part_a)
+    def test_update_stream_url_bare_paste_replaces_first_url_not_quoted_header_url(self):
+        mock_state = MagicMock()
+        old_exp = int(time.time()) - 300
+        new_exp = int(time.time()) + 7200
+        old_url = f"https://example.com/old.m3u8?exp={old_exp}"
+        mock_state.live_url = old_url
+        mock_state.active_stream_url = old_url
+        mock_state.nm3u8dl_part_a = f'N_m3u8DL-RE {old_url} -H "Referer: https://site.example/page"'
+        mock_state.active_command = f'ffmpeg -i {old_url} -headers "Origin: https://site.example"'
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+        self.assertTrue(guard.is_stream_token_expired())
+
+        new_url = f"https://example.com/new.m3u8?exp={new_exp}"
+        guard.update_stream_url(new_url)
+
+        self.assertIn(new_url, mock_state.nm3u8dl_part_a)
+        self.assertNotIn(old_url, mock_state.nm3u8dl_part_a)
+        self.assertIn('"Referer: https://site.example/page"', mock_state.nm3u8dl_part_a)
+        self.assertIn(new_url, mock_state.active_command)
+        self.assertIn('"Origin: https://site.example"', mock_state.active_command)
+        self.assertFalse(guard.is_stream_token_expired())
+
+
 
     def test_handle_token_hold_rejects_expired_candidate_and_propagates_timeout_stop(self):
         mock_state = MagicMock()
@@ -1137,17 +1161,1076 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
     def test_verify_and_resume_stream_propagates_false_on_token_hold_failure(self):
         mock_state = MagicMock()
         mock_state.stop_flag = False
-        mock_state.live_url = "https://example.com/DeadToken.m3u8"
+        mock_state.live_url = f"https://example.com/DeadToken.m3u8?exp={int(time.time()) - 100}"
         guard = NetworkGuard(required_country=None, state=mock_state)
         guard.vpn_mode = "UNRESTRICTED"
         guard.is_armed = False
 
         with patch("recorder_runtime.network.NetworkRouteResolver.is_internet_online", return_value=True), \
-             patch.object(guard, "_probe_stream_url", return_value=False), \
+             patch.object(guard, "_probe_stream_status", return_value=(False, 401)), \
              patch.object(guard, "handle_token_hold_state", return_value=False) as mock_token_hold:
             res = guard.handle_internet_hold_state(is_startup=False)
             self.assertFalse(res)
             mock_token_hold.assert_called_once()
+
+    def test_proactive_token_gate_passes_with_18s_remaining_and_holds_when_expired(self):
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        mock_state.stats = {"good_chunks": 0}
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        # 1. Token with 18s remaining: must pass immediately (return True, zero hold call)
+        future_url = f"https://example.com/live.mpd?exp={int(time.time()) + 18}"
+        mock_state.live_url = future_url
+        with patch.object(guard, "handle_token_hold_state") as mock_hold:
+            self.assertTrue(guard._proactive_token_gate_check())
+            mock_hold.assert_not_called()
+
+        # 2. Token already 1s in the past: must divert to hold with is_startup=True
+        expired_url = f"https://example.com/live.mpd?exp={int(time.time()) - 1}"
+        mock_state.live_url = expired_url
+        with patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            res = guard._proactive_token_gate_check()
+            self.assertTrue(res)
+            mock_hold.assert_called_once_with(is_startup=True)
+
+    def test_handle_token_hold_startup_is_silent_mid_match_alarms(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = True  # Stop immediately on loop entry
+        mock_state.is_scheduled = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_expired_post_ack_silent = False
+        mock_alarm = MagicMock()
+
+        guard = NetworkGuard(required_country=None, state=mock_state, alarm_start_fn=mock_alarm)
+
+        with patch("sys.stdin.isatty", return_value=True):
+            # Manual startup (good_chunks=0, is_startup=True): must NOT sound alarm
+            guard.handle_token_hold_state(is_startup=True)
+            mock_alarm.assert_not_called()
+
+            # Mid-match (good_chunks=2, is_startup=False): must sound alarm
+            mock_state.stats = {"good_chunks": 2}
+            guard.handle_token_hold_state(is_startup=False)
+            mock_alarm.assert_called_once_with(mock_state, alarm_type="token_expired")
+
+    def test_handle_token_hold_replacement_accepts_short_lived_token_and_bypasses_probe(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_hold_submitted_url = None
+        mock_state.live_url = "https://example.com/old.m3u8"
+        mock_state.nm3u8dl_part_a = 'N_m3u8DL-RE "https://example.com/old.m3u8"'
+        mock_state.active_command = mock_state.nm3u8dl_part_a
+
+        guard = NetworkGuard(required_country=None, state=mock_state)
+        # Token with 25s remaining (< 45s cutoff): must bypass probe and update URL immediately
+        short_token_url = f"https://example.com/live.mpd?exp={int(time.time()) + 25}"
+
+        submissions = [short_token_url]
+        def fake_sleep(_sec):
+            if submissions:
+                mock_state.token_hold_submitted_url = submissions.pop(0)
+
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep), \
+             patch.object(guard, "_probe_stream_url") as mock_probe:
+            res = guard.handle_token_hold_state(is_startup=True)
+            self.assertTrue(res)
+            mock_probe.assert_not_called()  # Probe was bypassed!
+            self.assertEqual(mock_state.live_url, short_token_url)
+
+    def test_token_hold_banner_truthfulness_chunks(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = True
+        mock_state.is_scheduled = False
+        logged_lines = []
+        mock_log = lambda line, **kw: logged_lines.append(line)
+
+        guard = NetworkGuard(required_country=None, state=mock_state, log_fn=mock_log)
+
+        with patch("sys.stdin.isatty", return_value=True):
+            # Startup (good_chunks=0): "Active chunk safely sealed to disk" must NOT be present
+            mock_state.stats = {"good_chunks": 0}
+            guard.handle_token_hold_state(is_startup=True)
+            self.assertFalse(any("sealed to disk" in l for l in logged_lines))
+
+            # Mid-match (good_chunks=1): "Active chunk safely sealed to disk" MUST be present
+            logged_lines.clear()
+            mock_state.stats = {"good_chunks": 1}
+            guard.handle_token_hold_state(is_startup=False)
+            self.assertTrue(any("sealed to disk" in l for l in logged_lines))
+
+    @unittest.skipIf(sys.platform == "win32", "posix listener")
+    def test_key_listener_burst_paste_processing(self):
+        import threading
+        from record_dynamic import RecorderState, _nm3u8dl_key_listener_loop
+        state = RecorderState()
+        state.token_hold_active = True
+        state.token_hold_input_buffer = ""
+        state.token_hold_submitted_url = None
+
+        pasted_url = "https://live.example.com/manifest.mpd?token=" + ("A" * 500)
+        raw_payload = b"\x1b[200~" + pasted_url.encode("utf-8") + b"\x1b[201~\r\n"
+
+        stop_event = threading.Event()
+        reads = [raw_payload, b""]
+        def fake_read(_fd, _sz):
+            if reads:
+                return reads.pop(0)
+            stop_event.set()
+            return b""
+
+        with patch("sys.platform", "darwin"), \
+             patch("os.read", side_effect=fake_read), \
+             patch("select.select", return_value=([1], [], [])), \
+             patch("termios.tcgetattr", return_value=[]), \
+             patch("termios.tcsetattr"), \
+             patch("termios.tcflush"), \
+             patch("tty.setcbreak"), \
+             patch("sys.stdin.fileno", return_value=0):
+            _nm3u8dl_key_listener_loop(state, stop_event)
+
+        self.assertEqual(state.token_hold_submitted_url, pasted_url)
+        self.assertEqual(state.token_hold_input_buffer, "")
+
+    @unittest.skipIf(sys.platform == "win32", "posix listener")
+    def test_key_listener_split_paste_and_escape_handling(self):
+        import threading
+        from record_dynamic import RecorderState, _nm3u8dl_key_listener_loop
+        state = RecorderState()
+        state.token_hold_active = True
+        state.token_hold_input_buffer = ""
+        state.token_hold_submitted_url = None
+
+        # 1. Split bracketed paste marker: '\x1b' at end of chunk 1, '[201~\r' in chunk 2
+        # Plus arrow key sequences \x1b[A and \x1b[B inserted mid-stream that should NOT clear buffer
+        target_url = "https://live.example.com/stream.m3u8?token=SECRET"
+        chunk1 = b"\x1b[200~" + target_url.encode("utf-8") + b"\x1b"
+        chunk2 = b"[201~\r\n"
+
+        stop_event = threading.Event()
+        reads = [chunk1, chunk2, b""]
+        def fake_read(_fd, _sz):
+            if reads:
+                return reads.pop(0)
+            stop_event.set()
+            return b""
+
+        with patch("sys.platform", "darwin"), \
+             patch("os.read", side_effect=fake_read), \
+             patch("select.select", return_value=([1], [], [])), \
+             patch("termios.tcgetattr", return_value=[]), \
+             patch("termios.tcsetattr"), \
+             patch("termios.tcflush"), \
+             patch("tty.setcbreak"), \
+             patch("sys.stdin.fileno", return_value=0):
+            _nm3u8dl_key_listener_loop(state, stop_event)
+
+        self.assertEqual(state.token_hold_submitted_url, target_url)
+        self.assertEqual(state.token_hold_input_buffer, "")
+
+        # 2. Arrow keys mid-typing must not wipe buffer or trigger alarm ack
+        state.token_hold_input_buffer = ""
+        state.token_hold_submitted_url = None
+        state.alarm_ack_requested = False
+        stop_event.clear()
+
+        # Type 'https', press Up Arrow (\x1b[A), press Down Arrow (\x1b[B), press Enter (\r\n)
+        arrow_payload = b"https\x1b[A\x1b[B://done\r\n"
+        reads = [arrow_payload, b""]
+        with patch("sys.platform", "darwin"), \
+             patch("os.read", side_effect=fake_read), \
+             patch("select.select", return_value=([1], [], [])), \
+             patch("termios.tcgetattr", return_value=[]), \
+             patch("termios.tcsetattr"), \
+             patch("termios.tcflush"), \
+             patch("tty.setcbreak"), \
+             patch("sys.stdin.fileno", return_value=0):
+            _nm3u8dl_key_listener_loop(state, stop_event)
+
+        # Buffer preserved without 'A' triggering alarm ack
+        self.assertFalse(state.alarm_ack_requested)
+        self.assertEqual(state.token_hold_submitted_url, "https://done")
+
+    def test_is_startup_phase_window_and_alarm_trigger(self):
+        mock_state = MagicMock()
+        mock_state.stats = {"good_chunks": 0}
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        # A. Initial unrecorded state: is_startup_phase is True and stamped at launch (B5)
+        self.assertIsNotNone(guard._last_token_gate_pass_mono)
+        self.assertTrue(guard.is_startup_phase())
+
+        # B. Gate passes at t0 = 1000.0
+        guard._last_token_gate_pass_mono = 1000.0
+
+        # At t0 + 60.0s (within 120s window): still startup phase
+        with patch("time.monotonic", return_value=1060.0):
+            self.assertTrue(guard.is_startup_phase())
+
+        # At t0 + 121.0s (> 120s window): startup phase EXPIRED -> False
+        with patch("time.monotonic", return_value=1121.0):
+            self.assertFalse(guard.is_startup_phase())
+
+        # C. As soon as good_chunks > 0, startup phase is permanently False even if t < 120s
+        mock_state.stats = {"good_chunks": 1}
+        with patch("time.monotonic", return_value=1010.0):
+            self.assertFalse(guard.is_startup_phase())
+
+    def test_handle_token_hold_replacement_rejects_junk_without_url_protocol(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_hold_submitted_url = None
+        mock_state.live_url = "https://example.com/old.m3u8"
+        mock_state.nm3u8dl_part_a = 'N_m3u8DL-RE "https://example.com/old.m3u8"'
+        mock_state.active_command = mock_state.nm3u8dl_part_a
+
+        logged_lines = []
+        guard = NetworkGuard(required_country=None, state=mock_state, log_fn=lambda l, **kw: logged_lines.append(l))
+
+        # Text with valid expiry parameter but no http:// or https:// URL protocol
+        junk_submission = f"exp={int(time.time()) + 25} --select-video best"
+
+        submissions = [junk_submission]
+        def fake_sleep(_sec):
+            if submissions:
+                mock_state.token_hold_submitted_url = submissions.pop(0)
+            else:
+                mock_state.stop_flag = True
+
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep), \
+             patch.object(guard, "update_stream_url") as mock_update:
+            res = guard.handle_token_hold_state(is_startup=True)
+            self.assertFalse(res)
+            mock_update.assert_not_called()  # Must NOT update URL!
+            self.assertTrue(any("failed verification probe" in l for l in logged_lines))
+
+    @unittest.skipIf(sys.platform == "win32", "posix listener")
+    def test_key_listener_lone_escape_does_not_swallow_next_char(self):
+        import threading
+        from record_dynamic import RecorderState, _nm3u8dl_key_listener_loop
+        state = RecorderState()
+        state.token_hold_active = True
+        state.token_hold_input_buffer = ""
+        state.token_hold_submitted_url = None
+
+        # Feed bare Esc, advance monotonic time past 0.25s timeout, then feed "https://x\r"
+        stop_event = threading.Event()
+        reads = [b"\x1b", b"https://x\r\n", b""]
+        curr_time = [100.0, 100.35, 100.40]
+        def fake_mono():
+            if curr_time:
+                return curr_time.pop(0)
+            return 100.50
+
+        def fake_read(_fd, _sz):
+            if reads:
+                return reads.pop(0)
+            stop_event.set()
+            return b""
+
+        with patch("sys.platform", "darwin"), \
+             patch("time.monotonic", side_effect=fake_mono), \
+             patch("os.read", side_effect=fake_read), \
+             patch("select.select", return_value=([1], [], [])), \
+             patch("termios.tcgetattr", return_value=[]), \
+             patch("termios.tcsetattr"), \
+             patch("termios.tcflush"), \
+             patch("tty.setcbreak"), \
+             patch("sys.stdin.fileno", return_value=0):
+            _nm3u8dl_key_listener_loop(state, stop_event)
+
+        self.assertEqual(state.token_hold_submitted_url, "https://x")
+        self.assertEqual(state.token_hold_input_buffer, "")
+
+    @unittest.skipIf(sys.platform == "win32", "posix listener")
+    def test_key_listener_escape_then_enter_still_submits(self):
+        import threading
+        from record_dynamic import RecorderState, _nm3u8dl_key_listener_loop
+        state = RecorderState()
+        state.token_hold_active = True
+        state.token_hold_input_buffer = ""
+        state.token_hold_submitted_url = None
+
+        # Feed "http\x1b\r\n" -> Enter must immediately submit "http" without being eaten
+        stop_event = threading.Event()
+        reads = [b"http\x1b\r\n", b""]
+        def fake_read(_fd, _sz):
+            if reads:
+                return reads.pop(0)
+            stop_event.set()
+            return b""
+
+        with patch("sys.platform", "darwin"), \
+             patch("os.read", side_effect=fake_read), \
+             patch("select.select", return_value=([1], [], [])), \
+             patch("termios.tcgetattr", return_value=[]), \
+             patch("termios.tcsetattr"), \
+             patch("termios.tcflush"), \
+             patch("tty.setcbreak"), \
+             patch("sys.stdin.fileno", return_value=0):
+            _nm3u8dl_key_listener_loop(state, stop_event)
+
+        self.assertEqual(state.token_hold_submitted_url, "http")
+        self.assertEqual(state.token_hold_input_buffer, "")
+
+    def test_is_startup_phase_playlist_mode_stamps_gate_pass(self):
+        mock_state = MagicMock()
+        mock_state.source_mode = "playlist"
+        mock_state.stats = {"good_chunks": 0}
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        # Before gate check, simulate prior timestamp
+        guard._last_token_gate_pass_mono = 100.0
+        with patch("time.monotonic", return_value=250.0):
+            res = guard._proactive_token_gate_check()
+        self.assertTrue(res)
+        # Playlist mode MUST re-stamp _last_token_gate_pass_mono so the 120s window functions
+        self.assertEqual(guard._last_token_gate_pass_mono, 250.0)
+
+    def test_token_hold_silent_startup_escalates_after_120s(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.is_scheduled = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_expired_post_ack_silent = False
+        mock_state.alarm_ack_requested = False
+        mock_alarm = MagicMock()
+
+        logged_lines = []
+        guard = NetworkGuard(required_country=None, state=mock_state, alarm_start_fn=mock_alarm, log_fn=lambda l, **kw: logged_lines.append(l))
+
+        # Advance time: t0=100.0, step 1: t=160.0 (elapsed 60s < 120s: no alarm), step 2: t=230.0 (elapsed 130s >= 120s: ESCALATES to alarm!)
+        clock = [100.0, 160.0, 230.0, 231.0]
+        def fake_mono():
+            val = clock.pop(0) if clock else 235.0
+            if not clock:
+                mock_state.stop_flag = True
+            return val
+
+        def fake_sleep(_sec):
+            pass
+
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("time.monotonic", side_effect=fake_mono), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep):
+            guard.handle_token_hold_state(is_startup=True)
+
+        mock_alarm.assert_called_once_with(mock_state, alarm_type="token_expired")
+        self.assertTrue(any("No operator response for 120s" in l for l in logged_lines))
+
+    def test_token_hold_escalation_resets_on_submission(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.is_scheduled = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_expired_post_ack_silent = False
+        mock_state.alarm_ack_requested = False
+        mock_state.token_hold_submitted_url = None
+        mock_state.token_hold_input_buffer = ""
+        mock_alarm = MagicMock()
+
+        logged_lines = []
+        guard = NetworkGuard(required_country=None, state=mock_state, alarm_start_fn=mock_alarm, log_fn=lambda l, **kw: logged_lines.append(l))
+
+        # Timeline:
+        # t0=100.0: enter hold
+        # t=200.0 (100s in): submit bad URL -> attended_mono updated to 200.0
+        # t=300.0: 200s total elapsed, but only 100s since submission -> no alarm!
+        # t=325.0: 125s since submission -> alarm sounds!
+        clock = [100.0, 200.0, 300.0, 325.0, 326.0]
+        def fake_mono():
+            val = clock.pop(0) if clock else 330.0
+            if val == 200.0:
+                mock_state.token_hold_submitted_url = "https://bad.example.com/expired.m3u8?exp=1"
+            elif val == 300.0:
+                # Still no alarm at 300.0
+                self.assertEqual(mock_alarm.call_count, 0)
+            elif not clock:
+                mock_state.stop_flag = True
+            return val
+
+        def fake_sleep(_sec):
+            pass
+
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("time.monotonic", side_effect=fake_mono), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep):
+            guard.handle_token_hold_state(is_startup=True)
+
+        mock_alarm.assert_called_once_with(mock_state, alarm_type="token_expired")
+
+    def test_token_hold_silent_startup_ack_before_120s_never_escalates(self):
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.is_scheduled = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_expired_post_ack_silent = False
+        mock_state.alarm_ack_requested = False
+        mock_state.token_hold_submitted_url = None
+        mock_state.token_hold_input_buffer = ""
+        mock_alarm = MagicMock()
+
+        guard = NetworkGuard(required_country=None, state=mock_state, alarm_start_fn=mock_alarm)
+
+        # Operator presses 'A' at 60s
+        clock = [100.0, 160.0, 235.0, 236.0]
+        def fake_mono():
+            val = clock.pop(0) if clock else 240.0
+            if val == 160.0:
+                mock_state.alarm_ack_requested = True
+            elif not clock:
+                mock_state.stop_flag = True
+            return val
+
+        def fake_sleep(_sec):
+            pass
+
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("time.monotonic", side_effect=fake_mono), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep):
+            guard.handle_token_hold_state(is_startup=True)
+
+        mock_alarm.assert_not_called()
+
+    def test_token_hold_continues_after_candidate_exception(self):
+        """B2: Hold survives candidate processing exception (e.g. update_stream_url raises) and resumes on next valid URL."""
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_hold_active = True
+        mock_state.token_hold_submitted_url = None
+
+        logged_lines = []
+        guard = NetworkGuard(required_country=None, state=mock_state, log_fn=lambda l, **kw: logged_lines.append(l))
+
+        exp_ts = int(time.time()) + 20
+        submissions = [
+            f"https://example.com/exploding.m3u8?exp={exp_ts}",
+            f"https://example.com/valid.m3u8?exp={exp_ts}",
+        ]
+        def fake_sleep(_sec):
+            if submissions:
+                mock_state.token_hold_submitted_url = submissions.pop(0)
+            else:
+                mock_state.stop_flag = True
+
+        call_count = [0]
+        def mock_update(cand):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("Simulated transient write failure")
+
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep), \
+             patch.object(guard, "update_stream_url", side_effect=mock_update):
+            res = guard.handle_token_hold_state(is_startup=True)
+
+        self.assertTrue(res)
+        self.assertEqual(call_count[0], 2)
+        self.assertTrue(any("Candidate processing failed" in l and "RuntimeError" in l for l in logged_lines))
+        self.assertFalse(mock_state.token_hold_active)
+
+    def test_token_hold_alarm_stopped_when_loop_raises(self):
+        """B1: try/finally in handle_token_hold_state stops alarm and clears flags even if loop raises."""
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.is_scheduled = True
+        mock_state.token_hold_active = True
+        mock_state.token_expired_post_ack_silent = False
+
+        mock_alarm_start = MagicMock(side_effect=RuntimeError("Audio device failure"))
+        mock_alarm_stop = MagicMock()
+
+        guard = NetworkGuard(
+            required_country=None,
+            state=mock_state,
+            alarm_start_fn=mock_alarm_start,
+            alarm_stop_fn=mock_alarm_stop,
+        )
+
+        with patch("sys.stdin.isatty", return_value=True):
+            with self.assertRaises(RuntimeError):
+                guard.handle_token_hold_state(is_startup=True)
+
+        self.assertFalse(mock_state.token_hold_active)
+        self.assertIsNone(mock_state._hold_esc_state)
+        self.assertEqual(mock_state.token_hold_input_buffer, "")
+        mock_alarm_stop.assert_called_once_with(mock_state)
+
+    def test_token_hold_countdown_clears_line_before_log(self):
+        """B3: _hold_log wipes current buffer line with \x1b[2K before printing countdown log."""
+        import io
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.is_scheduled = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_expired_post_ack_silent = False
+        mock_state.alarm_ack_requested = False
+        mock_state.token_hold_submitted_url = None
+        mock_state.token_hold_input_buffer = ""
+
+        cleared_sequences = []
+        def fake_clear():
+            cleared_sequences.append("\r\x1b[2K")
+            sys.stdout.write("\r\x1b[2K")
+
+        guard = NetworkGuard(
+            required_country=None,
+            state=mock_state,
+            clear_progress_fn=fake_clear,
+        )
+
+        clock = [100.0, 131.0, 132.0]
+        def fake_mono():
+            val = clock.pop(0) if clock else 135.0
+            if val == 131.0:
+                mock_state.token_hold_input_buffer = "https://typing.com"
+            if not clock:
+                mock_state.stop_flag = True
+            return val
+
+        def fake_sleep(_sec):
+            pass
+
+        fake_stdout = io.StringIO()
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("sys.stdout", fake_stdout), \
+             patch("time.monotonic", side_effect=fake_mono), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep):
+            guard.handle_token_hold_state(is_startup=True)
+
+        output = fake_stdout.getvalue()
+        self.assertIn("\x1b[2K", output)
+        self.assertIn("[TOKEN_HOLD] Waiting for updated stream URL", output)
+        self.assertIn("TOKEN_HOLD> https://typing.com", output)
+        self.assertTrue(len(cleared_sequences) >= 1)
+
+    def test_is_startup_phase_explicit_stamp_and_fallback(self):
+        """B5: Startup phase initializes explicitly at launch and supports fallback lazy initialization."""
+        mock_state = MagicMock()
+        mock_state.stats = {"good_chunks": 0}
+
+        t0 = 1000.0
+        with patch("time.monotonic", return_value=t0):
+            guard = NetworkGuard(required_country=None, state=mock_state)
+
+        # 1. Explicit initialization check
+        self.assertEqual(guard._last_token_gate_pass_mono, t0)
+
+        # 2. Within 120s window -> True
+        with patch("time.monotonic", return_value=t0 + 50.0):
+            self.assertTrue(guard.is_startup_phase())
+
+        # 3. Beyond 120s window -> False
+        with patch("time.monotonic", return_value=t0 + 125.0):
+            self.assertFalse(guard.is_startup_phase())
+
+        # 4. First good chunk sealed -> False immediately even within window
+        mock_state.stats = {"good_chunks": 1}
+        with patch("time.monotonic", return_value=t0 + 10.0):
+            self.assertFalse(guard.is_startup_phase())
+
+        # 5. Lazy fallback if uninitialized
+        mock_state.stats = {"good_chunks": 0}
+        guard._last_token_gate_pass_mono = None
+        with patch("time.monotonic", return_value=2000.0):
+            self.assertTrue(guard.is_startup_phase())
+            self.assertEqual(guard._last_token_gate_pass_mono, 2000.0)
+
+    @unittest.skipIf(sys.platform == "win32", "posix listener")
+    def test_key_listener_tab_converted_to_space(self):
+        """B6: Tabs pasted into token hold buffer are converted to spaces instead of dropped."""
+        import threading
+        from record_dynamic import RecorderState, _nm3u8dl_key_listener_loop
+        state = RecorderState()
+        state.token_hold_active = True
+        state.token_hold_input_buffer = ""
+        state.token_hold_submitted_url = None
+
+        pasted = b"N_m3u8DL-RE\t--key\tval\r\n"
+        stop_event = threading.Event()
+        reads = [pasted, b""]
+        def fake_read(_fd, _sz):
+            if reads:
+                return reads.pop(0)
+            stop_event.set()
+            return b""
+
+        with patch("sys.platform", "darwin"), \
+             patch("os.read", side_effect=fake_read), \
+             patch("select.select", return_value=([1], [], [])), \
+             patch("termios.tcgetattr", return_value=[]), \
+             patch("termios.tcsetattr"), \
+             patch("termios.tcflush"), \
+             patch("tty.setcbreak"), \
+             patch("sys.stdin.fileno", return_value=0), \
+             patch("sys.stdout.write"), \
+             patch("sys.stdout.flush"):
+            _nm3u8dl_key_listener_loop(state, stop_event)
+
+        self.assertEqual(state.token_hold_submitted_url, "N_m3u8DL-RE --key val")
+
+    def test_token_hold_post_commit_exception_still_resumes(self):
+        """D1: A failure in post-commit side effects (beep) must not keep the hold alive after the URL was applied."""
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_hold_active = True
+        mock_state.token_hold_submitted_url = None
+
+        logged_lines = []
+        guard = NetworkGuard(
+            required_country=None,
+            state=mock_state,
+            log_fn=lambda l, **kw: logged_lines.append(l),
+            beep_good_fn=MagicMock(side_effect=RuntimeError("Audio device failure")),
+            alarm_stop_fn=MagicMock(),
+        )
+
+        exp_ts = int(time.time()) + 20
+        submissions = [f"https://example.com/valid.m3u8?exp={exp_ts}"]
+
+        def fake_sleep(_sec):
+            if submissions:
+                mock_state.token_hold_submitted_url = submissions.pop(0)
+            else:
+                mock_state.stop_flag = True
+
+        update_mock = MagicMock()
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep), \
+             patch.object(guard, "update_stream_url", update_mock):
+            res = guard.handle_token_hold_state(is_startup=True)
+
+        self.assertTrue(res)
+        update_mock.assert_called_once()
+        self.assertTrue(any("post-renewal action failed" in l for l in logged_lines))
+        self.assertFalse(any("Candidate processing failed" in l for l in logged_lines))
+        self.assertFalse(mock_state.token_hold_active)
+
+    def test_mark_startup_begin_restarts_window(self):
+        """D3: mark_startup_begin re-stamps the silent startup window at first launch attempt."""
+        mock_state = MagicMock()
+        mock_state.stats = {"good_chunks": 0}
+        with patch("time.monotonic", return_value=1000.0):
+            guard = NetworkGuard(required_country=None, state=mock_state)
+        with patch("time.monotonic", return_value=1300.0):
+            self.assertFalse(guard.is_startup_phase())
+            guard.mark_startup_begin()
+            self.assertEqual(guard._last_token_gate_pass_mono, 1300.0)
+            self.assertTrue(guard.is_startup_phase())
+
+    def test_finally_alarm_stop_log_failure_does_not_mask(self):
+        """D6: If alarm_stop and log_fn both fail during cleanup, the original exception still propagates."""
+        mock_state = MagicMock()
+        mock_state.stats = {"good_chunks": 0}
+        guard = NetworkGuard(
+            required_country=None,
+            state=mock_state,
+            log_fn=MagicMock(side_effect=OSError("log sink gone")),
+            alarm_stop_fn=MagicMock(side_effect=RuntimeError("stop failed")),
+        )
+        with patch.object(guard, "_token_hold_loop", side_effect=ValueError("original")):
+            with self.assertRaises(ValueError) as ctx:
+                guard.handle_token_hold_state(is_startup=True)
+        self.assertEqual(str(ctx.exception), "original")
+        self.assertFalse(mock_state.token_hold_active)
+
+    @unittest.skipIf(sys.platform == "win32", "posix listener")
+    def test_key_listener_buffer_mutation_under_console_lock(self):
+        """D2: Buffer mutation and echo happen atomically while holding _CONSOLE_LOCK."""
+        import threading
+        import record_dynamic
+        from record_dynamic import RecorderState, _nm3u8dl_key_listener_loop
+
+        depth = [0]
+        held_at_write = []
+
+        class TrackingLock:
+            def __enter__(self_inner):
+                depth[0] += 1
+            def __exit__(self_inner, *a):
+                depth[0] -= 1
+                return False
+
+        class TrackedState(RecorderState):
+            @property
+            def token_hold_input_buffer(self):
+                return self.__dict__.get("_thib", "")
+            @token_hold_input_buffer.setter
+            def token_hold_input_buffer(self, v):
+                held_at_write.append(depth[0] > 0)
+                self.__dict__["_thib"] = v
+
+        state = TrackedState()
+        state.token_hold_active = True
+        state.token_hold_submitted_url = None
+
+        held_at_write.clear()  # ignore construction-time writes
+        stop_event = threading.Event()
+        reads = [b"xy\x7f\r", b""]
+        def fake_read(_fd, _sz):
+            if reads:
+                return reads.pop(0)
+            stop_event.set()
+            return b""
+
+        with patch.object(record_dynamic, "_CONSOLE_LOCK", TrackingLock()), \
+             patch("sys.platform", "darwin"), \
+             patch("os.read", side_effect=fake_read), \
+             patch("select.select", return_value=([1], [], [])), \
+             patch("termios.tcgetattr", return_value=[]), \
+             patch("termios.tcsetattr"), \
+             patch("termios.tcflush"), \
+             patch("tty.setcbreak"), \
+             patch("sys.stdin.fileno", return_value=0), \
+             patch("sys.stdout.write"), \
+             patch("sys.stdout.flush"):
+            _nm3u8dl_key_listener_loop(state, stop_event)
+
+        self.assertEqual(state.token_hold_submitted_url, "x")
+        self.assertTrue(held_at_write)
+        self.assertTrue(all(held_at_write))
+
+    def test_token_hold_countdown_reechoes_buffer(self):
+        import io
+        mock_state = MagicMock()
+        mock_state.stop_flag = False
+        mock_state.is_scheduled = False
+        mock_state.stats = {"good_chunks": 0}
+        mock_state.token_expired_post_ack_silent = False
+        mock_state.alarm_ack_requested = False
+        mock_state.token_hold_submitted_url = None
+        mock_state.token_hold_input_buffer = ""
+
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        # t0=100.0, step 1: t=131.0 (elapsed 31s >= 30s countdown log)
+        clock = [100.0, 131.0, 132.0]
+        def fake_mono():
+            val = clock.pop(0) if clock else 135.0
+            if val == 131.0:
+                mock_state.token_hold_input_buffer = "abc"
+            if not clock:
+                mock_state.stop_flag = True
+            return val
+
+        def fake_sleep(_sec):
+            pass
+
+        fake_stdout = io.StringIO()
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("sys.stdout", fake_stdout), \
+             patch("time.monotonic", side_effect=fake_mono), \
+             patch("recorder_runtime.network.time.sleep", side_effect=fake_sleep):
+            guard.handle_token_hold_state(is_startup=True)
+
+        output = fake_stdout.getvalue()
+        self.assertIn("TOKEN_HOLD> abc", output)
+
+    def test_verify_and_resume_passes_dynamic_startup(self):
+        mock_state = MagicMock()
+        guard = NetworkGuard(required_country=None, state=mock_state)
+        expired_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 100}"
+
+        with patch.object(guard, "get_active_source_url", return_value=expired_url), \
+             patch.object(guard, "_probe_stream_status", return_value=(False, 401)), \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+
+            with patch.object(guard, "is_startup_phase", return_value=True):
+                guard._verify_and_resume_stream()
+                mock_hold.assert_called_with(is_startup=True)
+
+            with patch.object(guard, "is_startup_phase", return_value=False):
+                guard._verify_and_resume_stream()
+                mock_hold.assert_called_with(is_startup=False)
+
+    def test_probe_url_bool_wrapper_preserved(self):
+        mock_state = MagicMock()
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 403)):
+            res = guard._probe_stream_url("https://example.com/test")
+            self.assertIs(res, False)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(True, 200)):
+            res = guard._probe_stream_url("https://example.com/test")
+            self.assertIs(res, True)
+
+    def test_static_untokenised_ts_resumes_without_probe(self):
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        mock_state.live_url = "http://iptv.server:8080/live/user/pass/12345.ts"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+        guard.resume_callback = MagicMock()
+
+        with patch.object(guard, "_probe_stream_status") as mock_probe, \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_not_called()
+            mock_hold.assert_not_called()
+            guard.resume_callback.assert_called_once_with(mock_state)
+
+    def test_token_expired_timestamp_option_b_probe_confirmation(self):
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 50}"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        # 1. Option B: probe returns 200 (clock drift tolerance) -> resumes without hold
+        with patch.object(guard, "_probe_stream_status", return_value=(True, 200)) as mock_probe, \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_called_once()
+            mock_hold.assert_not_called()
+
+        # 2. Option B: probe returns 401/403/410 -> diverts to hold
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 401)) as mock_probe, \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_called_once()
+            mock_hold.assert_called_once()
+
+    def test_token_governed_scans_all_command_material_fields(self):
+        # D1: token present only in active_command while nm3u8dl_part_a is set
+        mock_state = MagicMock()
+        mock_state.live_url = "https://example.com/base.m3u8"
+        mock_state.nm3u8dl_part_a = "N_m3u8DL-RE --save-name test"
+        future_exp = int(time.time()) + 3600
+        mock_state.active_command = f'ffmpeg -i "https://example.com/base.m3u8?exp={future_exp}"'
+        mock_state.active_stream_url = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        tokenised, expiry = guard._stream_is_token_governed(mock_state.live_url)
+        self.assertTrue(tokenised)
+        self.assertEqual(expiry, future_exp)
+
+    def test_playlist_mode_exempt_from_stale_timestamp_hold(self):
+        # D3 (Round 3): in playlist mode, resumes immediately without probing (zero-delay rule)
+        mock_state = MagicMock()
+        mock_state.source_mode = "playlist"
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 3600}"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status") as mock_probe, \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_not_called()
+            mock_hold.assert_not_called()
+
+    def test_probe_403_and_410_divert_with_geo_logging(self):
+        # D3 & D4 & N4: HTTP 403 and 410 divert to token hold and log Launch egress & Required country
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        future_exp = int(time.time()) + 3600
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={future_exp}"
+        guard = NetworkGuard(required_country="IN", state=mock_state)
+        guard.launch_country = "IN"
+
+        logged_messages = []
+        guard.log_fn = lambda msg, level="INFO": logged_messages.append((msg, level))
+
+        # Test 403
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 403)), \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            logged_messages.clear()
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_hold.assert_called_once()
+            self.assertTrue(any("HTTP 403" in m[0] and "Launch egress: IN" in m[0] and "Required: IN" in m[0] for m in logged_messages))
+
+        # Test 410 (D4) on tokenized feed
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 410)), \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            logged_messages.clear()
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_hold.assert_called_once()
+            self.assertTrue(any("HTTP 410" in m[0] and "Launch egress: IN" in m[0] for m in logged_messages))
+
+    def test_probe_410_on_untokenised_playlist_resumes_without_hold(self):
+        # D4: 410 on untokenised playlist feed is inconclusive and resumes
+        mock_state = MagicMock()
+        mock_state.source_mode = "playlist"
+        mock_state.live_url = "https://example.com/live.m3u8"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 410)), \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_hold.assert_not_called()
+
+    def test_probe_timeout_416_500_resumes_via_retry(self):
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        mock_state.live_url = f"https://example.com/live.m3u8?exp={int(time.time()) + 3600}"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+        guard.resume_callback = MagicMock()
+
+        for status_code in (None, 416, 400, 500, 503):
+            with patch.object(guard, "_probe_stream_status", return_value=(False, status_code)), \
+                 patch.object(guard, "handle_token_hold_state") as mock_hold:
+                guard.resume_callback.reset_mock()
+                res = guard._verify_and_resume_stream()
+                self.assertTrue(res)
+                mock_hold.assert_not_called()
+                guard.resume_callback.assert_called_once_with(mock_state)
+
+    def test_stream_mode_playlist_probes_while_static_resumes(self):
+        # 1. Static untokenised stream: zero probe, resumes
+        mock_state_static = MagicMock()
+        mock_state_static.source_mode = "static"
+        mock_state_static.live_url = "https://example.com/stream.mkv"
+        guard_static = NetworkGuard(required_country=None, state=mock_state_static)
+
+        with patch.object(guard_static, "_probe_stream_status") as mock_probe:
+            res = guard_static._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_not_called()
+
+        # 2. Dynamic playlist stream: zero probe, resumes unattended for dynamic manifest refresh (D3)
+        mock_state_pl = MagicMock()
+        mock_state_pl.source_mode = "playlist"
+        mock_state_pl.live_url = "https://example.com/stream.m3u8"
+        guard_pl = NetworkGuard(required_country=None, state=mock_state_pl)
+
+        with patch.object(guard_pl, "_probe_stream_status") as mock_probe:
+            res = guard_pl._verify_and_resume_stream()
+            self.assertTrue(res)
+            mock_probe.assert_not_called()
+
+    def test_expired_clock_option_b_probe_200_overrides_proactive_gate(self):
+        # N1: Expired clock plus probe 200 stamps override and passes proactive chunk gate
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        expired_url = f"https://example.com/live.m3u8?exp={int(time.time()) - 100}"
+        mock_state.live_url = expired_url
+        mock_state.active_stream_url = expired_url
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        mock_state.token_clock_override_url = None
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(True, 200)):
+            res = guard._verify_and_resume_stream(mock_state)
+            self.assertTrue(res)
+            self.assertEqual(mock_state.token_clock_override_url, expired_url)
+
+        # Pre-launch gate check must now pass without hold
+        with patch.object(guard, "handle_token_hold_state") as mock_hold:
+            gate_res = guard._proactive_token_gate_check()
+            self.assertTrue(gate_res)
+            mock_hold.assert_not_called()
+
+    def test_expired_clock_probe_416_fallback_without_range_resumes(self):
+        # N2: Range-rejecting stream (416) falls back to Range-less probe and resumes on 200
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        expired_url = f"https://example.com/live.ts?exp={int(time.time()) - 50}"
+        mock_state.live_url = expired_url
+        mock_state.active_stream_url = expired_url
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        def mock_probe(url, timeout=3.0, use_range=True):
+            if use_range:
+                return False, 416
+            return True, 200
+
+        with patch.object(guard, "_probe_stream_status", side_effect=mock_probe), \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream(mock_state)
+            self.assertTrue(res)
+            mock_hold.assert_not_called()
+            self.assertEqual(mock_state.token_clock_override_url, expired_url)
+
+    def test_expired_clock_probe_timeout_resumes_via_retry_without_hold(self):
+        # N2: Expired clock plus post-outage probe timeout falls through to recorder retry (no false hold)
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        expired_url = f"https://example.com/live.ts?exp={int(time.time()) - 50}"
+        mock_state.live_url = expired_url
+        mock_state.active_stream_url = expired_url
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(False, None)), \
+             patch.object(guard, "handle_token_hold_state") as mock_hold:
+            res = guard._verify_and_resume_stream(mock_state)
+            self.assertTrue(res)
+            mock_hold.assert_not_called()
+
+    def test_expired_clock_probe_403_diverts_and_clears_override(self):
+        # N1 & N2: Probe 403 on expired token diverts to hold and clears override
+        mock_state = MagicMock()
+        mock_state.source_mode = "static"
+        expired_url = f"https://example.com/live.ts?exp={int(time.time()) - 50}"
+        mock_state.live_url = expired_url
+        mock_state.active_stream_url = expired_url
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        mock_state.token_clock_override_url = expired_url
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        with patch.object(guard, "_probe_stream_status", return_value=(False, 403)), \
+             patch.object(guard, "handle_token_hold_state", return_value=True) as mock_hold:
+            res = guard._verify_and_resume_stream(mock_state)
+            self.assertTrue(res)
+            mock_hold.assert_called_once()
+            self.assertIsNone(mock_state.token_clock_override_url)
+
+    def test_header_only_exp_ignored_by_token_governed_scan(self):
+        # N5: Numeric exp= inside headers or cookies is ignored; only URLs are scanned
+        mock_state = MagicMock()
+        mock_state.live_url = "https://example.com/feed.ts"
+        mock_state.active_stream_url = "https://example.com/feed.ts"
+        mock_state.nm3u8dl_part_a = 'ffmpeg -headers "Cookie: exp=1730000000" -i "https://example.com/feed.ts"'
+        mock_state.active_command = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        tokenised, expiry = guard._stream_is_token_governed(mock_state.live_url)
+        self.assertFalse(tokenised)
+        self.assertIsNone(expiry)
+
+    def test_playlist_mode_access_refusal_resumes_unattended_for_refresh(self):
+        # N6 Option A: In playlist mode, 401/403 resumes unattended so playlist manager fetches fresh manifest
+        mock_state = MagicMock()
+        mock_state.source_mode = "playlist"
+        mock_state.live_url = "https://example.com/chunklist.m3u8?token=xyz"
+        mock_state.active_stream_url = "https://example.com/chunklist.m3u8?token=xyz"
+        mock_state.nm3u8dl_part_a = ""
+        mock_state.active_command = ""
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        for status_code in (401, 403):
+            with patch.object(guard, "_probe_stream_status", return_value=(False, status_code)), \
+                 patch.object(guard, "handle_token_hold_state") as mock_hold:
+                res = guard._verify_and_resume_stream(mock_state)
+                self.assertTrue(res)
+                mock_hold.assert_not_called()
+
+    def test_update_stream_url_clears_clock_override(self):
+        # N1: Updating stream URL resets token_clock_override_url
+        mock_state = MagicMock()
+        mock_state.live_url = "https://example.com/old.m3u8"
+        mock_state.token_clock_override_url = "https://example.com/old.m3u8"
+        guard = NetworkGuard(required_country=None, state=mock_state)
+
+        guard.update_stream_url("https://example.com/new.m3u8")
+        self.assertIsNone(mock_state.token_clock_override_url)
+        self.assertEqual(mock_state.live_url, "https://example.com/new.m3u8")
 
 
 if __name__ == "__main__":
