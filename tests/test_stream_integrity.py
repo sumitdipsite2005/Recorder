@@ -21,10 +21,19 @@ HELPER_CONSTANTS = ("STREAM_CORRUPT_WINDOW_SEC", "STREAM_CORRUPT_ALARM_THRESHOLD
 
 
 def resolve_record_py_path() -> Path:
-    """Resolve record_static.py: RECORD_STATIC_PY_PATH env -> parent/sibling search -> skip in CI."""
+    """Resolve record_static.py: env override -> this repository's copy -> legacy parent/sibling search.
+
+    The repository copy must win. The earlier mtime-based search could pick a
+    stale ``record_static.py`` sitting one directory above the clone, so every
+    AST assertion in this module would verify the wrong file while still passing.
+    """
     env_path = os.environ.get("RECORD_STATIC_PY_PATH")
     if env_path and Path(env_path).exists():
         return Path(env_path)
+    repo_copy = Path(__file__).resolve().parent.parent / "record_static.py"
+    if repo_copy.is_file():
+        return repo_copy
+    # Legacy search, retained only for layouts that keep the recorder outside the repository.
     candidates = []
     for parent in Path(__file__).resolve().parents[:4]:
         try:
@@ -39,7 +48,6 @@ def resolve_record_py_path() -> Path:
             continue
     if candidates:
         return max(candidates, key=lambda p: p.stat().st_mtime)
-    raise unittest.SkipTest("Static recorder record_static.py not found in local workspace (CI environment)")
     raise unittest.SkipTest("Static recorder record_static.py not found in local workspace (CI environment)")
 
 
@@ -1871,6 +1879,26 @@ class TestBackoffPolicy(unittest.TestCase):
                 os.unlink(tmp_path)
             except Exception:
                 pass
+
+
+class TestStaticRecorderResolution(unittest.TestCase):
+    """Guard: every AST assertion in this module must read this repository's record_static.py."""
+
+    def test_resolver_prefers_repository_copy(self):
+        repo_copy = Path(__file__).resolve().parent.parent / "record_static.py"
+        if not repo_copy.is_file():
+            self.skipTest("record_static.py is absent from this checkout")
+
+        previous_override = os.environ.pop("RECORD_STATIC_PY_PATH", None)
+        try:
+            self.assertEqual(
+                resolve_record_py_path(),
+                repo_copy,
+                "resolver must prefer the repository copy over any newer stale sibling",
+            )
+        finally:
+            if previous_override is not None:
+                os.environ["RECORD_STATIC_PY_PATH"] = previous_override
 
 
 if __name__ == "__main__":
