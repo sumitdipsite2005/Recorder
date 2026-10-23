@@ -182,6 +182,7 @@ cython_debug/
 
 .DS_Store
 recorder_dynamic_user_config*.py
+recorder_static_user_config*.py
 AGENTS.md
 .clinerules
 tests/test_privacy_guardrails.py
