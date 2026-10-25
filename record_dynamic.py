@@ -15788,11 +15788,11 @@ def log_nm3u8dl_playlist_renewal_check(
         level=decision_level,
     )
 
-    if replacement_locked and next_check_ts is None:
-        next_check_text = (
-            "not needed — retained replacement locked"
-        )
-    elif next_check_ts is None:
+    # A held backup answers "which stream do we roll to", never
+    # "do we keep looking". The only reason this timestamp can be
+    # absent is that renewal polling is disabled for this profile,
+    # so there is deliberately no third, lock-related wording here.
+    if next_check_ts is None:
         next_check_text = "not scheduled"
     else:
         next_check_text = format_timestamp(next_check_ts)
@@ -16180,11 +16180,11 @@ def monitor_nm3u8dl_playlist_renewal(
             pending_source = None
             pending_expiry = None
 
-            if (
-                authorization_renewal_enabled
-                and next_renewal_check_ts is None
-            ):
-                next_renewal_check_ts = now
+            if authorization_renewal_enabled:
+                next_renewal_check_ts = max(
+                    now,
+                    normal_check_start_ts,
+                )
 
         renewal_state = None
 
@@ -16584,10 +16584,71 @@ def monitor_nm3u8dl_playlist_renewal(
                     )
                 )
 
-                decision = (
-                    "no usable authorization found; "
-                    "current recording continues"
+                # One rule for a backup that ran out while this check was
+                # in progress, whichever door the check came through: drop
+                # it here and say so. The clock was already re-armed above
+                # on the unchanged cadence, and a held backup never
+                # silences it.
+                held_source = state.nm3u8dl_pending_source
+                held_expiry = (
+                    held_source.get("expiry")
+                    if held_source
+                    else None
                 )
+
+                held_usable = bool(
+                    held_source
+                    and is_nm3u8dl_usable_replacement(
+                        running_expiry,
+                        held_source.get("stream_url", ""),
+                        held_expiry,
+                        now_ts=check_completed_ts,
+                    )
+                )
+
+                held_stable = bool(
+                    held_usable
+                    and is_nm3u8dl_stable_replacement(
+                        running_expiry,
+                        held_expiry,
+                    )
+                )
+
+                if held_source and not held_usable:
+                    log(
+                        "Retained authorization replacement expired "
+                        "during this check → discarding it...",
+                        level="WARN",
+                    )
+
+                    state.nm3u8dl_pending_source = None
+                    held_source = None
+
+                    decision = (
+                        "retained replacement expired during this "
+                        "check; discarded; playlist check failed; "
+                        "current recording continues"
+                    )
+
+                elif held_stable:
+                    decision = (
+                        "playlist check failed; retained replacement "
+                        "remains safe and locked; current recording "
+                        "continues"
+                    )
+
+                elif held_source:
+                    decision = (
+                        "playlist check failed; fallback retained; "
+                        "current recording continues"
+                    )
+
+                else:
+                    decision = (
+                        "no usable authorization found; "
+                        "current recording continues"
+                    )
+
                 decision_level = "WARN"
 
                 log_nm3u8dl_playlist_renewal_check(
@@ -16599,6 +16660,7 @@ def monitor_nm3u8dl_playlist_renewal(
                     decision=decision,
                     next_check_ts=next_renewal_check_ts,
                     decision_level=decision_level,
+                    replacement_locked=held_stable,
                 )
 
             if quality_check_due:
@@ -17040,6 +17102,25 @@ def monitor_nm3u8dl_playlist_renewal(
                 )
             )
 
+            # Same rule as the failed-check path (Hunk 3A): a backup that
+            # ran out by the time this check finished is dropped here, in
+            # this pass, so the card can never report a dead token as a
+            # retained fallback. `retained_expired` keeps the reason for
+            # the card after the state itself is already cleared.
+            retained_expired = bool(
+                retained_source and not retained_usable
+            )
+
+            if retained_expired:
+                log(
+                    "Retained authorization replacement expired during "
+                    "this check → discarding it...",
+                    level="WARN",
+                )
+
+                state.nm3u8dl_pending_source = None
+                retained_source = None
+
             replacement_locked = False
 
             if stable_candidates:
@@ -17092,6 +17173,12 @@ def monitor_nm3u8dl_playlist_renewal(
                         "replacement"
                     )
 
+            elif retained_expired:
+                decision = (
+                    "retained replacement expired during this check; "
+                    "discarded; current recording continues"
+                )
+
             elif retained_source:
                 replacement_locked = retained_stable
 
@@ -17142,14 +17229,17 @@ def monitor_nm3u8dl_playlist_renewal(
             )
 
         if authorization_check_due:
-            if replacement_locked:
-                next_renewal_check_ts = None
-            else:
-                next_renewal_check_ts = (
-                    calculate_next_renewal_check(
-                        check_completed_ts
-                    )
+            # A retained backup decides which stream we roll to at
+            # expiry; it never decides whether we stop looking. Re-arm
+            # unconditionally on the unchanged cadence: 5 minutes before
+            # the risk window, 30 minutes before expiry in the lead
+            # window, then 60 seconds. calculate_next_renewal_check
+            # returns None only when renewal polling is disabled.
+            next_renewal_check_ts = (
+                calculate_next_renewal_check(
+                    check_completed_ts
                 )
+            )
 
             log_nm3u8dl_playlist_renewal_check(
                 checked_at_ts=check_completed_ts,
