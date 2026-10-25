@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional, Tuple
 from unittest.mock import patch
 
 
@@ -125,6 +125,54 @@ def load_window_helpers():
     return ns, logs, alarms_started, alarms_stopped, beeps
 
 
+# BUG-029: process_stderr_line now hands the startup Video banner to
+# evaluate_startup_quality(), so the isolated monitor harness must carry the
+# quality helpers the class calls. Everything here is still compiled from the
+# production file - nothing is re-implemented in the test.
+QUALITY_HELPER_FUNCTIONS = (
+    "observe_startup_line",
+    "evaluate_startup_quality",
+    "_handle_startup_downgrade",
+    "_raise_or_park_quality_alarm",
+    "request_format_recycle",
+    "_resolve_quality_standard",
+    "_classify_quality_reading",
+    "_coerce_video_params",
+    "_normalize_quality_fps",
+    "_parse_expected_video",
+    "_fmt_monotonic_clock",
+)
+QUALITY_HELPER_CLASSES = ("VideoParams", "QualityVerdict")
+QUALITY_HELPER_CONSTANTS = (
+    "QUALITY_PENDING_MAX_WAIT_SEC",
+    "RE_VIDEO_BANNER",
+    "RE_FIELD_ORDER",
+    "RE_EXPECTED_VIDEO_FULL",
+    "RE_EXPECTED_VIDEO_SHORT",
+    "_HEIGHT_TO_WIDTH",
+)
+
+
+def quality_support_nodes(tree):
+    """Collect the quality helpers/classes/constants the monitor class depends on."""
+    wanted = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in QUALITY_HELPER_FUNCTIONS:
+            wanted.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name in QUALITY_HELPER_CLASSES:
+            wanted.append(node)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in QUALITY_HELPER_CONSTANTS for t in node.targets
+        ):
+            wanted.append(node)
+    found = {n.name for n in wanted if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    missing = (
+        set(QUALITY_HELPER_FUNCTIONS) | set(QUALITY_HELPER_CLASSES)
+    ) - found
+    assert not missing, f"Missing quality helpers for the monitor harness: {sorted(missing)}"
+    return wanted
+
+
 def load_monitor_class():
     """Extract StreamIntegrityMonitor directly from record_static.py AST for fast isolated unit testing."""
     record_path = str(resolve_record_py_path())
@@ -162,17 +210,26 @@ def load_monitor_class():
     def dummy_alarm_stop(state):
         alarms_stopped.append(True)
 
+    def dummy_quality_alarm_start(state):
+        alarms_started.append("quality_downgrade")
+
     ns = {
         "re": re,
         "time": time,
         "threading": threading,
         "Optional": Optional,
+        "Tuple": Tuple,
+        "NamedTuple": NamedTuple,
         "RecorderState": DummyState,
         "log": dummy_log,
         "shared_alarm_start": dummy_alarm_start,
         "shared_alarm_stop": dummy_alarm_stop,
+        "is_alarm_active": lambda state: getattr(state, "shared_alarm_type", None) is not None,
+        "quality_downgrade_alarm_start": dummy_quality_alarm_start,
+        # EXPECTED_VIDEO is read via globals() in the production helpers.
+        "EXPECTED_VIDEO": None,
     }
-    mod = ast.Module(body=[class_node], type_ignores=[])
+    mod = ast.Module(body=quality_support_nodes(tree) + [class_node], type_ignores=[])
     exec(compile(mod, filename=record_path, mode="exec"), ns)
     return ns["StreamIntegrityMonitor"], DummyState, logs, alarms_started, alarms_stopped
 
@@ -1490,19 +1547,19 @@ class TestBackoffPolicy(unittest.TestCase):
                     rd.beep_good = fake_beep_good
 
                     # 1. Chunk 1 starts at 720p emergency slate (Item 6D)
-                    rd.get_video_params = lambda p: (1280, 720, 25.0)
+                    rd.get_video_params = lambda p: (1280, 720, 25.0, "h264", "")
                     rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_001.ts", "TEST")
                     self.assertEqual(state.baseline_video_params, (1280, 720, 25.0))
 
                     # 2. Chunk 2 upgrades to 1080p50 match feed -> baseline must elevate to 1080p50
                     dummy_chunk.write_bytes(b"chunk2")
-                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0, "h264", "")
                     rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
                     self.assertEqual(state.baseline_video_params, (1920, 1080, 50.0))
 
                     # 3. Chunk 3 drops back to 720p25 -> must trigger quality downgrade alarm (Item 6A)
                     dummy_chunk.write_bytes(b"chunk3")
-                    rd.get_video_params = lambda p: (1280, 720, 25.0)
+                    rd.get_video_params = lambda p: (1280, 720, 25.0, "h264", "")
                     rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_003.ts", "TEST")
                     self.assertIn("quality_downgrade", alarms_started)
                     self.assertEqual(state.last_downgraded_quality_params, (1280, 720, 25.0))
@@ -1524,7 +1581,7 @@ class TestBackoffPolicy(unittest.TestCase):
 
                     # 6. Chunk 5 restores to baseline 1080p50 -> stops alarm, clears ack params, beeps good (Item 6C)
                     dummy_chunk.write_bytes(b"chunk5")
-                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0, "h264", "")
                     beeps.clear()
                     rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_005.ts", "TEST")
                     self.assertIsNone(state.acknowledged_quality_params)
@@ -1606,7 +1663,7 @@ class TestBackoffPolicy(unittest.TestCase):
                     # Scenario 1: Mid-run flapping chunk of 35s (< 60s) -> REJECTED as BAD (Item 7A)
                     dummy_chunk.write_bytes(b"flap")
                     rd.get_file_info = lambda p: (35.0, 4000.0)
-                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0, "h264", "")
                     accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_002.ts", "TEST")
                     self.assertFalse(accepted)
 
@@ -1619,7 +1676,7 @@ class TestBackoffPolicy(unittest.TestCase):
 
                     # Scenario 3: Clean boundary (stop_flag=True), but 25s chunk with downgraded quality 720p25 -> REJECTED as BAD (Item 7B)
                     dummy_chunk.write_bytes(b"emergency_slate")
-                    rd.get_video_params = lambda p: (1280, 720, 25.0)
+                    rd.get_video_params = lambda p: (1280, 720, 25.0, "h264", "")
                     accepted = rd.maybe_accept_chunk(state, str(dummy_chunk), "chunk_003.ts", "TEST")
                     self.assertFalse(accepted)
 
@@ -1718,7 +1775,7 @@ class TestBackoffPolicy(unittest.TestCase):
                     rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
                     rd.LIST_FILE = str(td_path / "list.txt")
                     rd.get_file_info = lambda p: (75.0, 4000.0)
-                    rd.get_video_params = lambda p: (1920, 1080, 50.0)
+                    rd.get_video_params = lambda p: (1920, 1080, 50.0, "h264", "")
                     rd.log = lambda *a, **k: None
 
                     # Replay burst (75s media in 4s wall = 18.75x) must NOT be accepted
@@ -1912,6 +1969,198 @@ class TestStaticRecorderResolution(unittest.TestCase):
         finally:
             if previous_override is not None:
                 os.environ["RECORD_STATIC_PY_PATH"] = previous_override
+
+
+def load_integrity_cut_gate():
+    """Compile settle_integrity_cut() out of record_static.py with recording-free deps."""
+    record_path = resolve_record_py_path()
+    text = record_path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "settle_integrity_cut"
+    ]
+    assert nodes, f"settle_integrity_cut not found in {record_path}"
+
+    logs = []
+    corruption_cuts = []
+    beeps = []
+
+    def dummy_register(state, now=None, *, fatal=True):
+        corruption_cuts.append((now, fatal))
+        return True
+
+    def dummy_beep(state):
+        beeps.append(True)
+
+    ns = {
+        "log": lambda msg, level="INFO", **kwargs: logs.append((level, msg)),
+        "register_stream_corrupt_recycle": dummy_register,
+        "play_stream_corrupt_bad_beep_async": dummy_beep,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(record_path), "exec"), ns)
+    return ns["settle_integrity_cut"], logs, corruption_cuts, beeps
+
+
+class TestPlannedFormatCutAccounting(unittest.TestCase):
+    """BUG-029: a codec-change cut is a planned cut, never a corruption."""
+
+    class Monitor:
+        def __init__(self, kind, reason):
+            self.recycle_kind = kind
+            self.recycle_reason = reason
+            self.recycle_requested = True
+
+    class State:
+        def __init__(self):
+            self.stats = {}
+            self.stream_corrupt_recycle_timestamps = []
+
+    def setUp(self):
+        (
+            self.settle,
+            self.logs,
+            self.corruption_cuts,
+            self.beeps,
+        ) = load_integrity_cut_gate()
+
+    def test_format_cut_is_not_counted_as_corruption(self):
+        state = self.State()
+        monitor = self.Monitor("format_change", "format change: codec h264->hevc")
+
+        status = self.settle(state, monitor, flush_cb=lambda: None)
+
+        self.assertEqual(status, "format_change_recycle")
+        self.assertEqual(state.stats["format_change_recycles"], 1)
+        # No corruption timestamp, no Bad Beep, no siren, no false summary line.
+        self.assertEqual(state.stream_corrupt_recycle_timestamps, [])
+        self.assertEqual(self.corruption_cuts, [])
+        self.assertEqual(self.beeps, [])
+        self.assertIn("FORMAT CHANGE", self.logs[-1][1])
+        self.assertNotIn("STREAM RECYCLE", self.logs[-1][1])
+
+    def test_corruption_cut_still_counts(self):
+        state = self.State()
+        monitor = self.Monitor("corruption", "Fatal Container Poisoning")
+
+        status = self.settle(state, monitor, flush_cb=lambda: None)
+
+        self.assertEqual(status, "stream_corrupt_recycle")
+        self.assertEqual(len(self.corruption_cuts), 1)
+        self.assertEqual(self.beeps, [True])
+        self.assertNotIn("format_change_recycles", state.stats)
+        self.assertIn("STREAM RECYCLE", self.logs[-1][1])
+
+    def test_a_monitor_without_a_kind_is_treated_as_corruption(self):
+        state = self.State()
+
+        class LegacyMonitor:
+            recycle_reason = "grace countdown expired"
+
+        status = self.settle(state, LegacyMonitor(), flush_cb=None)
+
+        self.assertEqual(status, "stream_corrupt_recycle")
+        self.assertEqual(len(self.corruption_cuts), 1)
+
+
+class TestSealPathVideoParamsContract(unittest.TestCase):
+    """The chunk-seal path must accept the five-field VideoParams the probe returns."""
+
+    def _load_record_dynamic(self):
+        import importlib
+        import sys
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+            tmp.write(
+                "NM3U8DL_PLAYLIST_PRIMARY_PHRASES = ['test']\n"
+                "NM3U8DL_PLAYLIST_REQUIRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_REJECTED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_PREFERRED_QUALIFIERS = []\n"
+                "NM3U8DL_PLAYLIST_GROUP = 'TEST'\n"
+                "NM3U8DL_PLAYLIST_GROUPS = {'TEST': ['http://test']}\n"
+                "SCHEDULE_START = ''\n"
+                "RUN_DURATION_MIN = 1\n"
+                "BASE_NAME = 'test'\n"
+                f"RECORDING_OUTPUT_DIR = {repr(tempfile.gettempdir())}\n"
+                "REQUIRED_VPN_COUNTRY = 'IN'\n"
+            )
+            tmp_path = tmp.name
+        previous = os.environ.get("RECORDER_DYNAMIC_CONFIG_PATH")
+        os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = tmp_path
+        try:
+            if "record_dynamic" in sys.modules:
+                return sys.modules["record_dynamic"]
+            return importlib.import_module("record_dynamic")
+        finally:
+            if previous is None:
+                os.environ.pop("RECORDER_DYNAMIC_CONFIG_PATH", None)
+            else:
+                os.environ["RECORDER_DYNAMIC_CONFIG_PATH"] = previous
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def test_video_params_five_field_unpack_on_seal_path(self):
+        rd = self._load_record_dynamic()
+        state = rd.RecorderState()
+
+        originals = {
+            "DOWNLOAD_MODE": rd.DOWNLOAD_MODE,
+            "LIST_FILE": rd.LIST_FILE,
+            "get_file_info": rd.get_file_info,
+            "get_video_params": rd.get_video_params,
+            "log": rd.log,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            chunk = Path(td) / "chunk.ts"
+            chunk.write_bytes(b"chunk_bytes")
+            try:
+                rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
+                rd.LIST_FILE = str(Path(td) / "list.txt")
+                rd.get_file_info = lambda p: (100.0, 4000.0)
+                rd.log = lambda *a, **k: None
+                # Exactly what the fixed probe returns: five fields, codec included.
+                rd.get_video_params = lambda p: rd.VideoParams(
+                    1920, 1080, 50.0, "h264", "progressive"
+                )
+
+                rd.maybe_accept_chunk(state, str(chunk), "chunk_001.ts", "TEST")
+
+                self.assertEqual(state.baseline_video_params, (1920, 1080, 50.0))
+                self.assertEqual(state.baseline_video_codec, "h264")
+            finally:
+                for name, value in originals.items():
+                    setattr(rd, name, value)
+
+    def test_seal_path_accepts_a_legacy_three_field_probe(self):
+        rd = self._load_record_dynamic()
+        state = rd.RecorderState()
+
+        original_mode = rd.DOWNLOAD_MODE
+        original_list = rd.LIST_FILE
+        original_info = rd.get_file_info
+        original_params = rd.get_video_params
+        with tempfile.TemporaryDirectory() as td:
+            chunk = Path(td) / "chunk.ts"
+            chunk.write_bytes(b"chunk_bytes")
+            try:
+                rd.DOWNLOAD_MODE = rd.ENGINE_FFMPEG
+                rd.LIST_FILE = str(Path(td) / "list.txt")
+                rd.get_file_info = lambda p: (100.0, 4000.0)
+                rd.log = lambda *a, **k: None
+                rd.get_video_params = lambda p: (1920, 1080, 50.0)
+
+                rd.maybe_accept_chunk(state, str(chunk), "chunk_001.ts", "TEST")
+
+                # A legacy three-field mock is coerced, not crashed on.
+                self.assertEqual(state.baseline_video_params, (1920, 1080, 50.0))
+                self.assertIsNone(state.last_downgraded_quality_params)
+            finally:
+                rd.DOWNLOAD_MODE = original_mode
+                rd.LIST_FILE = original_list
+                rd.get_file_info = original_info
+                rd.get_video_params = original_params
 
 
 if __name__ == "__main__":
