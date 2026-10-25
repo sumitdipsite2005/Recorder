@@ -1043,15 +1043,24 @@ class TestStreamCorruptRollingWindow(unittest.TestCase):
         self.assertEqual(len(self.state.stream_corrupt_recycle_timestamps), 1)
 
     def test_ack_silences_episode_and_later_cuts_only_beep(self):
-        self.register(self.state, now=5000.0)
-        self.register(self.state, now=5100.0)
+        """R2: a cut after 'A' is beep-only while the five-minute quiet window is open.
+
+        The acknowledgement stamps its quiet window from the real clock (BUG-032), so
+        the cut times are offsets from time.monotonic() rather than absolute constants.
+        With constants this test silently depended on how long the host had been up: on
+        a freshly booted runner (CI) 5200.0 was already past the window, the siren
+        re-armed and the "later cut only beeps" expectation failed.
+        """
+        base = time.monotonic()
+        self.register(self.state, now=base)
+        self.register(self.state, now=base + 100.0)
         self.assertTrue(self.ack(self.state))
         self.assertTrue(self.state.ffmpeg_stream_corrupt_post_ack_silent)
         self.assertFalse(self.state.ffmpeg_stream_corrupt_alarm_active)
         self.assertEqual(self.alarms_stopped, [True])
         self.assertFalse(self.state.stream_corrupt_lock.locked())
 
-        should_beep = self.register(self.state, now=5200.0)
+        should_beep = self.register(self.state, now=base + 200.0)
         self.assertTrue(should_beep)
         self.assertEqual(self.alarms_started, ["stream_corrupt"])  # no second siren
 
