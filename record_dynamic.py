@@ -405,9 +405,17 @@ NM3U8DL_CHECK_INTERVAL_MULTIPLIER = 2
 NM3U8DL_MIN_GROWTH_CHECK_INTERVAL_SEC = 30  # Never judge N_m3u8DL file growth on a window shorter than 30s.
 NM3U8DL_TERMINAL_PROGRESS_INTERVAL_SEC = 60  # Permanent Vid/Aud terminal snapshots; native N refresh remains unchanged.
 NM3U8DL_HEALTH_LOG_INTERVAL_SEC = 60         # Match the other engines' normal Good speed log cadence.
-NM3U8DL_ALARM_BEEP_HZ = 1500
-NM3U8DL_ALARM_BEEP_MS = 500
-NM3U8DL_ALARM_BEEP_GAP_SEC = 0.05
+NM3U8DL_ALARM_BEEP_HZ = 1200                     # was 1500 - distinct from beep_bad/beep_good timbre
+NM3U8DL_ALARM_BEEP_MS = 200                      # was 500 - three short hits per burst, not one long tone
+NM3U8DL_ALARM_BEEP_GAP_SEC = 0.25                # was 0.05 - between hits inside one burst
+NM3U8DL_ALARM_BEEP_BURST_PAUSE_SEC = 0.5         # between bursts
+ALARM_FALLBACK_BURST_HITS = 3                    # three hits per burst, both platforms
+ALARM_FALLBACK_MACOS_SOUND = "/System/Library/Sounds/Sosumi.aiff"   # not Basso, not Glass
+ALARM_FALLBACK_MACOS_HIT_GAP_SEC = 0.4           # Sosumi runs about 0.35s
+ALARM_FALLBACK_RESPAWN_FLOOR_SEC = 0.5           # no exit path may spin
+ALARM_FALLBACK_MAX_CONSECUTIVE_FAILURES = 3      # a dead siren is declared, not retried forever
+AFPLAY_TERMINATE_GRACE_SEC = 1.0                 # bounded SIGTERM->SIGKILL reap (see _reap_afplay)
+AFPLAY_MIN_AUDIBLE_SEC = 0.05                    # anything shorter than this did not play a sound
 ALARM_SOUND_FILENAME = "alarm.wav"
 ALARM_LINGER_SEC = 30
 FFMPEG_OFF_ALARM_THRESHOLD_SEC = 300
@@ -2631,44 +2639,198 @@ def ensure_nm3u8dl_key_listener(state):
     # Back-compat alias (nm3u8dl historically owned this listener).
     ensure_global_key_listener(state)
 
+def _alarm_fallback_hit(stop_event: threading.Event) -> bool:
+    """One alarm burst: three hits, on whichever platform we are running.
+
+    Uses a timbre that is neither beep_bad (Basso) nor beep_good (Glass), so the
+    operator can tell an alarm from a status sound with their eyes closed.
+
+    Returns True when the burst played out, False when it was cut short or this
+    platform has no voice. The stop event is tested before every hit and waited on
+    between hits, because `A` must silence the alarm in well under a second:
+    shared_alarm_stop joins this thread for 1.0s, so an uninterruptible burst would
+    keep playing into whatever alarm comes next. Worst case after `A` is one hit
+    (~0.35s).
+
+    A non-zero `afplay` exit code is treated as "no sound" rather than silence:
+    afplay returns immediately with an error on an unreadable or missing file, and
+    the old code could not see that.
+    """
+    if sys.platform == "darwin":
+        for hit in range(ALARM_FALLBACK_BURST_HITS):
+            if stop_event.is_set():
+                return False
+            try:
+                res = subprocess.run(
+                    ["afplay", ALARM_FALLBACK_MACOS_SOUND],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                log(
+                    f"[ALARM] ALARM_SOUND_UNAVAILABLE: fallback voice could not start "
+                    f"(afplay {ALARM_FALLBACK_MACOS_SOUND}: {exc})",
+                    level="ERROR",
+                )
+                return False
+            if getattr(res, "returncode", 0) != 0:
+                log(
+                    f"[ALARM] ALARM_SOUND_UNAVAILABLE: fallback voice exited with code "
+                    f"{getattr(res, 'returncode', None)} for {ALARM_FALLBACK_MACOS_SOUND}",
+                    level="ERROR",
+                )
+                return False
+            if hit + 1 < ALARM_FALLBACK_BURST_HITS:
+                if stop_event.wait(ALARM_FALLBACK_MACOS_HIT_GAP_SEC):
+                    return False
+        return True
+
+    if winsound is not None:
+        for hit in range(ALARM_FALLBACK_BURST_HITS):
+            if stop_event.is_set():
+                return False
+            # winsound.Beep blocks for NM3U8DL_ALARM_BEEP_MS and has no interruptible
+            # form, so one hit (~200ms) is the Windows floor as well.
+            winsound.Beep(int(NM3U8DL_ALARM_BEEP_HZ), int(NM3U8DL_ALARM_BEEP_MS))
+            if hit + 1 < ALARM_FALLBACK_BURST_HITS:
+                if stop_event.wait(NM3U8DL_ALARM_BEEP_GAP_SEC):
+                    return False
+        return True
+
+    # Neither voice is available. Say so ONCE per loop entry and stop trying:
+    # an alarm that cannot be heard must not also burn a core.
+    log("[ALARM] ALARM_SOUND_UNAVAILABLE: no audible fallback available on this platform", level="ERROR")
+    return False
+
 def _alarm_beep_fallback_loop(
     stop_event: threading.Event,
     state: RecorderState,
     activity_id: Optional[str] = None,
 ):
-    # Existing v15 behavior: continuous winsound.Beep loop. Sound snooze gates
-    # playback only; this alarm thread remains alive so sound can resume later.
+    """Audible alarm of last resort: Sosumi x3 on macOS, 1200 Hz x3 on Windows.
+
+    Signature is unchanged from the production one so both existing callers —
+    missing file, Windows `except` — keep passing `stop_event` first positionally.
+    """
     log(
-        "ALARM: wav/mp3 unavailable; using beep fallback loop",
+        "ALARM: siren unusable; using cross-platform fallback voice",
+        level="WARN",
         activity_id=activity_id,
     )
+    warned_unavailable = False
     while not stop_event.is_set():
-        if is_sound_snoozed(state):
-            stop_event.wait(0.1)
+        if getattr(state, "alarm_ack_requested", False) or is_sound_snoozed(state):
+            if stop_event.wait(NM3U8DL_ALARM_BEEP_GAP_SEC):
+                return
             continue
+        must_stop = False
         try:
-            winsound.Beep(int(NM3U8DL_ALARM_BEEP_HZ), int(NM3U8DL_ALARM_BEEP_MS))
-        except Exception:
-            try:
-                winsound.MessageBeep()
-            except Exception:
-                pass
-        stop_event.wait(float(NM3U8DL_ALARM_BEEP_GAP_SEC))
+            must_stop = not _alarm_fallback_hit(stop_event)
+        except Exception as exc:  # never let the last resort die of its own error
+            if not warned_unavailable:
+                log(
+                    f"ALARM: fallback voice failed: {exc}",
+                    level="ERROR",
+                    activity_id=activity_id,
+                )
+                warned_unavailable = True
+        if must_stop:
+            # Either `A`/a stop cut the burst short, or there is no voice at all.
+            # Both mean stop looping rather than wake up every second forever.
+            return
+        # Floor wait. Without it, a platform with a very short burst spins hot.
+        if stop_event.wait(NM3U8DL_ALARM_BEEP_BURST_PAUSE_SEC):
+            return
 
 def _resolve_alarm_sound_path() -> Optional[str]:
-    # ALARM_SOUND_FILENAME may be absolute or relative to the shared sounds folder.
+    """Locate the alarm siren: sounds/ first (production layout), then beside the script.
+
+    A zero-byte file is not a siren: it opens, plays nothing, and sends the operator
+    back to the silent-fallback bug this batch exists to fix.
+    """
+    candidates = []
+    if os.path.isabs(ALARM_SOUND_FILENAME):
+        candidates.append(ALARM_SOUND_FILENAME)
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(script_dir, "sounds", ALARM_SOUND_FILENAME))
+        candidates.append(os.path.join(script_dir, ALARM_SOUND_FILENAME))
+        candidates.append(
+            os.path.join(os.path.dirname(script_dir), "sounds", ALARM_SOUND_FILENAME)
+        )
+    for candidate in candidates:
+        try:
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+def _reap_afplay(proc) -> None:
+    """Terminate the afplay child AND reap it, so it cannot linger as a zombie.
+
+    terminate() alone leaves the child in the process table as a defunct entry until
+    this process spawns another child or exits. Because the siren loop only spawns
+    again while the alarm is sounding, every acknowledgement or snooze strands one
+    zombie for the life of the recorder - and an overnight feed produces many.
+
+    The grace is 1.0s because shared_alarm_stop() joins this alarm thread for 1.0s;
+    waiting longer would make the stop path time out and leak the thread. A child
+    that ignores SIGTERM is killed, then reaped.
+    """
     try:
-        if os.path.isabs(ALARM_SOUND_FILENAME):
-            p = ALARM_SOUND_FILENAME
-        else:
-            p = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "sounds",
-                ALARM_SOUND_FILENAME,
-            )
+        proc.terminate()
     except Exception:
-        return None
-    return p
+        return
+    for escalate in (False, True):
+        if escalate:
+            try:
+                proc.kill()
+            except Exception:
+                return
+        try:
+            proc.wait(timeout=AFPLAY_TERMINATE_GRACE_SEC)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+    log("ALARM: afplay survived SIGTERM and SIGKILL; leaving it to the OS", level="WARN")
+
+def _afplay_play_once(state, stop_event: threading.Event, sound_path: str) -> str:
+    """Play the siren once and report what actually happened.
+
+    Returns one of: "played" (audible, exit 0), "partial" (audible but exited
+    non-zero), "failed" (no sound at all - unreadable, corrupt or zero-length
+    file), "stopped" (alarm cleared while playing), "snoozed".
+
+    Popen succeeding proves nothing: afplay returns immediately with a non-zero
+    exit code on an unreadable file. Judging by exception alone is what let the
+    alarm respawn afplay in an unbounded loop at 100% CPU instead of falling back.
+    """
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            ["afplay", sound_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log(f"ALARM: afplay could not start: {exc}", level="ERROR")
+        return "failed"
+
+    while proc.poll() is None:
+        if stop_event.wait(0.1):
+            _reap_afplay(proc)
+            return "stopped"
+        if is_sound_snoozed(state):
+            _reap_afplay(proc)
+            return "snoozed"
+
+    elapsed = time.monotonic() - started
+    if proc.returncode != 0:
+        return "partial" if elapsed >= AFPLAY_MIN_AUDIBLE_SEC else "failed"
+    return "played"
 
 def _shared_alarm_sound_loop(
     stop_event: threading.Event,
@@ -2679,93 +2841,120 @@ def _shared_alarm_sound_loop(
     # snoozed; only physical playback is paused.
     sound_path = _resolve_alarm_sound_path()
 
-    if sound_path and os.path.isfile(sound_path):
-
-        # macOS
-        if sys.platform == "darwin":
-            while not stop_event.is_set():
-                if is_sound_snoozed(state):
-                    stop_event.wait(0.1)
-                    continue
-
-                try:
-                    proc = subprocess.Popen(
-                        ["afplay", sound_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-
-                    while proc.poll() is None:
-                        if stop_event.wait(0.1):
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                log_process_shutdown_timeout("afplay", 2)
-                                proc.kill()
-                            return
-
-                        if is_sound_snoozed(state):
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                log_process_shutdown_timeout("afplay", 2)
-                                proc.kill()
-                            break
-
-                except Exception as exc:
-                    log(
-                        f"ALARM: failed to play {sound_path} with afplay ({exc})",
-                        activity_id=activity_id,
-                    )
-                    break
-
-            return
-
-        # Windows
-        if winsound is not None:
-            sound_playing = False
-            try:
-                while not stop_event.is_set():
-                    snoozed = is_sound_snoozed(state)
-
-                    if snoozed and sound_playing:
-                        winsound.PlaySound(None, winsound.SND_PURGE)
-                        sound_playing = False
-                    elif not snoozed and not sound_playing:
-                        winsound.PlaySound(
-                            sound_path,
-                            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP
-                        )
-                        sound_playing = True
-
-                    stop_event.wait(0.1)
-
-                if sound_playing:
-                    winsound.PlaySound(None, winsound.SND_PURGE)
-                return
-            except Exception as exc:
-                log(
-                    f"ALARM: failed to play {sound_path}; falling back to beep loop ({exc})",
-                    activity_id=activity_id,
-                )
-                try:
-                    winsound.PlaySound(None, winsound.SND_PURGE)
-                except Exception:
-                    pass
-
-    else:
+    if sound_path is None:
         log(
-            f"ALARM: sound file missing at {sound_path}; falling back to beep loop",
+            f"ALARM: sound file {ALARM_SOUND_FILENAME!r} not found in sounds/ or beside "
+            f"the script; falling back to beep loop",
+            level="WARN",
             activity_id=activity_id,
         )
+        _alarm_beep_fallback_loop(stop_event, state, activity_id=activity_id)
+        return
+
+    # macOS
+    if sys.platform == "darwin":
+        consecutive_failures = 0
+        while not stop_event.is_set():
+            if getattr(state, "alarm_ack_requested", False) or is_sound_snoozed(state):
+                if stop_event.wait(NM3U8DL_ALARM_BEEP_GAP_SEC):
+                    return
+                continue
+
+            outcome = _afplay_play_once(state, stop_event, sound_path)
+
+            if outcome == "stopped":
+                return
+            if outcome == "snoozed":
+                continue
+            if outcome == "failed":
+                consecutive_failures += 1
+                if consecutive_failures >= ALARM_FALLBACK_MAX_CONSECUTIVE_FAILURES:
+                    log(
+                        f"ALARM: siren {sound_path!r} produced no sound "
+                        f"{consecutive_failures}x; switching to fallback voice",
+                        level="ERROR",
+                    )
+                    _alarm_beep_fallback_loop(stop_event, state, activity_id=activity_id)
+                    return
+            else:
+                consecutive_failures = 0
+
+            # Respawn floor: afplay returns instantly for a file it cannot decode,
+            # so an unguarded loop spins a core and never reaches the fallback.
+            if stop_event.wait(ALARM_FALLBACK_RESPAWN_FLOOR_SEC):
+                return
+        return
+
+    # Windows
+    if winsound is not None:
+        sound_playing = False
+        try:
+            while not stop_event.is_set():
+                snoozed = is_sound_snoozed(state)
+
+                if snoozed and sound_playing:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                    sound_playing = False
+                elif not snoozed and not sound_playing:
+                    winsound.PlaySound(
+                        sound_path,
+                        winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP
+                    )
+                    sound_playing = True
+
+                stop_event.wait(0.1)
+
+            if sound_playing:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            return
+        except Exception as exc:
+            log(
+                f"ALARM: failed to play {sound_path}; falling back to beep loop ({exc})",
+                activity_id=activity_id,
+            )
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
 
     _alarm_beep_fallback_loop(
         stop_event,
         state,
         activity_id=activity_id,
     )
+
+
+def check_alarm_sound_at_launch() -> str:
+    """Say which voice will wake the operator, before anything goes wrong.
+
+    Returns "siren", "fallback" or "none". The macOS fallback is only promised when
+    the system sound actually exists on disk, so a machine with no audio at all says
+    so at launch instead of during the incident it was supposed to announce.
+    """
+    sound_path = _resolve_alarm_sound_path()
+    if sound_path:
+        log(f"ALARM_AUDIO_READY source=siren path={sound_path}")
+        return "siren"
+    if sys.platform == "darwin" and os.path.isfile(ALARM_FALLBACK_MACOS_SOUND):
+        log(
+            f"ALARM_AUDIO_READY source=fallback voice={ALARM_FALLBACK_MACOS_SOUND} "
+            f"(siren {ALARM_SOUND_FILENAME!r} not found)",
+            level="WARN",
+        )
+        return "fallback"
+    if winsound is not None:
+        log(
+            f"ALARM_AUDIO_READY source=fallback voice={NM3U8DL_ALARM_BEEP_HZ}Hz "
+            f"(siren {ALARM_SOUND_FILENAME!r} not found)",
+            level="WARN",
+        )
+        return "fallback"
+    log(
+        "[ALARM] ALARM_SOUND_UNAVAILABLE: source=none — no siren, no macOS fallback "
+        "voice and no winsound; alarms in this session will be SILENT",
+        level="ERROR",
+    )
+    return "none"
 
 
 def _auto_silence_shared_alarm(state, alarm_type: str):
@@ -19843,6 +20032,7 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
     log(f"Engine selected   : {engine.description}")
     init_termcap()
     init_raw_external_capture()
+    check_alarm_sound_at_launch()
     
     if not state.stats["process_start"]:
         state.start_time = time.time()

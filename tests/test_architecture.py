@@ -597,5 +597,51 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("selection_policy_for_provider(",snapshot)
 
 
+ALARM_AUDIO_CONSTANTS = (
+    "NM3U8DL_ALARM_BEEP_HZ",
+    "NM3U8DL_ALARM_BEEP_MS",
+    "NM3U8DL_ALARM_BEEP_GAP_SEC",
+    "NM3U8DL_ALARM_BEEP_BURST_PAUSE_SEC",
+    "ALARM_FALLBACK_BURST_HITS",
+    "ALARM_FALLBACK_MACOS_SOUND",
+    "ALARM_FALLBACK_RESPAWN_FLOOR_SEC",
+    "ALARM_FALLBACK_MAX_CONSECUTIVE_FAILURES",
+)
+
+
+def _module_constants(path, names):
+    """Return {name: literal value} for module-level constant assignments."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    values = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in names:
+                try:
+                    values[target.id] = ast.literal_eval(node.value)
+                except ValueError:
+                    values[target.id] = "unparsed"
+    return values
+
+
+class AlarmAudioParityTests(unittest.TestCase):
+    # BUG-038: both recorders sound the alarm by copy, so the values must match or
+    # the static and dynamic recorders will sound different alarms for one defect.
+    def test_alarm_audio_constants_are_defined_identically_in_both_recorders(self):
+        static = _module_constants(ROOT / "record_static.py", ALARM_AUDIO_CONSTANTS)
+        dynamic = _module_constants(ROOT / "record_dynamic.py", ALARM_AUDIO_CONSTANTS)
+        missing = [name for name in ALARM_AUDIO_CONSTANTS if name not in static or name not in dynamic]
+        self.assertEqual(missing, [], f"alarm-audio constants missing: {missing}")
+        for name in ALARM_AUDIO_CONSTANTS:
+            self.assertEqual(static[name], dynamic[name], f"{name} differs between the recorders")
+
+    def test_both_recorders_check_the_alarm_sound_at_launch(self):
+        for name in ("record_static.py", "record_dynamic.py"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("def check_alarm_sound_at_launch()", text, name)
+            self.assertIn("    check_alarm_sound_at_launch()", text, name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
