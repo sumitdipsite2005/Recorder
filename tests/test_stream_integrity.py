@@ -11,13 +11,19 @@ from unittest.mock import patch
 
 
 HELPER_FUNCTIONS = (
+    "_fmt_monotonic_clock",
     "_prune_locked",
+    "_start_corrupt_siren_if_due",
     "prune_stream_corrupt_window",
     "register_stream_corrupt_recycle",
     "acknowledge_stream_corrupt_alarm",
     "play_stream_corrupt_bad_beep_async",
 )
-HELPER_CONSTANTS = ("STREAM_CORRUPT_WINDOW_SEC", "STREAM_CORRUPT_ALARM_THRESHOLD")
+HELPER_CONSTANTS = (
+    "STREAM_CORRUPT_WINDOW_SEC",
+    "STREAM_CORRUPT_ALARM_THRESHOLD",
+    "STREAM_CORRUPT_ACK_QUIET_SEC",
+)
 
 
 def resolve_record_py_path() -> Path:
@@ -998,13 +1004,20 @@ class TestStreamCorruptRollingWindow(unittest.TestCase):
         self.assertFalse(self.state.ffmpeg_stream_corrupt_post_ack_silent)
 
     def test_rearm_after_31_minutes_without_tick_via_register_time_prune(self):
-        """R1: ack, then a long gap with no sweeper tick, then a cut starts a fresh episode."""
-        self.register(self.state, now=5000.0)
-        self.register(self.state, now=5100.0)
+        """R1: ack, then a long gap with no sweeper tick, then a cut starts a fresh episode.
+
+        The acknowledgement stamps its quiet window from the real clock (BUG-032), so
+        the synthetic cut times are offsets from time.monotonic() rather than absolute
+        constants - otherwise the "31 minutes later" cut lands inside a quiet window
+        that was opened in the present.
+        """
+        base = time.monotonic()
+        self.register(self.state, now=base)
+        self.register(self.state, now=base + 100.0)
         self.ack(self.state)
         self.assertTrue(self.state.ffmpeg_stream_corrupt_post_ack_silent)
 
-        later = 5100.0 + 31 * 60.0
+        later = base + 100.0 + 31 * 60.0
         should_beep = self.register(self.state, now=later)
         self.assertFalse(self.state.ffmpeg_stream_corrupt_post_ack_silent)
         self.assertEqual(len(self.state.stream_corrupt_recycle_timestamps), 1)

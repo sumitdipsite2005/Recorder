@@ -219,6 +219,7 @@ NM3U8DL_CRASH_MAX_ATTEMPTS = 2
 CONTINUOUS_ALARM_MAX_SEC = 5 * 60
 STREAM_CORRUPT_WINDOW_SEC = 1800.0  # Rolling 30-minute window of fatal (chunk-cut) corruption events (time.monotonic)
 STREAM_CORRUPT_ALARM_THRESHOLD = 2  # Fatal cuts inside the window required to sound the persistent siren
+STREAM_CORRUPT_ACK_QUIET_SEC = 300.0  # 5 minutes: how long 'A' buys silence for fatal cuts (BUG-032)
 NM3U8DL_CHECK_INTERVAL_MULTIPLIER = 2
 NM3U8DL_MIN_GROWTH_CHECK_INTERVAL_SEC = 30  # Never judge N_m3u8DL file growth on a window shorter than 30s.
 NM3U8DL_TERMINAL_PROGRESS_INTERVAL_SEC = 60  # Permanent Vid/Aud terminal snapshots; native N refresh remains unchanged.
@@ -421,6 +422,12 @@ class RecorderState:
     ffmpeg_stream_corrupt_incidents: int = 0  # fatal: chunk cut because of corruption
     ffmpeg_stream_corrupt_nonfatal_incidents: int = 0  # defect >= 8s that self-healed
     stream_corrupt_recycle_timestamps: list[float] = field(default_factory=list)
+    # BUG-032: acknowledgement buys a bounded quiet window instead of a permanent flag.
+    # post_ack_silent is retained for the non-fatal paths and for timeout bookkeeping.
+    ffmpeg_stream_corrupt_quiet_until: Optional[float] = None      # time.monotonic deadline
+    ffmpeg_stream_corrupt_quiet_fatal_snapshot: int = 0
+    ffmpeg_stream_corrupt_quiet_nonfatal_snapshot: int = 0
+    ffmpeg_stream_corrupt_fatal_cuts: int = 0  # cumulative, incremented per fatal cut
     stream_corrupt_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # Network Guard / VPN Drop alarm state
@@ -1454,6 +1461,15 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
                 or getattr(state, "shared_alarm_type", None) in ("vpn_drop", "internet_drop", "token_expired", "critical", "quality_downgrade")
             )
 
+            # BUG-032: the acknowledged quiet state has no sounding alarm, so the gate
+            # below can never see it. acknowledge_stream_corrupt_alarm() returns True
+            # only when a quiet window is open (or a siren was silenced, which cannot
+            # happen here because alarm_active is False). This is the ONLY reachable
+            # path for the "already quiet" press; putting the branch inside
+            # `if alarm_active:` would make it dead code.
+            if not alarm_active and acknowledge_stream_corrupt_alarm(state):
+                return
+
             if alarm_active:
                 # ACK the N_m3u8DL stall incident immediately. The alarm
                 # may still be sounding while the next process is starting.
@@ -1958,8 +1974,16 @@ def _auto_silence_shared_alarm(state, alarm_type: str):
         state.live_off_post_ack_silent = True
         log("ALARM_OFF_STOP reason=timeout", level="WARN")
     elif alarm_type == "stream_corrupt":
-        state.ffmpeg_stream_corrupt_alarm_active = False
-        state.ffmpeg_stream_corrupt_post_ack_silent = True
+        with state.stream_corrupt_lock:
+            state.ffmpeg_stream_corrupt_alarm_active = False
+            state.ffmpeg_stream_corrupt_post_ack_silent = True
+            # The timeout supersedes any acknowledgement: close the quiet window too,
+            # or its later expiry would re-arm a siren the operator never asked for.
+            if getattr(state, "ffmpeg_stream_corrupt_quiet_until", None) is not None:
+                state.ffmpeg_stream_corrupt_quiet_until = None
+                state.ffmpeg_stream_corrupt_quiet_fatal_snapshot = 0
+                state.ffmpeg_stream_corrupt_quiet_nonfatal_snapshot = 0
+                log("STREAM_CORRUPT: quiet window closed by alarm timeout", level="INFO")
         log("ALARM_CORRUPT_STOP reason=timeout", level="WARN")
     elif alarm_type == "vpn_drop":
         state.vpn_drop_post_ack_silent = True
@@ -2188,37 +2212,106 @@ def acknowledge_live_stall_alarm(state) -> bool:
     return True
 
 
+def _fmt_monotonic_clock(deadline_mono: Optional[float], now_mono: Optional[float] = None) -> str:
+    """Render a time.monotonic() deadline as local wall-clock HH:MM:SS.
+
+    time.monotonic() has no epoch, so it can never be formatted directly. Convert
+    the remaining seconds into a wall-clock instant instead, so a log line can tell
+    the operator when a window ends without printing a meaningless raw float.
+    """
+    if deadline_mono is None:
+        return "-"
+    if now_mono is None:
+        now_mono = time.monotonic()
+    remaining = max(0.0, deadline_mono - now_mono)
+    return time.strftime("%H:%M:%S", time.localtime(time.time() + remaining))
+
+
 def acknowledge_stream_corrupt_alarm(state) -> bool:
-    """Acknowledge the live stream corruption alarm immediately.
+    """Acknowledge the corruption siren, or report a press already in the quiet state.
+
+    Returns True when the press was consumed - either it silenced a sounding siren
+    or it landed inside an open quiet window. The quiet check sits ABOVE the
+    sounding-alarm guard: a second press while quiet must still be consumed, and
+    the guard must not turn a live acknowledgement into a silent no-op.
 
     Flags are mutated under stream_corrupt_lock; the (up to 1s) alarm thread join in
     shared_alarm_stop() runs only after the lock is released.
     """
+    now = time.monotonic()
     with state.stream_corrupt_lock:
         alarm_type = getattr(state, "shared_alarm_type", None)
-        if not (
+        sounding = (
             getattr(state, "ffmpeg_stream_corrupt_alarm_active", False)
             or alarm_type == "stream_corrupt"
-        ):
+        )
+        quiet_until = getattr(state, "ffmpeg_stream_corrupt_quiet_until", None)
+
+        if quiet_until is not None and now >= quiet_until:
+            state.ffmpeg_stream_corrupt_quiet_until = None
+            quiet_until = None
+
+        if not sounding:
+            if quiet_until is not None:
+                remaining = int(quiet_until - now)
+                log(
+                    f"STREAM_CORRUPT: 'A' ignored - quiet window already open, "
+                    f"{remaining}s left (ends {_fmt_monotonic_clock(quiet_until, now)})",
+                    level="INFO",
+                )
+                return True
             return False
 
         alarm_activity_id = getattr(state, "shared_alarm_activity_id", None)
         state.ffmpeg_stream_corrupt_alarm_active = False
         state.ffmpeg_stream_corrupt_post_ack_silent = True
+        state.ffmpeg_stream_corrupt_quiet_until = now + STREAM_CORRUPT_ACK_QUIET_SEC
+        state.ffmpeg_stream_corrupt_quiet_fatal_snapshot = getattr(
+            state, "ffmpeg_stream_corrupt_fatal_cuts", 0
+        )
+        state.ffmpeg_stream_corrupt_quiet_nonfatal_snapshot = getattr(
+            state, "ffmpeg_stream_corrupt_nonfatal_incidents", 0
+        )
         state.alarm_ack_requested = False
         state.alarm_linger_until = None
 
     log("ALARM_ACK", activity_id=alarm_activity_id)
-    log("ALARM_CORRUPT_STOP reason=ack", activity_id=alarm_activity_id)
+    log(
+        f"ALARM_CORRUPT_STOP reason=ack "
+        f"quiet_until={_fmt_monotonic_clock(now + STREAM_CORRUPT_ACK_QUIET_SEC, now)} "
+        f"(fatal_cuts>{state.ffmpeg_stream_corrupt_quiet_fatal_snapshot} re-arms)",
+        activity_id=alarm_activity_id,
+    )
     shared_alarm_stop(state)
     return True
 
 
-def _prune_locked(state, now: float) -> None:
-    """Expire stale fatal-cut timestamps. Caller MUST hold state.stream_corrupt_lock.
+def _prune_locked(state, now: float) -> Optional[str]:
+    """Expire stale timestamps and decide what the acknowledged quiet window means.
 
-    When the rolling window transitions from non-empty to empty (30 clean monotonic
-    minutes), the operator silence is cleared so the next episode re-arms the siren.
+    Caller holds state.stream_corrupt_lock and MUST act on the return value only
+    after releasing it (see _start_corrupt_siren_if_due).
+
+    Returns:
+        None                - no window, or the window is still open.
+        "expired_clean"     - five minutes passed with no fatal cut; siren armed.
+        "expired_with_cuts" - five minutes passed with >=1 fatal cut; siren must sound.
+
+    Two independent expiries:
+      1. The rolling 30-minute window (unchanged) - clears the long-form silence flag
+         when the feed has been clean for the full window.
+      2. The 5-minute acknowledged quiet window (BUG-032).
+
+    THE WINDOW IS NEVER CLOSED EARLY. A fatal cut inside the window is withheld (and
+    logged by register_stream_corrupt_recycle, not here); the operator gets the five
+    minutes he was promised. Closing it on the first cut would cut the silence to
+    however long the feed took to break again - 30 seconds in the reported case - and
+    would make the "siren withheld" line unreachable, because this prune runs first
+    inside the same call.
+
+    At expiry BOTH branches clear ffmpeg_stream_corrupt_post_ack_silent: the silence
+    was granted for five minutes only. Leaving it set would block shared_alarm_start
+    until the 30-clean-minute rule fired - i.e. BUG-032 unfixed.
     """
     timestamps = state.stream_corrupt_recycle_timestamps
     was_non_empty = bool(timestamps)
@@ -2231,47 +2324,146 @@ def _prune_locked(state, now: float) -> None:
             level="INFO",
         )
 
+    quiet_until = getattr(state, "ffmpeg_stream_corrupt_quiet_until", None)
+    if quiet_until is None:
+        return None
+
+    fatal_delta = (
+        getattr(state, "ffmpeg_stream_corrupt_fatal_cuts", 0)
+        - getattr(state, "ffmpeg_stream_corrupt_quiet_fatal_snapshot", 0)
+    )
+
+    if now < quiet_until:
+        # Nothing to say here: register_stream_corrupt_recycle already logs every cut
+        # that the window swallowed, and this function runs on a 0.5s tick. Silence
+        # during the window is the feature; the expiry line below closes the account.
+        return None
+
+    # The window expires on schedule, never early.
+    state.ffmpeg_stream_corrupt_quiet_until = None
+    state.ffmpeg_stream_corrupt_post_ack_silent = False
+
+    if fatal_delta < 1:
+        log(
+            "STREAM_CORRUPT: quiet window expired with no fatal cuts "
+            "(5 min of clean cuts); siren armed",
+            level="INFO",
+        )
+        return "expired_clean"
+
+    log(
+        f"STREAM_CORRUPT: quiet window expired with {fatal_delta} fatal cut(s) "
+        f"unaddressed; siren re-armed",
+        level="WARN",
+    )
+    return "expired_with_cuts"
+
+
+def _start_corrupt_siren_if_due(state, count: int, *, reason: str) -> None:
+    """Start the corruption siren, applying the threshold and post-ack rules.
+
+    Call this WITHOUT state.stream_corrupt_lock held. shared_alarm_start publishes
+    shared_alarm_thread / shared_alarm_stop_event for the alarm thread it creates,
+    and the lock is documented as protecting flags, not thread objects.
+
+    A duplicate call is harmless: shared_alarm_start already refuses while any alarm
+    thread is alive, and refuses outright while post_ack_silent is set.
+
+    The threshold is bypassed for reason="quiet_window_expired" on purpose: the prune
+    has already proven that fatal cuts landed INSIDE the acknowledged window, so the
+    operator was promised a siren for them. Re-applying `count >= 2` there can silently
+    break that promise, because the threshold is measured over the 1800s rolling
+    window while the quiet window is only 300s: a cut that was admitted at age 1799s
+    when `A` was pressed has aged out by expiry, leaving count == 1 even though a cut
+    arrived during the five minutes the operator bought.
+    """
+    if reason != "quiet_window_expired" and count < STREAM_CORRUPT_ALARM_THRESHOLD:
+        return
+    if getattr(state, "ffmpeg_stream_corrupt_post_ack_silent", False):
+        return
+    log(
+        f"ALARM_STREAM_CORRUPT_START: {count} fatal stream cuts within "
+        f"{int(STREAM_CORRUPT_WINDOW_SEC)}s (reason={reason}). Press 'A' to silence.",
+        level="ERROR",
+    )
+    shared_alarm_start(state, alarm_type="stream_corrupt", incident=None)
+    if getattr(state, "shared_alarm_type", None) == "stream_corrupt":
+        state.ffmpeg_stream_corrupt_alarm_active = True
+
 
 def prune_stream_corrupt_window(state, now: Optional[float] = None) -> int:
-    """Prune the rolling fatal-cut window and return the remaining count."""
-    if now is None:
-        now = time.monotonic()
-    with state.stream_corrupt_lock:
-        _prune_locked(state, now)
-        return len(state.stream_corrupt_recycle_timestamps)
+    """Prune the rolling window, expire the quiet window, and re-arm the siren.
 
-
-def register_stream_corrupt_recycle(state, now: Optional[float] = None) -> bool:
-    """Record one fatal (chunk-cut) corruption event.
-
-    Single owner of ffmpeg_stream_corrupt_incidents. Starts the escalation siren when the
-    rolling window holds >= STREAM_CORRUPT_ALARM_THRESHOLD cuts and the operator has not
-    silenced the episode. Returns True when the caller should play the short Bad Beep
-    (no alarm of any kind is sounding).
+    Runs on the supervision tick and once at startup, so a quiet window that expires
+    while the feed is STILL broken re-sounds the siren without waiting for another
+    cut. That is the point of BUG-032: on an overnight feed the cuts keep coming, but
+    the feed can also go fully dead - and then nothing would ever call
+    register_stream_corrupt_recycle again.
     """
     if now is None:
         now = time.monotonic()
     with state.stream_corrupt_lock:
-        # Prune first so a window-empty re-arm is visible to the silence check below.
+        outcome = _prune_locked(state, now)
+        count = len(state.stream_corrupt_recycle_timestamps)
+    if outcome == "expired_with_cuts":
+        _start_corrupt_siren_if_due(state, count, reason="quiet_window_expired")
+    return count
+
+
+def register_stream_corrupt_recycle(state, now: Optional[float] = None, *, fatal: bool = True) -> bool:
+    """Record one corruption event and sound the siren when the window threshold is met.
+
+    `fatal=True` is a chunk cut (footage lost). `fatal=False` covers defensive cuts and
+    minor errors that self-healed: it is TELEMETRY ONLY. It increments the existing
+    non-fatal counter so the run summary stays honest, but it never enters the fatal
+    window, never increments ffmpeg_stream_corrupt_incidents, and can never re-arm or
+    trigger an acknowledged siren - otherwise one self-healed glitch plus one real cut
+    would add up to 2 timestamps and blast a siren claiming two fatal cuts happened.
+
+    Returns True when the caller should play the short Bad Beep (nothing is sounding).
+    """
+    if now is None:
+        now = time.monotonic()
+    withheld_seconds = 0
+    with state.stream_corrupt_lock:
+        # Prune first: it may expire the quiet window, which un-silences this very cut.
         _prune_locked(state, now)
+
+        if not fatal:
+            state.ffmpeg_stream_corrupt_nonfatal_incidents = (
+                getattr(state, "ffmpeg_stream_corrupt_nonfatal_incidents", 0) + 1
+            )
+            log(
+                f"STREAM_CORRUPT_NONFATAL_EVENT: self-healed corruption recorded "
+                f"(nonfatal_total={state.ffmpeg_stream_corrupt_nonfatal_incidents}); "
+                f"fatal_window_count={len(state.stream_corrupt_recycle_timestamps)}"
+            )
+            return False
+
         state.stream_corrupt_recycle_timestamps.append(now)
         state.ffmpeg_stream_corrupt_incidents += 1
+        state.ffmpeg_stream_corrupt_fatal_cuts = (
+            getattr(state, "ffmpeg_stream_corrupt_fatal_cuts", 0) + 1
+        )
         count = len(state.stream_corrupt_recycle_timestamps)
+        quiet_until = getattr(state, "ffmpeg_stream_corrupt_quiet_until", None)
+        if quiet_until is not None and now < quiet_until:
+            withheld_seconds = int(quiet_until - now)
 
-        if (
-            count >= STREAM_CORRUPT_ALARM_THRESHOLD
-            and not getattr(state, "ffmpeg_stream_corrupt_post_ack_silent", False)
-        ):
+    if withheld_seconds:
+        # The window stays open and this line is the only trace the cut leaves, so it
+        # is emitted for the event that would have sounded the siren - not for every
+        # sub-threshold cut. The siren re-sounds at expiry (_prune_locked).
+        if count >= STREAM_CORRUPT_ALARM_THRESHOLD:
             log(
-                f"ALARM_STREAM_CORRUPT_START: {count} fatal stream cuts within "
-                f"{int(STREAM_CORRUPT_WINDOW_SEC)}s. Press 'A' to silence.",
-                level="ERROR",
+                f"STREAM_INTEGRITY: siren withheld "
+                f"(fatal cut {count} in window, quiet window {withheld_seconds}s left)",
+                level="WARN",
             )
-            shared_alarm_start(state, alarm_type="stream_corrupt", incident=None)
-            if getattr(state, "shared_alarm_type", None) == "stream_corrupt":
-                state.ffmpeg_stream_corrupt_alarm_active = True
+    else:
+        _start_corrupt_siren_if_due(state, count, reason="threshold")
 
-        return not is_alarm_active(state)
+    return not is_alarm_active(state)
 
 
 def play_stream_corrupt_bad_beep_async(state) -> None:
@@ -9465,6 +9657,11 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
 
             if not ran_30s and (time.time() - start_run) >= 30:
                 ran_30s = True
+
+            # BUG-032: expire an acknowledged quiet window on this tick too. Without it
+            # a window opened during an FFmpeg run would never expire once the feed
+            # degrades to N_m3u8DL, and the siren would stay silent all night.
+            prune_stream_corrupt_window(state)
 
             time.sleep(0.5)
 
