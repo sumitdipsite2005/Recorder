@@ -184,6 +184,13 @@ def acknowledge_quality_downgrade_alarm(
     state.quality_downgrade_alarm_active = False
     if getattr(state, "last_downgraded_quality_params", None) is not None:
         state.acknowledged_quality_params = state.last_downgraded_quality_params
+        # BUG-029: the codec is part of the acknowledgement key. Without it an 'A'
+        # press remembered only the geometry, and the very next chunk re-raised the
+        # siren for a codec the operator had already accepted.
+        state.acknowledged_quality_codec = getattr(state, "last_downgraded_codec", None)
+    # A downgrade parked behind another alarm must not be promoted after this ACK.
+    state.quality_pending_downgrade = None
+    state.quality_pending_since_mono = None
     state.alarm_ack_requested = False
     state.alarm_linger_until = None
     if log_fn:

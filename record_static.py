@@ -52,7 +52,7 @@ try:
 except Exception:
     msvcrt = None
 import threading
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 try:
     from send2trash import send2trash  # pyright: ignore[reportMissingModuleSource]
 except ImportError:
@@ -123,6 +123,11 @@ RUN_DURATION_MIN = _static_user_config["RUN_DURATION_MIN"]
 BASE_NAME = _static_user_config["BASE_NAME"]
 REQUIRED_VPN_COUNTRY = _static_user_config.get("REQUIRED_VPN_COUNTRY", None)
 VPN_SERVER_PRIORITY = _static_user_config.get("VPN_SERVER_PRIORITY", {})
+
+# BUG-029: optional broadcast-format standard ("1080p50", "1920x1080@50", "1080p").
+# .get with a default: older config files keep working without the key. When it is
+# unset the first accepted chunk of the run defines the standard instead.
+EXPECTED_VIDEO = _static_user_config.get("EXPECTED_VIDEO", None)
 
 
 
@@ -219,13 +224,22 @@ NM3U8DL_CRASH_MAX_ATTEMPTS = 2
 CONTINUOUS_ALARM_MAX_SEC = 5 * 60
 STREAM_CORRUPT_WINDOW_SEC = 1800.0  # Rolling 30-minute window of fatal (chunk-cut) corruption events (time.monotonic)
 STREAM_CORRUPT_ALARM_THRESHOLD = 2  # Fatal cuts inside the window required to sound the persistent siren
+STREAM_CORRUPT_ACK_QUIET_SEC = 300.0  # 5 minutes: how long 'A' buys silence for fatal cuts (BUG-032)
 NM3U8DL_CHECK_INTERVAL_MULTIPLIER = 2
 NM3U8DL_MIN_GROWTH_CHECK_INTERVAL_SEC = 30  # Never judge N_m3u8DL file growth on a window shorter than 30s.
 NM3U8DL_TERMINAL_PROGRESS_INTERVAL_SEC = 60  # Permanent Vid/Aud terminal snapshots; native N refresh remains unchanged.
 NM3U8DL_HEALTH_LOG_INTERVAL_SEC = 60         # Match the other engines' normal Good speed log cadence.
-NM3U8DL_ALARM_BEEP_HZ = 1500
-NM3U8DL_ALARM_BEEP_MS = 500
-NM3U8DL_ALARM_BEEP_GAP_SEC = 0.05
+NM3U8DL_ALARM_BEEP_HZ = 1200                     # was 1500 - distinct from beep_bad/beep_good timbre
+NM3U8DL_ALARM_BEEP_MS = 200                      # was 500 - three short hits per burst, not one long tone
+NM3U8DL_ALARM_BEEP_GAP_SEC = 0.25                # was 0.05 - between hits inside one burst
+NM3U8DL_ALARM_BEEP_BURST_PAUSE_SEC = 0.5         # between bursts
+ALARM_FALLBACK_BURST_HITS = 3                    # three hits per burst, both platforms
+ALARM_FALLBACK_MACOS_SOUND = "/System/Library/Sounds/Sosumi.aiff"   # not Basso, not Glass
+ALARM_FALLBACK_MACOS_HIT_GAP_SEC = 0.4           # Sosumi runs about 0.35s
+ALARM_FALLBACK_RESPAWN_FLOOR_SEC = 0.5           # no exit path may spin
+ALARM_FALLBACK_MAX_CONSECUTIVE_FAILURES = 3      # a dead siren is declared, not retried forever
+AFPLAY_TERMINATE_GRACE_SEC = 1.0                 # bounded SIGTERM->SIGKILL reap (see _reap_afplay)
+AFPLAY_MIN_AUDIBLE_SEC = 0.05                    # anything shorter than this did not play a sound
 ALARM_SOUND_FILENAME = "alarm.wav"
 ALARM_LINGER_SEC = 30
 LIVE_OFF_ALARM_THRESHOLD_SEC = 300
@@ -342,6 +356,26 @@ class RecorderState:
     baseline_video_params: Optional[tuple] = None
     last_downgraded_quality_params: Optional[tuple] = None
     acknowledged_quality_params: Optional[tuple] = None
+    # BUG-029: the floor stays three-field geometry; format identity is carried
+    # beside it, so a codec change can never rewrite the geometry floor.
+    baseline_video_codec: Optional[str] = None
+    last_downgraded_codec: Optional[str] = None
+    acknowledged_quality_codec: Optional[str] = None
+    # Startup verdict plumbing (one chunk's worth of state, reset per chunk).
+    quality_banner_reading: Optional[Any] = None
+    quality_banner_consumed: bool = False
+    quality_probe_done: bool = False
+    quality_startup_checked: bool = False
+    quality_expected_unset_logged: bool = False
+    # BUG-029: an fps=0 startup reading defers the frame-rate verdict without
+    # closing the chunk's startup slot. This keeps that deferral to one log/chunk.
+    quality_fps_defer_logged: bool = False
+    # A quality alarm that could not sound because another alarm owns the bus.
+    quality_pending_downgrade: Optional[dict] = None
+    quality_pending_since_mono: Optional[float] = None
+    # The live StreamIntegrityMonitor of the current chunk run (set by
+    # start_ffmpeg_to_chunk) so module-level helpers can request a planned cut.
+    integrity_monitor: Optional[Any] = None
 
     # Audio / A/V stream-layout consistency tracking (locked after first GOOD chunk)
     audio_expected: Optional[bool] = None
@@ -413,6 +447,12 @@ class RecorderState:
     ffmpeg_stream_corrupt_incidents: int = 0  # fatal: chunk cut because of corruption
     ffmpeg_stream_corrupt_nonfatal_incidents: int = 0  # defect >= 8s that self-healed
     stream_corrupt_recycle_timestamps: list[float] = field(default_factory=list)
+    # BUG-032: acknowledgement buys a bounded quiet window instead of a permanent flag.
+    # post_ack_silent is retained for the non-fatal paths and for timeout bookkeeping.
+    ffmpeg_stream_corrupt_quiet_until: Optional[float] = None      # time.monotonic deadline
+    ffmpeg_stream_corrupt_quiet_fatal_snapshot: int = 0
+    ffmpeg_stream_corrupt_quiet_nonfatal_snapshot: int = 0
+    ffmpeg_stream_corrupt_fatal_cuts: int = 0  # cumulative, incremented per fatal cut
     stream_corrupt_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # Network Guard / VPN Drop alarm state
@@ -1446,6 +1486,15 @@ def _nm3u8dl_key_listener_loop(state, stop_event: threading.Event):
                 or getattr(state, "shared_alarm_type", None) in ("vpn_drop", "internet_drop", "token_expired", "critical", "quality_downgrade")
             )
 
+            # BUG-032: the acknowledged quiet state has no sounding alarm, so the gate
+            # below can never see it. acknowledge_stream_corrupt_alarm() returns True
+            # only when a quiet window is open (or a siren was silenced, which cannot
+            # happen here because alarm_active is False). This is the ONLY reachable
+            # path for the "already quiet" press; putting the branch inside
+            # `if alarm_active:` would make it dead code.
+            if not alarm_active and acknowledge_stream_corrupt_alarm(state):
+                return
+
             if alarm_active:
                 # ACK the N_m3u8DL stall incident immediately. The alarm
                 # may still be sounding while the next process is starting.
@@ -1599,40 +1648,198 @@ def ensure_nm3u8dl_key_listener(state):
     # Back-compat alias (nm3u8dl historically owned this listener).
     ensure_global_key_listener(state)
 
+def _alarm_fallback_hit(stop_event: threading.Event) -> bool:
+    """One alarm burst: three hits, on whichever platform we are running.
+
+    Uses a timbre that is neither beep_bad (Basso) nor beep_good (Glass), so the
+    operator can tell an alarm from a status sound with their eyes closed.
+
+    Returns True when the burst played out, False when it was cut short or this
+    platform has no voice. The stop event is tested before every hit and waited on
+    between hits, because `A` must silence the alarm in well under a second:
+    shared_alarm_stop joins this thread for 1.0s, so an uninterruptible burst would
+    keep playing into whatever alarm comes next. Worst case after `A` is one hit
+    (~0.35s).
+
+    A non-zero `afplay` exit code is treated as "no sound" rather than silence:
+    afplay returns immediately with an error on an unreadable or missing file, and
+    the old code could not see that.
+    """
+    if sys.platform == "darwin":
+        for hit in range(ALARM_FALLBACK_BURST_HITS):
+            if stop_event.is_set():
+                return False
+            try:
+                res = subprocess.run(
+                    ["afplay", ALARM_FALLBACK_MACOS_SOUND],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                log(
+                    f"[ALARM] ALARM_SOUND_UNAVAILABLE: fallback voice could not start "
+                    f"(afplay {ALARM_FALLBACK_MACOS_SOUND}: {exc})",
+                    level="ERROR",
+                )
+                return False
+            if getattr(res, "returncode", 0) != 0:
+                log(
+                    f"[ALARM] ALARM_SOUND_UNAVAILABLE: fallback voice exited with code "
+                    f"{getattr(res, 'returncode', None)} for {ALARM_FALLBACK_MACOS_SOUND}",
+                    level="ERROR",
+                )
+                return False
+            if hit + 1 < ALARM_FALLBACK_BURST_HITS:
+                if stop_event.wait(ALARM_FALLBACK_MACOS_HIT_GAP_SEC):
+                    return False
+        return True
+
+    if winsound is not None:
+        for hit in range(ALARM_FALLBACK_BURST_HITS):
+            if stop_event.is_set():
+                return False
+            # winsound.Beep blocks for NM3U8DL_ALARM_BEEP_MS and has no interruptible
+            # form, so one hit (~200ms) is the Windows floor as well.
+            winsound.Beep(int(NM3U8DL_ALARM_BEEP_HZ), int(NM3U8DL_ALARM_BEEP_MS))
+            if hit + 1 < ALARM_FALLBACK_BURST_HITS:
+                if stop_event.wait(NM3U8DL_ALARM_BEEP_GAP_SEC):
+                    return False
+        return True
+
+    # Neither voice is available. Say so ONCE per loop entry and stop trying:
+    # an alarm that cannot be heard must not also burn a core.
+    log("[ALARM] ALARM_SOUND_UNAVAILABLE: no audible fallback available on this platform", level="ERROR")
+    return False
+
 def _alarm_beep_fallback_loop(
     stop_event: threading.Event,
     state: RecorderState,
     activity_id: Optional[str] = None,
 ):
-    # Existing v15 behavior: continuous winsound.Beep loop. Sound snooze gates
-    # playback only; this alarm thread remains alive so sound can resume later.
+    """Audible alarm of last resort: Sosumi x3 on macOS, 1200 Hz x3 on Windows.
+
+    Signature is unchanged from the production one so both existing callers —
+    missing file, Windows `except` — keep passing `stop_event` first positionally.
+    """
     log(
-        "ALARM: wav/mp3 unavailable; using beep fallback loop",
+        "ALARM: siren unusable; using cross-platform fallback voice",
+        level="WARN",
         activity_id=activity_id,
     )
+    warned_unavailable = False
     while not stop_event.is_set():
-        if is_sound_snoozed(state):
-            stop_event.wait(0.1)
+        if getattr(state, "alarm_ack_requested", False) or is_sound_snoozed(state):
+            if stop_event.wait(NM3U8DL_ALARM_BEEP_GAP_SEC):
+                return
             continue
+        must_stop = False
         try:
-            winsound.Beep(int(NM3U8DL_ALARM_BEEP_HZ), int(NM3U8DL_ALARM_BEEP_MS))
-        except Exception:
-            try:
-                winsound.MessageBeep()
-            except Exception:
-                pass
-        stop_event.wait(float(NM3U8DL_ALARM_BEEP_GAP_SEC))
+            must_stop = not _alarm_fallback_hit(stop_event)
+        except Exception as exc:  # never let the last resort die of its own error
+            if not warned_unavailable:
+                log(
+                    f"ALARM: fallback voice failed: {exc}",
+                    level="ERROR",
+                    activity_id=activity_id,
+                )
+                warned_unavailable = True
+        if must_stop:
+            # Either `A`/a stop cut the burst short, or there is no voice at all.
+            # Both mean stop looping rather than wake up every second forever.
+            return
+        # Floor wait. Without it, a platform with a very short burst spins hot.
+        if stop_event.wait(NM3U8DL_ALARM_BEEP_BURST_PAUSE_SEC):
+            return
 
 def _resolve_alarm_sound_path() -> Optional[str]:
-    # ALARM_SOUND_FILENAME may be absolute or relative to this script folder.
+    """Locate the alarm siren: sounds/ first (production layout), then beside the script.
+
+    A zero-byte file is not a siren: it opens, plays nothing, and sends the operator
+    back to the silent-fallback bug this batch exists to fix.
+    """
+    candidates = []
+    if os.path.isabs(ALARM_SOUND_FILENAME):
+        candidates.append(ALARM_SOUND_FILENAME)
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(script_dir, "sounds", ALARM_SOUND_FILENAME))
+        candidates.append(os.path.join(script_dir, ALARM_SOUND_FILENAME))
+        candidates.append(
+            os.path.join(os.path.dirname(script_dir), "sounds", ALARM_SOUND_FILENAME)
+        )
+    for candidate in candidates:
+        try:
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+def _reap_afplay(proc) -> None:
+    """Terminate the afplay child AND reap it, so it cannot linger as a zombie.
+
+    terminate() alone leaves the child in the process table as a defunct entry until
+    this process spawns another child or exits. Because the siren loop only spawns
+    again while the alarm is sounding, every acknowledgement or snooze strands one
+    zombie for the life of the recorder - and an overnight feed produces many.
+
+    The grace is 1.0s because shared_alarm_stop() joins this alarm thread for 1.0s;
+    waiting longer would make the stop path time out and leak the thread. A child
+    that ignores SIGTERM is killed, then reaped.
+    """
     try:
-        if os.path.isabs(ALARM_SOUND_FILENAME):
-            p = ALARM_SOUND_FILENAME
-        else:
-            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ALARM_SOUND_FILENAME)
+        proc.terminate()
     except Exception:
-        return None
-    return p
+        return
+    for escalate in (False, True):
+        if escalate:
+            try:
+                proc.kill()
+            except Exception:
+                return
+        try:
+            proc.wait(timeout=AFPLAY_TERMINATE_GRACE_SEC)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+    log("ALARM: afplay survived SIGTERM and SIGKILL; leaving it to the OS", level="WARN")
+
+def _afplay_play_once(state, stop_event: threading.Event, sound_path: str) -> str:
+    """Play the siren once and report what actually happened.
+
+    Returns one of: "played" (audible, exit 0), "partial" (audible but exited
+    non-zero), "failed" (no sound at all - unreadable, corrupt or zero-length
+    file), "stopped" (alarm cleared while playing), "snoozed".
+
+    Popen succeeding proves nothing: afplay returns immediately with a non-zero
+    exit code on an unreadable file. Judging by exception alone is what let the
+    alarm respawn afplay in an unbounded loop at 100% CPU instead of falling back.
+    """
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            ["afplay", sound_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log(f"ALARM: afplay could not start: {exc}", level="ERROR")
+        return "failed"
+
+    while proc.poll() is None:
+        if stop_event.wait(0.1):
+            _reap_afplay(proc)
+            return "stopped"
+        if is_sound_snoozed(state):
+            _reap_afplay(proc)
+            return "snoozed"
+
+    elapsed = time.monotonic() - started
+    if proc.returncode != 0:
+        return "partial" if elapsed >= AFPLAY_MIN_AUDIBLE_SEC else "failed"
+    return "played"
 
 def _shared_alarm_sound_loop(
     stop_event: threading.Event,
@@ -1643,91 +1850,120 @@ def _shared_alarm_sound_loop(
     # snoozed; only physical playback is paused.
     sound_path = _resolve_alarm_sound_path()
 
-    if sound_path and os.path.isfile(sound_path):
-
-        # macOS
-        if sys.platform == "darwin":
-            while not stop_event.is_set():
-                if is_sound_snoozed(state):
-                    stop_event.wait(0.1)
-                    continue
-
-                try:
-                    proc = subprocess.Popen(
-                        ["afplay", sound_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-
-                    while proc.poll() is None:
-                        if stop_event.wait(0.1):
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                            return
-
-                        if is_sound_snoozed(state):
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                            break
-
-                except Exception as exc:
-                    log(
-                        f"ALARM: failed to play {sound_path} with afplay ({exc})",
-                        activity_id=activity_id,
-                    )
-                    break
-
-            return
-
-        # Windows
-        if winsound is not None:
-            sound_playing = False
-            try:
-                while not stop_event.is_set():
-                    snoozed = is_sound_snoozed(state)
-
-                    if snoozed and sound_playing:
-                        winsound.PlaySound(None, winsound.SND_PURGE)
-                        sound_playing = False
-                    elif not snoozed and not sound_playing:
-                        winsound.PlaySound(
-                            sound_path,
-                            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP
-                        )
-                        sound_playing = True
-
-                    stop_event.wait(0.1)
-
-                if sound_playing:
-                    winsound.PlaySound(None, winsound.SND_PURGE)
-                return
-            except Exception as exc:
-                log(
-                    f"ALARM: failed to play {sound_path}; falling back to beep loop ({exc})",
-                    activity_id=activity_id,
-                )
-                try:
-                    winsound.PlaySound(None, winsound.SND_PURGE)
-                except Exception:
-                    pass
-
-    else:
+    if sound_path is None:
         log(
-            f"ALARM: sound file missing at {sound_path}; falling back to beep loop",
+            f"ALARM: sound file {ALARM_SOUND_FILENAME!r} not found in sounds/ or beside "
+            f"the script; falling back to beep loop",
+            level="WARN",
             activity_id=activity_id,
         )
+        _alarm_beep_fallback_loop(stop_event, state, activity_id=activity_id)
+        return
+
+    # macOS
+    if sys.platform == "darwin":
+        consecutive_failures = 0
+        while not stop_event.is_set():
+            if getattr(state, "alarm_ack_requested", False) or is_sound_snoozed(state):
+                if stop_event.wait(NM3U8DL_ALARM_BEEP_GAP_SEC):
+                    return
+                continue
+
+            outcome = _afplay_play_once(state, stop_event, sound_path)
+
+            if outcome == "stopped":
+                return
+            if outcome == "snoozed":
+                continue
+            if outcome == "failed":
+                consecutive_failures += 1
+                if consecutive_failures >= ALARM_FALLBACK_MAX_CONSECUTIVE_FAILURES:
+                    log(
+                        f"ALARM: siren {sound_path!r} produced no sound "
+                        f"{consecutive_failures}x; switching to fallback voice",
+                        level="ERROR",
+                    )
+                    _alarm_beep_fallback_loop(stop_event, state, activity_id=activity_id)
+                    return
+            else:
+                consecutive_failures = 0
+
+            # Respawn floor: afplay returns instantly for a file it cannot decode,
+            # so an unguarded loop spins a core and never reaches the fallback.
+            if stop_event.wait(ALARM_FALLBACK_RESPAWN_FLOOR_SEC):
+                return
+        return
+
+    # Windows
+    if winsound is not None:
+        sound_playing = False
+        try:
+            while not stop_event.is_set():
+                snoozed = is_sound_snoozed(state)
+
+                if snoozed and sound_playing:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                    sound_playing = False
+                elif not snoozed and not sound_playing:
+                    winsound.PlaySound(
+                        sound_path,
+                        winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP
+                    )
+                    sound_playing = True
+
+                stop_event.wait(0.1)
+
+            if sound_playing:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            return
+        except Exception as exc:
+            log(
+                f"ALARM: failed to play {sound_path}; falling back to beep loop ({exc})",
+                activity_id=activity_id,
+            )
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
 
     _alarm_beep_fallback_loop(
         stop_event,
         state,
         activity_id=activity_id,
     )
+
+
+def check_alarm_sound_at_launch() -> str:
+    """Say which voice will wake the operator, before anything goes wrong.
+
+    Returns "siren", "fallback" or "none". The macOS fallback is only promised when
+    the system sound actually exists on disk, so a machine with no audio at all says
+    so at launch instead of during the incident it was supposed to announce.
+    """
+    sound_path = _resolve_alarm_sound_path()
+    if sound_path:
+        log(f"ALARM_AUDIO_READY source=siren path={sound_path}")
+        return "siren"
+    if sys.platform == "darwin" and os.path.isfile(ALARM_FALLBACK_MACOS_SOUND):
+        log(
+            f"ALARM_AUDIO_READY source=fallback voice={ALARM_FALLBACK_MACOS_SOUND} "
+            f"(siren {ALARM_SOUND_FILENAME!r} not found)",
+            level="WARN",
+        )
+        return "fallback"
+    if winsound is not None:
+        log(
+            f"ALARM_AUDIO_READY source=fallback voice={NM3U8DL_ALARM_BEEP_HZ}Hz "
+            f"(siren {ALARM_SOUND_FILENAME!r} not found)",
+            level="WARN",
+        )
+        return "fallback"
+    log(
+        "[ALARM] ALARM_SOUND_UNAVAILABLE: source=none — no siren, no macOS fallback "
+        "voice and no winsound; alarms in this session will be SILENT",
+        level="ERROR",
+    )
+    return "none"
 
 
 def _auto_silence_shared_alarm(state, alarm_type: str):
@@ -1763,8 +1999,16 @@ def _auto_silence_shared_alarm(state, alarm_type: str):
         state.live_off_post_ack_silent = True
         log("ALARM_OFF_STOP reason=timeout", level="WARN")
     elif alarm_type == "stream_corrupt":
-        state.ffmpeg_stream_corrupt_alarm_active = False
-        state.ffmpeg_stream_corrupt_post_ack_silent = True
+        with state.stream_corrupt_lock:
+            state.ffmpeg_stream_corrupt_alarm_active = False
+            state.ffmpeg_stream_corrupt_post_ack_silent = True
+            # The timeout supersedes any acknowledgement: close the quiet window too,
+            # or its later expiry would re-arm a siren the operator never asked for.
+            if getattr(state, "ffmpeg_stream_corrupt_quiet_until", None) is not None:
+                state.ffmpeg_stream_corrupt_quiet_until = None
+                state.ffmpeg_stream_corrupt_quiet_fatal_snapshot = 0
+                state.ffmpeg_stream_corrupt_quiet_nonfatal_snapshot = 0
+                log("STREAM_CORRUPT: quiet window closed by alarm timeout", level="INFO")
         log("ALARM_CORRUPT_STOP reason=timeout", level="WARN")
     elif alarm_type == "vpn_drop":
         state.vpn_drop_post_ack_silent = True
@@ -1779,6 +2023,12 @@ def _auto_silence_shared_alarm(state, alarm_type: str):
         state.quality_downgrade_alarm_active = False
         if getattr(state, "last_downgraded_quality_params", None) is not None:
             state.acknowledged_quality_params = state.last_downgraded_quality_params
+            # BUG-029 item 10: remember the codec too, or the same downgrade would
+            # re-alarm at chunk seal on a codec the operator never acknowledged.
+            state.acknowledged_quality_codec = getattr(state, "last_downgraded_codec", None)
+        # A suppressed downgrade must not be promoted after the silence.
+        state.quality_pending_downgrade = None
+        state.quality_pending_since_mono = None
         log("ALARM_QUALITY_DOWNGRADE_STOP reason=timeout", level="WARN")
 
     shared_alarm_stop(state)
@@ -1993,37 +2243,106 @@ def acknowledge_live_stall_alarm(state) -> bool:
     return True
 
 
+def _fmt_monotonic_clock(deadline_mono: Optional[float], now_mono: Optional[float] = None) -> str:
+    """Render a time.monotonic() deadline as local wall-clock HH:MM:SS.
+
+    time.monotonic() has no epoch, so it can never be formatted directly. Convert
+    the remaining seconds into a wall-clock instant instead, so a log line can tell
+    the operator when a window ends without printing a meaningless raw float.
+    """
+    if deadline_mono is None:
+        return "-"
+    if now_mono is None:
+        now_mono = time.monotonic()
+    remaining = max(0.0, deadline_mono - now_mono)
+    return time.strftime("%H:%M:%S", time.localtime(time.time() + remaining))
+
+
 def acknowledge_stream_corrupt_alarm(state) -> bool:
-    """Acknowledge the live stream corruption alarm immediately.
+    """Acknowledge the corruption siren, or report a press already in the quiet state.
+
+    Returns True when the press was consumed - either it silenced a sounding siren
+    or it landed inside an open quiet window. The quiet check sits ABOVE the
+    sounding-alarm guard: a second press while quiet must still be consumed, and
+    the guard must not turn a live acknowledgement into a silent no-op.
 
     Flags are mutated under stream_corrupt_lock; the (up to 1s) alarm thread join in
     shared_alarm_stop() runs only after the lock is released.
     """
+    now = time.monotonic()
     with state.stream_corrupt_lock:
         alarm_type = getattr(state, "shared_alarm_type", None)
-        if not (
+        sounding = (
             getattr(state, "ffmpeg_stream_corrupt_alarm_active", False)
             or alarm_type == "stream_corrupt"
-        ):
+        )
+        quiet_until = getattr(state, "ffmpeg_stream_corrupt_quiet_until", None)
+
+        if quiet_until is not None and now >= quiet_until:
+            state.ffmpeg_stream_corrupt_quiet_until = None
+            quiet_until = None
+
+        if not sounding:
+            if quiet_until is not None:
+                remaining = int(quiet_until - now)
+                log(
+                    f"STREAM_CORRUPT: 'A' ignored - quiet window already open, "
+                    f"{remaining}s left (ends {_fmt_monotonic_clock(quiet_until, now)})",
+                    level="INFO",
+                )
+                return True
             return False
 
         alarm_activity_id = getattr(state, "shared_alarm_activity_id", None)
         state.ffmpeg_stream_corrupt_alarm_active = False
         state.ffmpeg_stream_corrupt_post_ack_silent = True
+        state.ffmpeg_stream_corrupt_quiet_until = now + STREAM_CORRUPT_ACK_QUIET_SEC
+        state.ffmpeg_stream_corrupt_quiet_fatal_snapshot = getattr(
+            state, "ffmpeg_stream_corrupt_fatal_cuts", 0
+        )
+        state.ffmpeg_stream_corrupt_quiet_nonfatal_snapshot = getattr(
+            state, "ffmpeg_stream_corrupt_nonfatal_incidents", 0
+        )
         state.alarm_ack_requested = False
         state.alarm_linger_until = None
 
     log("ALARM_ACK", activity_id=alarm_activity_id)
-    log("ALARM_CORRUPT_STOP reason=ack", activity_id=alarm_activity_id)
+    log(
+        f"ALARM_CORRUPT_STOP reason=ack "
+        f"quiet_until={_fmt_monotonic_clock(now + STREAM_CORRUPT_ACK_QUIET_SEC, now)} "
+        f"(fatal_cuts>{state.ffmpeg_stream_corrupt_quiet_fatal_snapshot} re-arms)",
+        activity_id=alarm_activity_id,
+    )
     shared_alarm_stop(state)
     return True
 
 
-def _prune_locked(state, now: float) -> None:
-    """Expire stale fatal-cut timestamps. Caller MUST hold state.stream_corrupt_lock.
+def _prune_locked(state, now: float) -> Optional[str]:
+    """Expire stale timestamps and decide what the acknowledged quiet window means.
 
-    When the rolling window transitions from non-empty to empty (30 clean monotonic
-    minutes), the operator silence is cleared so the next episode re-arms the siren.
+    Caller holds state.stream_corrupt_lock and MUST act on the return value only
+    after releasing it (see _start_corrupt_siren_if_due).
+
+    Returns:
+        None                - no window, or the window is still open.
+        "expired_clean"     - five minutes passed with no fatal cut; siren armed.
+        "expired_with_cuts" - five minutes passed with >=1 fatal cut; siren must sound.
+
+    Two independent expiries:
+      1. The rolling 30-minute window (unchanged) - clears the long-form silence flag
+         when the feed has been clean for the full window.
+      2. The 5-minute acknowledged quiet window (BUG-032).
+
+    THE WINDOW IS NEVER CLOSED EARLY. A fatal cut inside the window is withheld (and
+    logged by register_stream_corrupt_recycle, not here); the operator gets the five
+    minutes he was promised. Closing it on the first cut would cut the silence to
+    however long the feed took to break again - 30 seconds in the reported case - and
+    would make the "siren withheld" line unreachable, because this prune runs first
+    inside the same call.
+
+    At expiry BOTH branches clear ffmpeg_stream_corrupt_post_ack_silent: the silence
+    was granted for five minutes only. Leaving it set would block shared_alarm_start
+    until the 30-clean-minute rule fired - i.e. BUG-032 unfixed.
     """
     timestamps = state.stream_corrupt_recycle_timestamps
     was_non_empty = bool(timestamps)
@@ -2036,47 +2355,185 @@ def _prune_locked(state, now: float) -> None:
             level="INFO",
         )
 
+    quiet_until = getattr(state, "ffmpeg_stream_corrupt_quiet_until", None)
+    if quiet_until is None:
+        return None
+
+    fatal_delta = (
+        getattr(state, "ffmpeg_stream_corrupt_fatal_cuts", 0)
+        - getattr(state, "ffmpeg_stream_corrupt_quiet_fatal_snapshot", 0)
+    )
+
+    if now < quiet_until:
+        # Nothing to say here: register_stream_corrupt_recycle already logs every cut
+        # that the window swallowed, and this function runs on a 0.5s tick. Silence
+        # during the window is the feature; the expiry line below closes the account.
+        return None
+
+    # The window expires on schedule, never early.
+    state.ffmpeg_stream_corrupt_quiet_until = None
+    state.ffmpeg_stream_corrupt_post_ack_silent = False
+
+    if fatal_delta < 1:
+        log(
+            "STREAM_CORRUPT: quiet window expired with no fatal cuts "
+            "(5 min of clean cuts); siren armed",
+            level="INFO",
+        )
+        return "expired_clean"
+
+    log(
+        f"STREAM_CORRUPT: quiet window expired with {fatal_delta} fatal cut(s) "
+        f"unaddressed; siren re-armed",
+        level="WARN",
+    )
+    return "expired_with_cuts"
+
+
+def _start_corrupt_siren_if_due(state, count: int, *, reason: str) -> None:
+    """Start the corruption siren, applying the threshold and post-ack rules.
+
+    Call this WITHOUT state.stream_corrupt_lock held. shared_alarm_start publishes
+    shared_alarm_thread / shared_alarm_stop_event for the alarm thread it creates,
+    and the lock is documented as protecting flags, not thread objects.
+
+    A duplicate call is harmless: shared_alarm_start already refuses while any alarm
+    thread is alive, and refuses outright while post_ack_silent is set.
+
+    The threshold is bypassed for reason="quiet_window_expired" on purpose: the prune
+    has already proven that fatal cuts landed INSIDE the acknowledged window, so the
+    operator was promised a siren for them. Re-applying `count >= 2` there can silently
+    break that promise, because the threshold is measured over the 1800s rolling
+    window while the quiet window is only 300s: a cut that was admitted at age 1799s
+    when `A` was pressed has aged out by expiry, leaving count == 1 even though a cut
+    arrived during the five minutes the operator bought.
+    """
+    if reason != "quiet_window_expired" and count < STREAM_CORRUPT_ALARM_THRESHOLD:
+        return
+    if getattr(state, "ffmpeg_stream_corrupt_post_ack_silent", False):
+        return
+    log(
+        f"ALARM_STREAM_CORRUPT_START: {count} fatal stream cuts within "
+        f"{int(STREAM_CORRUPT_WINDOW_SEC)}s (reason={reason}). Press 'A' to silence.",
+        level="ERROR",
+    )
+    shared_alarm_start(state, alarm_type="stream_corrupt", incident=None)
+    if getattr(state, "shared_alarm_type", None) == "stream_corrupt":
+        state.ffmpeg_stream_corrupt_alarm_active = True
+
 
 def prune_stream_corrupt_window(state, now: Optional[float] = None) -> int:
-    """Prune the rolling fatal-cut window and return the remaining count."""
-    if now is None:
-        now = time.monotonic()
-    with state.stream_corrupt_lock:
-        _prune_locked(state, now)
-        return len(state.stream_corrupt_recycle_timestamps)
+    """Prune the rolling window, expire the quiet window, and re-arm the siren.
 
-
-def register_stream_corrupt_recycle(state, now: Optional[float] = None) -> bool:
-    """Record one fatal (chunk-cut) corruption event.
-
-    Single owner of ffmpeg_stream_corrupt_incidents. Starts the escalation siren when the
-    rolling window holds >= STREAM_CORRUPT_ALARM_THRESHOLD cuts and the operator has not
-    silenced the episode. Returns True when the caller should play the short Bad Beep
-    (no alarm of any kind is sounding).
+    Runs on the supervision tick and once at startup, so a quiet window that expires
+    while the feed is STILL broken re-sounds the siren without waiting for another
+    cut. That is the point of BUG-032: on an overnight feed the cuts keep coming, but
+    the feed can also go fully dead - and then nothing would ever call
+    register_stream_corrupt_recycle again.
     """
     if now is None:
         now = time.monotonic()
     with state.stream_corrupt_lock:
-        # Prune first so a window-empty re-arm is visible to the silence check below.
+        outcome = _prune_locked(state, now)
+        count = len(state.stream_corrupt_recycle_timestamps)
+    if outcome == "expired_with_cuts":
+        _start_corrupt_siren_if_due(state, count, reason="quiet_window_expired")
+    return count
+
+
+def register_stream_corrupt_recycle(state, now: Optional[float] = None, *, fatal: bool = True) -> bool:
+    """Record one corruption event and sound the siren when the window threshold is met.
+
+    `fatal=True` is a chunk cut (footage lost). `fatal=False` covers defensive cuts and
+    minor errors that self-healed: it is TELEMETRY ONLY. It increments the existing
+    non-fatal counter so the run summary stays honest, but it never enters the fatal
+    window, never increments ffmpeg_stream_corrupt_incidents, and can never re-arm or
+    trigger an acknowledged siren - otherwise one self-healed glitch plus one real cut
+    would add up to 2 timestamps and blast a siren claiming two fatal cuts happened.
+
+    Returns True when the caller should play the short Bad Beep (nothing is sounding).
+    """
+    if now is None:
+        now = time.monotonic()
+    withheld_seconds = 0
+    with state.stream_corrupt_lock:
+        # Prune first: it may expire the quiet window, which un-silences this very cut.
         _prune_locked(state, now)
+
+        if not fatal:
+            state.ffmpeg_stream_corrupt_nonfatal_incidents = (
+                getattr(state, "ffmpeg_stream_corrupt_nonfatal_incidents", 0) + 1
+            )
+            log(
+                f"STREAM_CORRUPT_NONFATAL_EVENT: self-healed corruption recorded "
+                f"(nonfatal_total={state.ffmpeg_stream_corrupt_nonfatal_incidents}); "
+                f"fatal_window_count={len(state.stream_corrupt_recycle_timestamps)}"
+            )
+            return False
+
         state.stream_corrupt_recycle_timestamps.append(now)
         state.ffmpeg_stream_corrupt_incidents += 1
+        state.ffmpeg_stream_corrupt_fatal_cuts = (
+            getattr(state, "ffmpeg_stream_corrupt_fatal_cuts", 0) + 1
+        )
         count = len(state.stream_corrupt_recycle_timestamps)
+        quiet_until = getattr(state, "ffmpeg_stream_corrupt_quiet_until", None)
+        if quiet_until is not None and now < quiet_until:
+            withheld_seconds = int(quiet_until - now)
 
-        if (
-            count >= STREAM_CORRUPT_ALARM_THRESHOLD
-            and not getattr(state, "ffmpeg_stream_corrupt_post_ack_silent", False)
-        ):
+    if withheld_seconds:
+        # The window stays open and this line is the only trace the cut leaves, so it
+        # is emitted for the event that would have sounded the siren - not for every
+        # sub-threshold cut. The siren re-sounds at expiry (_prune_locked).
+        if count >= STREAM_CORRUPT_ALARM_THRESHOLD:
             log(
-                f"ALARM_STREAM_CORRUPT_START: {count} fatal stream cuts within "
-                f"{int(STREAM_CORRUPT_WINDOW_SEC)}s. Press 'A' to silence.",
-                level="ERROR",
+                f"STREAM_INTEGRITY: siren withheld "
+                f"(fatal cut {count} in window, quiet window {withheld_seconds}s left)",
+                level="WARN",
             )
-            shared_alarm_start(state, alarm_type="stream_corrupt", incident=None)
-            if getattr(state, "shared_alarm_type", None) == "stream_corrupt":
-                state.ffmpeg_stream_corrupt_alarm_active = True
+    else:
+        _start_corrupt_siren_if_due(state, count, reason="threshold")
 
-        return not is_alarm_active(state)
+    return not is_alarm_active(state)
+
+
+def settle_integrity_cut(state, monitor, *, flush_cb=None) -> str:
+    """Account for a pending integrity cut and return the status the run loop reports.
+
+    A format change (BUG-029) is a planned, healthy cut: it is counted separately and
+    must never append a corruption timestamp, play the Bad Beep or raise the siren, or
+    the run summary claims a corruption that never happened. Every other cut is the
+    corruption path and is registered exactly as before.
+    """
+    reason = getattr(monitor, "recycle_reason", None) or ""
+    is_format_change = getattr(monitor, "recycle_kind", "corruption") == "format_change"
+
+    if flush_cb is not None:
+        flush_cb()
+
+    if is_format_change:
+        status = "format_change_recycle"
+        log(
+            f"FFmpeg: [FORMAT CHANGE] {reason or 'format change'} → "
+            f"terminating FFmpeg to seal chunk and restart in the new format...",
+            level="WARN",
+        )
+        state.stats["format_change_recycles"] = (
+            state.stats.get("format_change_recycles", 0) + 1
+        )
+        return status
+
+    status = "stream_corrupt_recycle"
+    log(
+        f"FFmpeg: [STREAM RECYCLE] {reason or 'stream corruption grace countdown expired'} "
+        f"→ terminating FFmpeg to seal chunk and re-anchor keyframe...",
+        level="WARN",
+    )
+    # Chunk is sealed. Count the fatal cut, escalate to the siren on the
+    # 2nd cut inside the rolling window, otherwise give a short Bad Beep.
+    if register_stream_corrupt_recycle(state):
+        play_stream_corrupt_bad_beep_async(state)
+    return status
 
 
 def play_stream_corrupt_bad_beep_async(state) -> None:
@@ -2162,6 +2619,9 @@ def quality_downgrade_alarm_stop(state: RecorderState, reason: str = "recovered"
         getattr(state, "shared_alarm_type", None) == "quality_downgrade"
     )
     state.quality_downgrade_alarm_active = False
+    # BUG-029 item 5: a recovered/upgraded stream owes no parked siren either.
+    state.quality_pending_downgrade = None
+    state.quality_pending_since_mono = None
     if getattr(state, "shared_alarm_type", None) == "quality_downgrade":
         shared_alarm_stop(state)
     if was_active:
@@ -2180,6 +2640,12 @@ def acknowledge_quality_downgrade_alarm(state: RecorderState) -> bool:
     state.quality_downgrade_alarm_active = False
     if getattr(state, "last_downgraded_quality_params", None) is not None:
         state.acknowledged_quality_params = state.last_downgraded_quality_params
+        # The codec is part of the acknowledgement key: a later codec change must
+        # raise a fresh alarm even at the same geometry.
+        state.acknowledged_quality_codec = getattr(state, "last_downgraded_codec", None)
+    # A parked downgrade for these params must never be promoted after the ACK.
+    state.quality_pending_downgrade = None
+    state.quality_pending_since_mono = None
     state.alarm_ack_requested = False
     state.alarm_linger_until = None
     log("ALARM_ACK", activity_id=alarm_activity_id)
@@ -2962,10 +3428,189 @@ def get_file_info(path):
     except:
         return 0, 0
 
-def get_video_params(path):
+# ==================== QUALITY STANDARD & STARTUP VERDICT (BUG-029) ==========================
+# The startup verdict judges a chunk from its first seconds, before the chunk is sealed.
+# Three paths feed it (FFmpeg's Video banner, the N_m3u8DL Vid row, an ffprobe of the
+# growing file) and all three compare against the one standard resolved by
+# _resolve_quality_standard(), so they can never disagree with each other.
+
+QUALITY_FPS_TOLERANCE = 5.0
+QUALITY_PENDING_MAX_WAIT_SEC = 60.0
+QUALITY_PROBE_MIN_AGE_SEC = 20.0
+QUALITY_PROBE_MIN_BYTES = 1_000_000
+
+RE_EXPECTED_VIDEO_FULL = re.compile(
+    r'^(?P<w>\d{2,5})\s*[x×]\s*(?P<h>\d{2,5})'
+    r'(?:\s*[@pP]\s*(?P<fps>\d{2,3}(?:\.\d+)?))?$'
+)
+RE_EXPECTED_VIDEO_SHORT = re.compile(
+    r'^(?P<h>\d{3,4})\s*[pP]\s*(?P<fps>\d{2,3}(?:\.\d+)?)?$'
+)
+_HEIGHT_TO_WIDTH = {480: 854, 576: 1024, 720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
+
+# FFmpeg stderr banner, e.g.
+# "Stream #0:0: Video: h264 (High), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 50 fps, 50 tbr"
+RE_VIDEO_BANNER = re.compile(
+    r'Video:\s*(?P<codec>[A-Za-z0-9_]+)'
+    r'.*?(?P<w>\d{2,5})x(?P<h>\d{2,5})'
+    r'.*?(?P<fps>\d+(?:\.\d+)?)\s*fps',
+    re.IGNORECASE,
+)
+RE_FIELD_ORDER = re.compile(
+    r'\b(?P<fo>interlaced|progressive|tt|bb|tb|bt)\b',
+    re.IGNORECASE,
+)
+
+# N_m3u8DL selected / progress video row, e.g.
+# "Vid 1920x1080 │ 5000 Kbps │ 25 fps │ avc1.64002a" (both | and │ separators).
+RE_NM3U8DL_VID_ROW = re.compile(
+    r'^Vid(?:\s*\*\S+)?\s+(?P<w>\d{2,5})x(?P<h>\d{2,5})\s*[|│]',
+    re.IGNORECASE,
+)
+RE_NM3U8DL_VID_FPS = re.compile(
+    r'\b(?P<fps>\d{2,3}(?:\.\d+)?)\s*fps\b',
+    re.IGNORECASE,
+)
+RE_NM3U8DL_VID_CODEC = re.compile(
+    r'^(?P<codec>avc1|h264|hev1|hvc1|hevc|vp9|av01)\b',
+    re.IGNORECASE,
+)
+RE_NM3U8DL_VID_TIME = re.compile(r'\d{2}:\d{2}:\d{2}')
+_NM3U8DL_CODEC_ALIASES = {
+    "avc1": "h264",
+    "h264": "h264",
+    "hev1": "hevc",
+    "hvc1": "hevc",
+    "hevc": "hevc",
+    "av01": "av1",
+}
+
+
+class VideoParams(NamedTuple):
+    """Five fields. The first three are the geometry floor contract; the last two
+    carry format identity that the seal path and the startup verdict both need.
+
+    A VideoParams is a tuple, so ``params[:3]`` stays the geometry floor while
+    ``params.codec`` / ``params.field_order`` reach the extra identity fields.
     """
-    Return (width, height, fps) from a video file.
-    Falls back to 1920x1080@50 if probe fails.
+    width: int
+    height: int
+    fps: float
+    codec: str            # lower-case ffprobe codec_name, "" when unknown
+    field_order: str      # "progressive" / "tt" / "bb" / "tb" / "bt", "" when unknown
+
+
+class QualityVerdict(NamedTuple):
+    """One reading judged against one standard. Never raises, never mutates state."""
+    geometry: str            # "none" | "at" | "below" | "above"
+    codec_changed: bool
+    interlace_changed: bool
+    reason: str              # ready-to-log sentence, "" when nothing changed
+
+    @property
+    def is_downgrade(self) -> bool:
+        return self.geometry == "below"
+
+    @property
+    def is_upgrade(self) -> bool:
+        return self.geometry == "above"
+
+    @property
+    def is_codec_change(self) -> bool:
+        return self.codec_changed
+
+    @property
+    def is_any_change(self) -> bool:
+        return bool(self.reason)
+
+
+def _normalize_quality_fps(fps_val) -> float:
+    """Round a positive frame rate to whole frames; unknown (<=0) stays 0.0.
+
+    Ratified by the operator (24 October 2026): round ONCE at every boundary
+    (banner, N_m3u8DL Vid row, chunk seal, EXPECTED_VIDEO) so a broadcast 59.94
+    and an ffprobe 60.0 are the same number and an acknowledgement taken at
+    chunk start still matches the reading at chunk seal.
+    """
+    try:
+        value = float(fps_val)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return float(int(round(value)))
+
+
+def _parse_expected_video(raw) -> Optional[Tuple[int, int, Optional[float]]]:
+    """Parse EXPECTED_VIDEO into (width, height, fps|None). None when unusable.
+
+    Accepted forms: "1920x1080@50", "1920x1080", "1080p50", "1080p".
+    Anything else is logged once and treated as unset - a typo in a config file
+    must never stop a recording or start a siren.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    match = RE_EXPECTED_VIDEO_FULL.match(text)
+    if match:
+        fps = _normalize_quality_fps(match.group("fps")) if match.group("fps") else None
+        return (int(match.group("w")), int(match.group("h")), fps)
+
+    match = RE_EXPECTED_VIDEO_SHORT.match(text)
+    if match:
+        height = int(match.group("h"))
+        fps = _normalize_quality_fps(match.group("fps")) if match.group("fps") else None
+        width = _HEIGHT_TO_WIDTH.get(height)
+        if width is None:
+            width = int(round(height * 16 / 9 / 2.0)) * 2
+        return (width, height, fps)
+
+    log(
+        f"EXPECTED_VIDEO={raw!r} is not understood (use '1080p50' or '1920x1080@50'); "
+        "ignoring it",
+        level="WARN",
+    )
+    return None
+
+
+def _coerce_video_params(raw_vp) -> VideoParams:
+    """Normalize any probe result into VideoParams.
+
+    Accepts a VideoParams, a legacy three-field tuple (older callers and test
+    mocks that only carry geometry) or a longer sequence. Frame rate is rounded
+    here so every comparison downstream uses identical integers.
+    """
+    if isinstance(raw_vp, VideoParams):
+        return VideoParams(
+            int(raw_vp.width),
+            int(raw_vp.height),
+            _normalize_quality_fps(raw_vp.fps),
+            str(raw_vp.codec or ""),
+            str(raw_vp.field_order or ""),
+        )
+    codec = str(getattr(raw_vp, "codec", "") or "")
+    if not codec and len(raw_vp) > 3 and raw_vp[3]:
+        codec = str(raw_vp[3])
+    field_order = str(getattr(raw_vp, "field_order", "") or "")
+    if not field_order and len(raw_vp) > 4 and raw_vp[4]:
+        field_order = str(raw_vp[4])
+    return VideoParams(
+        int(raw_vp[0]),
+        int(raw_vp[1]),
+        _normalize_quality_fps(raw_vp[2]),
+        codec,
+        field_order,
+    )
+
+
+def _probe_video_params(path) -> Optional[VideoParams]:
+    """ffprobe one file. Returns None when the probe fails.
+
+    The startup probe (BUG-029) must be able to tell "no reading" from "1080p50",
+    so the fallback lives in get_video_params() only.
     """
     try:
         out = check_output_external(
@@ -2973,7 +3618,8 @@ def get_video_params(path):
                 "ffprobe",
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate",
+                "-show_entries",
+                "stream=width,height,avg_frame_rate,r_frame_rate,codec_name,field_order",
                 "-of", "json",
                 path,
             ],
@@ -3001,9 +3647,33 @@ def get_video_params(path):
                 if val_f > 0:
                     fps = int(round(val_f))
                     break
-        return w, h, fps
+
+        codec = str(data.get("codec_name") or "").strip().lower()
+        field_order = (
+            str(data.get("field_order") or "")
+            .strip()
+            .lower()
+            .replace("unknown", "")
+        )
+        return VideoParams(int(w), int(h), float(fps), codec, field_order)
     except Exception:
-        return 1920, 1080, 50
+        return None
+
+
+def get_video_params(path):
+    """
+    Return VideoParams(width, height, fps, codec, field_order) from a video file.
+    Falls back to 1920x1080@50 with unknown identity if probe fails.
+    """
+    return _probe_video_params(path) or VideoParams(1920, 1080, 50.0, "", "")
+
+
+def _live_chunk_size(path) -> int:
+    """Current on-disk size of a chunk being written, or 0 when not created yet."""
+    try:
+        return int(os.path.getsize(path))
+    except (OSError, TypeError, ValueError):
+        return 0
         
 def get_audio_layout(path):
     """
@@ -3978,6 +4648,10 @@ class StreamIntegrityMonitor:
 
         # Phase 2: Autonomous Worker Recycling & Grace Management
         self.recycle_requested: bool = False
+        # BUG-029: one boolean cannot describe two different cuts. The consumer must
+        # know whether this is corruption (count it, beep, siren) or a format change
+        # (planned, silent, no corruption counter).
+        self.recycle_kind: str = "corruption"          # "corruption" | "format_change"
         self.recycle_reason: str = ""
 
         # State Machine & Timers
@@ -4076,6 +4750,22 @@ class StreamIntegrityMonitor:
         self.codec_defect = val
 
     def process_stderr_line(self, line: str) -> bool:
+        """Inspect one FFmpeg stderr line: corruption tiers, then the startup banner.
+
+        Returns True if this line should be suppressed from the interactive terminal
+        (anti-spam). The banner parse runs AFTER the lock is released, because
+        evaluate_startup_quality can log, alarm and request a recycle - none of that
+        may happen while the monitor lock is held (BUG-029).
+        """
+        suppress = self._classify_stderr_line(line)
+
+        startup_reading = observe_startup_line(self.state, line)
+        if startup_reading is not None:
+            evaluate_startup_quality(self.state, startup_reading, source="ffmpeg")
+
+        return suppress
+
+    def _classify_stderr_line(self, line: str) -> bool:
         """
         Inspect one FFmpeg stderr line for corruption signals.
         Returns True if this line should be suppressed from the interactive terminal (anti-spam).
@@ -4384,6 +5074,7 @@ class StreamIntegrityMonitor:
                     and (now - self.container_defect_start_mono) >= self.FAST_SEAL_COALESCE_SEC
                     and not self.recycle_requested
                 ):
+                    self.recycle_kind = "corruption"
                     self.recycle_requested = True
                     self.recycle_reason = (
                         f"Fatal Container Poisoning ({self.last_container_error_msg}) "
@@ -4422,6 +5113,7 @@ class StreamIntegrityMonitor:
                             active_defect_name = "Video Elementary Freeze"
 
                         if incident_elapsed >= active_grace_sec and not self.recycle_requested:
+                            self.recycle_kind = "corruption"
                             self.recycle_requested = True
                             self.recycle_reason = f"{active_defect_name} sustained >= {active_grace_sec:.0f}s"
             else:
@@ -7275,8 +7967,15 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
             amount = amount / 1000.0
         return amount
 
+    # BUG-029: every new chunk run starts with fresh startup-verdict slots.
+    begin_quality_observation(state)
     integrity_monitor = StreamIntegrityMonitor(state)
+    # The monitor is a local; the startup verdict and request_format_recycle both
+    # need to reach it from module-level helpers.
+    state.integrity_monitor = integrity_monitor
     prune_stream_corrupt_window(state)
+    # A downgrade parked behind an alarm of the previous run may be promotable now.
+    evaluate_pending_quality_alarm(state)
 
     def monitor_ffmpeg(p):
         nonlocal last_progress_line, progress_line_active
@@ -7416,16 +8115,23 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
 
         # Rolling 30-minute corruption window sweeper (re-arms alarm when it empties).
         prune_stream_corrupt_window(state)
+        # A downgrade parked behind another alarm is promoted as soon as that bus frees.
+        evaluate_pending_quality_alarm(state)
         integrity_monitor.evaluate_health(flush_cb=flush_progress_line)
+
+        # BUG-029: no Video banner within 20 s or 1 MB -> probe the growing chunk
+        # ourselves, so an engine that prints nothing cannot disable the verdict.
+        maybe_probe_startup_quality(state, chunk_path, start_run_mono)
+
         if integrity_monitor.recycle_requested:
-            reason = "stream corruption grace countdown expired"
-            status = "stream_corrupt_recycle"
-            flush_progress_line()
-            log(
-                f"FFmpeg: [STREAM RECYCLE] {integrity_monitor.recycle_reason} → "
-                f"terminating FFmpeg to seal chunk and re-anchor keyframe...",
-                level="WARN",
+            # BUG-029: a format change is NOT corruption. settle_integrity_cut() keeps
+            # the planned cut out of the corruption timestamps, the Bad Beep, the siren
+            # and the summary line, and reports status="format_change_recycle" so the
+            # orchestrator restarts immediately without a growing backoff.
+            status = settle_integrity_cut(
+                state, integrity_monitor, flush_cb=flush_progress_line
             )
+            reason = integrity_monitor.recycle_reason or reason
             proc.terminate()
             try:
                 proc.wait(timeout=5)
@@ -7433,10 +8139,6 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
                 log("FFmpeg did not terminate gracefully, killing.", level="WARN")
                 proc.kill()
                 proc.wait()
-            # Chunk is sealed. Count the fatal cut, escalate to the siren on the
-            # 2nd cut inside the rolling window, otherwise give a short Bad Beep.
-            if register_stream_corrupt_recycle(state):
-                play_stream_corrupt_bad_beep_async(state)
             break
 
         if hot_audio_restart.is_set():
@@ -7711,7 +8413,10 @@ def start_ffmpeg_to_chunk(state: RecorderState, notify=None, deadline_ts: Option
 
     log("FFmpeg stopped for this run")
     return EngineResult(
-        status=status if status in ("duration_reached", "stalled", "vpn_drop", "internet_drop", "stream_corrupt_recycle") else "ended",
+        status=status if status in (
+            "duration_reached", "stalled", "vpn_drop", "internet_drop",
+            "stream_corrupt_recycle", "format_change_recycle",
+        ) else "ended",
         reason=reason if status != "ended" or proc.returncode != 0 else f"exit code {proc.returncode}",
         chunk_path=chunk_path,
         chunk_name=chunk_name,
@@ -7874,6 +8579,15 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
             stripped_line,
             re.IGNORECASE,
         )
+
+        # BUG-029: judge only the selected Vid row (after "Selected streams:") or a
+        # live progress Vid row — never unselected variants in the initial manifest
+        # table printed before "Selected streams:".
+        if state is not None and (in_selected_section or progress_match):
+            vid_reading = _startup_vid_reading(stripped_line)
+            if vid_reading is not None:
+                evaluate_startup_quality(state, vid_reading, source="nm3u8dl")
+
         if progress_match:
             key = "vid" if progress_match.group(1).lower() == "vid" else "aud"
             startup_latest_progress[key] = stripped_line
@@ -7908,20 +8622,22 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
         ):
             match = re.search(
                 r'\bVid(?:\s*\*\S+)?\s+'
-                r'\d+x\d+\s*\|\s*(\d+)\s+Kbps\b',
+                r'(?P<w>\d{2,5})x(?P<h>\d{2,5})\s*\|\s*(?P<kbps>\d+)\s+Kbps\b',
                 stripped_line,
                 re.IGNORECASE,
             )
 
             if match and bitrate == 0:
                 try:
-                    bitrate = int(match.group(1))
+                    bitrate = int(match.group("kbps"))
                     log(
                         f"N_m3u8DL: Selected bitrate detected: "
                         f"{bitrate} Kbps"
                     )
                 except Exception:
                     pass
+
+
 
     try:
         while True:
@@ -8641,6 +9357,10 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
         chunk_path, chunk_name = next_chunk_names(state)
         state.nm3u8dl_stall_flag = False
 
+        # BUG-029: fresh startup-verdict slots for this chunk, even though N_m3u8DL
+        # never builds a StreamIntegrityMonitor (its evidence is the Vid row).
+        begin_quality_observation(state)
+
         # Build full command: Part_A + save-name + deduplicated Part_B
         chunk_name_without_ext = chunk_name.replace('.ts', '')
         nm3u8dl_part_b = _deduplicate_nm3u8dl_part_b(NM3U8DL_PART_A, NM3U8DL_PART_B)
@@ -9270,6 +9990,13 @@ def start_nm3u8dl_to_chunk(state: RecorderState, notify=None, deadline_ts: Optio
 
             if not ran_30s and (time.time() - start_run) >= 30:
                 ran_30s = True
+
+            # BUG-032: expire an acknowledged quiet window on this tick too. Without it
+            # a window opened during an FFmpeg run would never expire once the feed
+            # degrades to N_m3u8DL, and the siren would stay silent all night.
+            prune_stream_corrupt_window(state)
+            # BUG-029: promote a downgrade parked behind another alarm.
+            evaluate_pending_quality_alarm(state)
 
             time.sleep(0.5)
 
@@ -11030,6 +11757,570 @@ def cleanup_nm3u8dl_work_dir(chunk_name, context):
     return not os.path.exists(work_dir)
 
 
+def begin_quality_observation(state) -> None:
+    """Reset the per-chunk startup verdict slots. Call once before an engine starts.
+
+    Every start_*_to_chunk entry point calls this, so a second chunk never inherits
+    the first chunk's consumed banner and silent verdict.
+    """
+    if not getattr(state, "quality_expected_unset_logged", False):
+        if _parse_expected_video(globals().get("EXPECTED_VIDEO")) is None:
+            log(
+                "QUALITY_STANDARD: EXPECTED_VIDEO is not set in the recorder config; "
+                "the first accepted chunk will define the standard"
+            )
+        state.quality_expected_unset_logged = True
+    state.quality_banner_reading = None
+    state.quality_banner_consumed = False
+    state.quality_probe_done = False
+    state.quality_startup_checked = False
+    state.quality_fps_defer_logged = False
+
+
+def request_format_recycle(state, reason: str) -> None:
+    """Cut the current chunk because its format changed. Planned, not corruption."""
+    monitor = getattr(state, "integrity_monitor", None)
+    if monitor is None:
+        log(f"FORMAT_CHANGE: cannot cut chunk ({reason}); no monitor attached", level="WARN")
+        return
+    if getattr(monitor, "recycle_requested", False):
+        return  # a cut is already pending; never queue two reasons
+    monitor.recycle_kind = "format_change"
+    monitor.recycle_reason = f"format change: {reason}"
+    monitor.recycle_requested = True
+
+
+def maybe_probe_startup_quality(state, chunk_path, start_run_mono, now: Optional[float] = None):
+    """BUG-029: probe the live chunk when the engine printed no Video banner.
+
+    Fires once per chunk, after QUALITY_PROBE_MIN_AGE_SEC or QUALITY_PROBE_MIN_BYTES,
+    and never when a banner already arrived. ffprobe only needs the header, so
+    reading a chunk that is still being written is safe. Returns the reading, or
+    None when nothing was probed - it must never be able to break a live recording.
+    """
+    if getattr(state, "quality_banner_consumed", False):
+        return None
+    if getattr(state, "quality_probe_done", False):
+        return None
+
+    if now is None:
+        now = time.monotonic()
+    if (
+        (now - start_run_mono) < QUALITY_PROBE_MIN_AGE_SEC
+        and _live_chunk_size(chunk_path) < QUALITY_PROBE_MIN_BYTES
+    ):
+        return None
+
+    state.quality_probe_done = True
+    try:
+        probed = _probe_video_params(chunk_path)
+    except Exception as exc:
+        log(f"QUALITY_PROBE: skipped ({exc})", level="INFO")
+        return None
+    if probed is None or probed.width < 160 or probed.height < 120:
+        return None
+
+    log(
+        f"FORMAT_BANNER source=probe {probed.width}x{probed.height}"
+        f"@{probed.fps:g}fps codec={probed.codec or '?'}",
+        level="INFO",
+    )
+    evaluate_startup_quality(state, probed, source="probe")
+    return probed
+
+
+def observe_startup_line(state, line: str) -> Optional[VideoParams]:
+    """Take the first usable Video banner of this chunk. Returns the reading once.
+
+    FFmpeg prints the same information for input and output, so the FIRST match
+    wins and later ones are ignored: a mid-chunk re-open must not be mistaken for
+    the chunk's declared format.
+    """
+    if getattr(state, "quality_banner_consumed", False):
+        return None
+    match = RE_VIDEO_BANNER.search(str(line or ""))
+    if not match:
+        return None
+    try:
+        width = int(match.group("w"))
+        height = int(match.group("h"))
+        fps = _normalize_quality_fps(match.group("fps"))
+    except (TypeError, ValueError):
+        return None
+    if width < 160 or height < 120 or fps <= 0 or fps > 240:
+        return None
+
+    field_match = RE_FIELD_ORDER.search(str(line or ""))
+    field_order = ""
+    if field_match:
+        token = field_match.group("fo").lower()
+        field_order = "progressive" if token == "progressive" else token
+
+    reading = VideoParams(width, height, fps, match.group("codec").lower(), field_order)
+    state.quality_banner_consumed = True
+    state.quality_banner_reading = reading
+    log(
+        f"FORMAT_BANNER source=ffmpeg {width}x{height}@{fps:g}fps "
+        f"codec={reading.codec or '?'} field_order={field_order or '?'}",
+        level="INFO",
+    )
+    return reading
+
+
+def _startup_vid_reading(line: str) -> Optional[VideoParams]:
+    """Parse one N_m3u8DL Vid row into a startup reading, or None.
+
+    Geometry is always available. Frame rate is taken only from an explicit
+    "NN fps" token, or from a bare number segment when the row carries no
+    timecode (a progress row's trailing number is a byte/segment count, not a
+    frame rate, and inventing one there would raise a false siren). The codec is
+    taken from an avc1/hevc/av01 segment when the table publishes one.
+    """
+    text = str(line or "").strip()
+    match = RE_NM3U8DL_VID_ROW.match(text)
+    if not match:
+        return None
+    try:
+        width = int(match.group("w"))
+        height = int(match.group("h"))
+    except (TypeError, ValueError):
+        return None
+    if width < 160 or height < 120:
+        return None
+
+    fps = 0.0
+    fps_match = RE_NM3U8DL_VID_FPS.search(text)
+    if fps_match:
+        candidate = _normalize_quality_fps(fps_match.group("fps"))
+        if 10.0 <= candidate <= 240.0:
+            fps = candidate
+    elif not RE_NM3U8DL_VID_TIME.search(text):
+        for segment in re.split(r'[|│]', text)[1:]:
+            segment = segment.strip()
+            if re.fullmatch(r'\d{1,3}(?:\.\d+)?', segment):
+                candidate = _normalize_quality_fps(segment)
+                if 10.0 <= candidate <= 240.0:
+                    fps = candidate
+
+    codec = ""
+    for segment in re.split(r'[|│]', text)[1:]:
+        segment = segment.strip()
+        segment = re.split(r'\s+', segment)[0] if segment else segment
+        codec_match = RE_NM3U8DL_VID_CODEC.match(segment)
+        if codec_match:
+            raw_codec = codec_match.group("codec").lower()
+            codec = _NM3U8DL_CODEC_ALIASES.get(raw_codec, raw_codec)
+            break
+
+    return VideoParams(width, height, fps, codec, "")
+
+
+def _raise_or_park_quality_alarm(state, reason: str, *, source: str = "unknown") -> None:
+    """Sound the downgrade siren, or park it when another alarm owns the bus.
+
+    There is one alarm thread (shared_alarm_start refuses a second). Parking is
+    scoped to quality_downgrade, promoted by the supervision tick, and expires
+    after QUALITY_PENDING_MAX_WAIT_SEC into an explicit log line. Silently
+    dropping the alarm is what BUG-029 was reported as.
+
+    A quality alarm never parks behind another quality alarm: the siren is already
+    ringing for the same condition, so the call is a no-op (BLOCKER 2).
+    """
+    if (
+        getattr(state, "quality_downgrade_alarm_active", False)
+        or getattr(state, "shared_alarm_type", None) == "quality_downgrade"
+    ):
+        return
+
+    if is_alarm_active(state):
+        active_type = getattr(state, "shared_alarm_type", None) or "unknown"
+        now = time.monotonic()
+        if getattr(state, "quality_pending_downgrade", None) is None:
+            state.quality_pending_since_mono = now
+        params = getattr(state, "last_downgraded_quality_params", None) or (0, 0, 0.0)
+        state.quality_pending_downgrade = {
+            "reason": reason,
+            "source": source,
+            "w": params[0],
+            "h": params[1],
+            "fps": params[2],
+            "codec": getattr(state, "last_downgraded_codec", None),
+        }
+        log(
+            f"QUALITY_DOWNGRADE: alarm deferred — another alarm is sounding "
+            f"(type='{active_type}'); will fire if still degraded when the bus frees "
+            f"(max wait until "
+            f"{_fmt_monotonic_clock((state.quality_pending_since_mono or now) + QUALITY_PENDING_MAX_WAIT_SEC)})",
+            level="WARN",
+        )
+        return
+
+    log(
+        f"[ALARM] QUALITY DOWNGRADE DETECTED: {reason} (from {source}) (Press 'A' to ACK)",
+        level="WARN",
+    )
+    quality_downgrade_alarm_start(state)
+
+
+def evaluate_pending_quality_alarm(state, now: Optional[float] = None) -> None:
+    """Tick: promote a parked downgrade once the bus frees, or say it was withheld.
+
+    Promotion is refused when the operator already acknowledged these params while
+    the alarm was parked (BLOCKER 2 item 7) and when the parking window expired.
+    """
+    pending = getattr(state, "quality_pending_downgrade", None)
+    if pending is None:
+        return
+
+    if now is None:
+        now = time.monotonic()
+
+    # The expiry is decided BEFORE the bus check: a pending alarm that has waited
+    # its full window must be withheld even while the other alarm is still ringing,
+    # or it would fire as a stale siren the moment that alarm finally stops.
+    since = getattr(state, "quality_pending_since_mono", None) or now
+    if (now - since) > QUALITY_PENDING_MAX_WAIT_SEC:
+        # One ERROR line, naming the downgrade that never got its siren, so the
+        # operator can see what the other alarm cost him. mixed_reason still holds it.
+        log(
+            f"QUALITY_DOWNGRADE_PENDING_EXPIRED: alarm withheld for {int(now - since)}s "
+            f"(> {int(QUALITY_PENDING_MAX_WAIT_SEC)}s) behind another alarm — "
+            f"{pending.get('reason')} (from {pending.get('source')}); not firing a stale "
+            f"siren",
+            level="ERROR",
+        )
+        state.quality_pending_downgrade = None
+        state.quality_pending_since_mono = None
+        return
+
+    if is_alarm_active(state):
+        return  # bus still busy; promoted on a later tick inside the window
+
+    pending_tuple = (
+        pending.get("w", 0),
+        pending.get("h", 0),
+        _normalize_quality_fps(pending.get("fps", 0.0)),
+    )
+    pending_codec = pending.get("codec") or None
+    if (
+        state.acknowledged_quality_params == pending_tuple
+        and getattr(state, "acknowledged_quality_codec", None) == pending_codec
+    ):
+        state.quality_pending_downgrade = None
+        state.quality_pending_since_mono = None
+        return
+
+    reason = pending.get("reason", "quality downgraded")
+    source = pending.get("source", "deferred")
+    state.quality_pending_downgrade = None
+    state.quality_pending_since_mono = None
+    log(
+        f"[ALARM] QUALITY DOWNGRADE DETECTED (promoted after prior alarm cleared): "
+        f"{reason} (from {source}) (Press 'A' to ACK)",
+        level="WARN",
+    )
+    quality_downgrade_alarm_start(state)
+
+
+def evaluate_startup_quality(state, reading: VideoParams, source: str) -> None:
+    """Judge one startup reading. Called within the first seconds of a chunk.
+
+    Adopts the floor on the first chunk and never lowers it. A codec change is
+    adopted immediately (so it cannot re-fire on the next chunk) and cuts the chunk;
+    geometry is never written by a codec path. A geometry downgrade raises the
+    alarm, or parks it in the pending slot when another alarm owns the bus.
+
+    `source` is "ffmpeg" (stderr banner), "nm3u8dl" (Vid row) or "probe".
+    Idempotent per chunk via state.quality_startup_checked, which
+    begin_quality_observation() clears for every new chunk run.
+    """
+    try:
+        if getattr(state, "quality_startup_checked", False):
+            return
+        reading = _coerce_video_params(reading)
+        if reading.width <= 0 or reading.height <= 0:
+            return
+
+        expected = _parse_expected_video(globals().get("EXPECTED_VIDEO"))
+
+        # BLOCKER 4: EXPECTED_VIDEO seeds the floor BEFORE the first reading is
+        # judged, so a downgraded first chunk is measured against the operator's
+        # standard instead of being adopted as the standard itself.
+        if expected is not None and getattr(state, "baseline_video_params", None) is None:
+            meets_expected_area = (
+                float(reading.width) * float(reading.height)
+                >= float(expected[0]) * float(expected[1]) * 0.98
+            )
+            seeded_fps = expected[2] or (
+                reading.fps if (reading.fps > 0 and meets_expected_area) else 0.0
+            )
+            if seeded_fps > 0:
+                state.baseline_video_params = (expected[0], expected[1], seeded_fps)
+                log(
+                    f"QUALITY_STANDARD_ADOPTED source=expected_video "
+                    f"{expected[0]}x{expected[1]}@{seeded_fps:g}fps"
+                )
+        if getattr(state, "baseline_video_codec", None) is None and reading.codec:
+            state.baseline_video_codec = reading.codec
+
+        standard = _resolve_quality_standard(state)
+        if standard is None:
+            if reading.fps <= 0:
+                # Trap 5: never adopt a floor from a reading with fps <= 0, and leave
+                # the startup slot open so a later reading with a real frame rate (or
+                # the 20 s probe) can still judge this chunk. Log once per chunk.
+                if not getattr(state, "quality_fps_defer_logged", False):
+                    state.quality_fps_defer_logged = True
+                    log(
+                        f"QUALITY_CHECK_DEFERRED: {source} reading "
+                        f"{reading.width}x{reading.height} has fps=0 "
+                        f"— baseline adoption deferred to the probe or chunk seal"
+                    )
+                return
+            state.quality_startup_checked = True
+            state.baseline_video_params = (reading.width, reading.height, reading.fps)
+            if reading.codec:
+                state.baseline_video_codec = reading.codec
+            log(
+                f"QUALITY_STANDARD_ADOPTED source={source} "
+                f"{reading.width}x{reading.height}@{reading.fps:g}fps "
+                f"codec={reading.codec or '?'} (first chunk of the run)"
+            )
+            return
+
+        verdict = _classify_quality_reading(reading, standard)
+        if not verdict.reason:
+            if reading.fps <= 0:
+                # Geometry matches the standard but the frame rate is unknown (an
+                # N_m3u8DL Vid row without one). Keep quality_startup_checked False so
+                # a subsequent reading with fps > 0 (or the 20s probe) can still run,
+                # and log the deferral once per chunk.
+                if not getattr(state, "quality_fps_defer_logged", False):
+                    state.quality_fps_defer_logged = True
+                    log(
+                        f"QUALITY_CHECK_DEFERRED: {source} reading "
+                        f"{reading.width}x{reading.height} has fps=0 and matching geometry "
+                        f"— fps check deferred to chunk seal"
+                    )
+                return
+            state.quality_startup_checked = True
+            if (
+                getattr(state, "quality_downgrade_alarm_active", False)
+                or getattr(state, "acknowledged_quality_params", None) is not None
+                or getattr(state, "quality_pending_downgrade", None) is not None
+            ):
+                stop_fn = globals().get("quality_downgrade_alarm_stop")
+                if callable(stop_fn):
+                    stop_fn(state, reason="restored")
+                else:
+                    state.quality_downgrade_alarm_active = False
+                    state.quality_pending_downgrade = None
+                    state.quality_pending_since_mono = None
+                    if getattr(state, "shared_alarm_type", None) == "quality_downgrade":
+                        state.shared_alarm_type = None
+                state.acknowledged_quality_params = None
+                state.acknowledged_quality_codec = None
+                state.last_downgraded_quality_params = None
+                state.last_downgraded_codec = None
+                log_beep_fn = globals().get("log_good_beep")
+                if callable(log_beep_fn):
+                    log_beep_fn("quality_restored")
+                beep_fn = globals().get("beep_good")
+                if callable(beep_fn):
+                    beep_fn(state)
+                std_w, std_h, std_fps, _std_codec = standard
+                std_fps_eff = _normalize_quality_fps(std_fps) or reading.fps
+                log(
+                    f"Broadcast quality restored to standard "
+                    f"{std_w}x{std_h}@{std_fps_eff:g}fps (from {source})"
+                )
+            return
+
+        state.quality_startup_checked = True
+        log(f"QUALITY_VERDICT source={source} {verdict.reason}", level="WARN")
+
+        if verdict.codec_changed:
+            # Adopt the new codec NOW: the baseline codec is the suppression key, so
+            # leaving it on the old value would raise the same siren on every chunk.
+            # Geometry is deliberately untouched here - a simultaneous resolution
+            # drop is judged by the geometry branch below, not absorbed by this one.
+            previous_codec = state.baseline_video_codec
+            state.baseline_video_codec = reading.codec
+            log(
+                f"FORMAT_CHANGE codec {previous_codec} -> {reading.codec}; cutting chunk",
+                level="WARN",
+            )
+            request_format_recycle(state, reason=f"codec {previous_codec}->{reading.codec}")
+
+        if verdict.geometry == "below":
+            _handle_startup_downgrade(state, reading, verdict, standard, source)
+        elif verdict.geometry == "above":
+            log(
+                f"QUALITY_UPGRADE source={source} "
+                f"{reading.width}x{reading.height}@{reading.fps:g}fps"
+            )
+            if reading.fps > 0 and expected is None:
+                # High-water lock inside one chunk run: a confirmed upgrade raises
+                # the floor immediately. EXPECTED_VIDEO never moves.
+                state.baseline_video_params = (reading.width, reading.height, reading.fps)
+                if reading.codec:
+                    state.baseline_video_codec = reading.codec
+                log(
+                    f"QUALITY_STANDARD_UPGRADED: new high-water baseline "
+                    f"{reading.width}x{reading.height}@{reading.fps:g}fps (from {source})"
+                )
+            if (
+                reading.fps > 0
+                and not verdict.codec_changed
+                and not verdict.interlace_changed
+                and (
+                    getattr(state, "quality_downgrade_alarm_active", False)
+                    or getattr(state, "acknowledged_quality_params", None) is not None
+                    or getattr(state, "quality_pending_downgrade", None) is not None
+                )
+            ):
+                stop_fn = globals().get("quality_downgrade_alarm_stop")
+                if callable(stop_fn):
+                    stop_fn(state, reason="upgraded")
+                else:
+                    state.quality_downgrade_alarm_active = False
+                    state.quality_pending_downgrade = None
+                    state.quality_pending_since_mono = None
+                    if getattr(state, "shared_alarm_type", None) == "quality_downgrade":
+                        state.shared_alarm_type = None
+                state.acknowledged_quality_params = None
+                state.acknowledged_quality_codec = None
+                state.last_downgraded_quality_params = None
+                state.last_downgraded_codec = None
+                log_beep_fn = globals().get("log_good_beep")
+                if callable(log_beep_fn):
+                    log_beep_fn("quality_upgraded")
+                beep_fn = globals().get("beep_good")
+                if callable(beep_fn):
+                    beep_fn(state)
+    except Exception as exc:
+        # A verdict must never break a live recording.
+        log(f"QUALITY_VERDICT: evaluation failed ({exc}); continuing", level="WARN")
+
+
+def _handle_startup_downgrade(state, reading: VideoParams, verdict: QualityVerdict,
+                              standard: Tuple[int, int, Optional[float], Optional[str]],
+                              source: str) -> None:
+    """Record a startup downgrade and raise or park its siren, honouring an earlier ACK."""
+    # BLOCKER 1 item 3: when the banner had no frame rate, store the standard's rate
+    # on the acknowledged downgrade, so an 'A' press taken at startup still matches
+    # the reading at chunk seal.
+    eff_ack_fps = reading.fps or _normalize_quality_fps(standard[2])
+    state.last_downgraded_quality_params = (reading.width, reading.height, eff_ack_fps)
+    state.last_downgraded_codec = reading.codec or None
+    acked_codec = getattr(state, "acknowledged_quality_codec", None)
+    params_match = state.acknowledged_quality_params == (
+        reading.width, reading.height, eff_ack_fps
+    )
+    if params_match and acked_codec is None and reading.codec and not verdict.is_codec_change:
+        # The ACK carried no codec because the reading that raised it published none
+        # (an N_m3u8DL Vid row, or a banner without one). Lock it in now, exactly as
+        # the chunk-seal path does, so the same downgrade cannot re-fire on this chunk.
+        state.acknowledged_quality_codec = reading.codec
+        acked_codec = reading.codec
+    already_acked = params_match and (
+        acked_codec == (reading.codec or None)
+        or (not reading.codec and acked_codec is not None)
+    )
+    if already_acked:
+        log(
+            f"QUALITY_DOWNGRADE_SUPPRESSED: {verdict.reason} matches "
+            f"operator-acknowledged params — alarm kept silent"
+        )
+        return
+    _raise_or_park_quality_alarm(state, verdict.reason, source=source)
+
+
+def _resolve_quality_standard(state) -> Optional[Tuple[int, int, Optional[float], Optional[str]]]:
+    """The rung this chunk is judged against: (w, h, fps|None, codec|None).
+
+    Rung 1 - EXPECTED_VIDEO, when the operator configured one (using the learned
+             baseline frame rate when EXPECTED_VIDEO stated resolution only).
+    Rung 2 - the learned geometry floor (baseline_video_params) plus baseline codec.
+    Rung 3 - None: no standard yet, the first accepted chunk defines it.
+
+    Both the startup verdict and the seal path resolve their standard here, so the
+    two can never judge the same chunk against different numbers.
+    """
+    expected = _parse_expected_video(globals().get("EXPECTED_VIDEO"))
+    baseline = getattr(state, "baseline_video_params", None)
+    if expected is not None:
+        exp_w, exp_h, exp_fps = expected
+        learned_fps = (
+            _normalize_quality_fps(baseline[2])
+            if baseline and len(baseline) >= 3
+            else 0.0
+        )
+        eff_fps = exp_fps if exp_fps is not None else (learned_fps or None)
+        return (exp_w, exp_h, eff_fps, getattr(state, "baseline_video_codec", None))
+
+    if baseline is not None:
+        base_w, base_h, base_fps = baseline[:3]
+        return (base_w, base_h, base_fps, getattr(state, "baseline_video_codec", None))
+
+    return None
+
+
+def _classify_quality_reading(
+    reading: VideoParams,
+    standard: Tuple[int, int, Optional[float], Optional[str]],
+) -> QualityVerdict:
+    """Compare one reading against the standard. Never raises, never mutates state.
+
+    Geometry is compared by pixels-per-second so a resolution drop at double the
+    frame rate is not mistaken for an upgrade (the BUG-027 rule). Frame rate is
+    compared only when the standard states one. Codec and interlace are compared
+    whenever both sides are known.
+    """
+    std_w, std_h, std_fps, std_codec = standard
+
+    # When either frame rate is unknown (an N_m3u8DL table that does not publish one),
+    # compare pixel area instead of pixels-per-second rather than inventing a rate.
+    eff_reading_fps = _normalize_quality_fps(reading.fps) or _normalize_quality_fps(std_fps)
+    eff_standard_fps = _normalize_quality_fps(std_fps) or _normalize_quality_fps(reading.fps)
+    if eff_reading_fps <= 0 or eff_standard_fps <= 0:
+        eff_reading_fps = eff_standard_fps = 1.0
+
+    reading_rate = float(reading.width) * float(reading.height) * eff_reading_fps
+    standard_rate = float(std_w) * float(std_h) * eff_standard_fps
+    if standard_rate <= 0:
+        geometry = "none"
+    elif reading_rate < standard_rate * 0.98:
+        geometry = "below"
+    elif reading_rate > standard_rate * 1.02:
+        geometry = "above"
+    else:
+        geometry = "at"
+
+    codec_changed = bool(
+        std_codec and reading.codec and reading.codec != std_codec
+    )
+    interlace_changed = bool(
+        reading.field_order and reading.field_order != "progressive"
+    )
+
+    reasons = []
+    if geometry == "below":
+        # A reading without a published frame rate says "?" rather than "@0".
+        reading_fps_label = f"{reading.fps:g}" if reading.fps > 0 else "?"
+        standard_fps_label = f"{std_fps or reading.fps:g}"
+        reasons.append(
+            f"geometry below standard {reading.width}x{reading.height}@{reading_fps_label} "
+            f"vs {std_w}x{std_h}@{standard_fps_label}"
+        )
+    if codec_changed:
+        reasons.append(f"codec {std_codec} -> {reading.codec}")
+    if interlace_changed:
+        reasons.append(f"interlaced source (field_order={reading.field_order})")
+
+    return QualityVerdict(geometry, codec_changed, interlace_changed, "; ".join(reasons))
+
+
 def maybe_accept_chunk(state: RecorderState, chunk_path, chunk_name, context):
     """
     Decide if chunk is good.
@@ -11102,63 +12393,144 @@ def maybe_accept_chunk(state: RecorderState, chunk_path, chunk_name, context):
         else MIN_ACCEPTED_CHUNK_SECONDS
     )
 
-    probed_video_params = None
+    probed_video_params: Optional[VideoParams] = None
     is_short_downgrade = False
+    # BLOCKER 4 item 12: judge against the RESOLVED standard (EXPECTED_VIDEO when the
+    # operator set one, else the learned floor), so a degraded FIRST chunk is still
+    # rejected as BAD instead of being adopted as the standard.
+    active_standard = _resolve_quality_standard(state)
     if (
         dur < MIN_ACCEPTED_CHUNK_SECONDS
-        and getattr(state, "baseline_video_params", None) is not None
+        and active_standard is not None
         and dur > effective_min_dur
     ):
-        probed_video_params = get_video_params(chunk_path)
-        probe_w, probe_h, probe_fps = probed_video_params
-        base_w, base_h, base_fps = state.baseline_video_params
-        if (probe_w < base_w) or (probe_h < base_h) or (probe_fps < (base_fps - 5.0)):
+        probed_video_params = _coerce_video_params(get_video_params(chunk_path))
+        probe_verdict = _classify_quality_reading(probed_video_params, active_standard)
+        if probe_verdict.is_downgrade or probe_verdict.is_codec_change:
             is_short_downgrade = True
+            std_w, std_h, std_fps, _std_codec = active_standard
+            std_fps_shown = _normalize_quality_fps(std_fps) or probed_video_params.fps
             log(
                 f"{context}: {chunk_name} REJECTED ({dur:.1f}s < {MIN_ACCEPTED_CHUNK_SECONDS}s "
-                f"with downgraded quality {probe_w}x{probe_h}@{probe_fps}fps below baseline {base_w}x{base_h}@{base_fps}fps) → treating as BAD",
+                f"with degraded quality {probed_video_params.width}x{probed_video_params.height}"
+                f"@{probed_video_params.fps:g}fps against standard {std_w}x{std_h}"
+                f"@{std_fps_shown:g}fps) → treating as BAD",
                 level="WARN",
             )
 
     if dur > effective_min_dur and bitrate_ok and not is_replay_burst and not is_short_downgrade:
         # Update best resolution/fps from this chunk and track consistency
-        w, h, fps = probed_video_params if probed_video_params is not None else get_video_params(chunk_path)
-        log(f"{context}: {chunk_name} params {w}x{h}@{fps}fps")
+        vp = (
+            probed_video_params
+            if probed_video_params is not None
+            else _coerce_video_params(get_video_params(chunk_path))
+        )
+        w, h, fps = vp.width, vp.height, vp.fps
+        codec = vp.codec
+        log(f"{context}: {chunk_name} params {w}x{h}@{fps:g}fps codec={codec or '?'}")
 
-        # Item 6: Quality Downgrade Alarm & Baseline Tracking
-        if state.baseline_video_params is None:
+        # Item 6 + BUG-029: Quality Downgrade Alarm, Format Change & Baseline Tracking
+        expected_cfg = _parse_expected_video(globals().get("EXPECTED_VIDEO"))
+        # BLOCKER 4 item 13: EXPECTED_VIDEO seeds the floor, so the seal judges the same
+        # standard the startup verdict used, and a downgraded chunk can never become it.
+        if expected_cfg is not None and state.baseline_video_params is None:
+            meets_expected_area = (
+                float(w) * float(h)
+                >= float(expected_cfg[0]) * float(expected_cfg[1]) * 0.98
+            )
+            seeded_fps = expected_cfg[2] or (fps if meets_expected_area else 0.0)
+            if seeded_fps > 0:
+                state.baseline_video_params = (expected_cfg[0], expected_cfg[1], seeded_fps)
+                log(
+                    f"{context}: QUALITY BASELINE {expected_cfg[0]}x{expected_cfg[1]}"
+                    f"@{seeded_fps:g}fps (from EXPECTED_VIDEO)"
+                )
+
+        standard = _resolve_quality_standard(state)
+        if standard is None:
+            # Rung 3: the first accepted chunk of the run defines the geometry floor.
             state.baseline_video_params = (w, h, fps)
+            if codec:
+                state.baseline_video_codec = codec
+            log(f"{context}: QUALITY BASELINE {w}x{h}@{fps:g}fps codec={codec or '?'}")
         else:
-            base_w, base_h, base_fps = state.baseline_video_params
-            is_downgrade = (w < base_w) or (h < base_h) or (fps < (base_fps - 5.0))
-            is_upgrade = (h > base_h) or (h == base_h and w > base_w) or (h == base_h and w == base_w and fps > (base_fps + 5.0))
+            # Backfill the baseline codec from the first chunk that publishes one: an
+            # N_m3u8DL startup table often names no codec at all.
+            if state.baseline_video_codec is None and codec:
+                state.baseline_video_codec = codec
+                standard = _resolve_quality_standard(state)
+            std_w, std_h, std_fps, std_codec = standard
+            std_fps_eff = _normalize_quality_fps(std_fps) or fps
+
+            verdict = _classify_quality_reading(vp, standard)
+            is_downgrade = verdict.is_downgrade or verdict.is_codec_change
+            is_upgrade = verdict.is_upgrade
 
             if is_upgrade:
-                # Stream upgraded above initial baseline (e.g. 720p -> 1080p50); lock new high-water baseline
-                state.baseline_video_params = (w, h, fps)
-                if state.quality_downgrade_alarm_active or state.acknowledged_quality_params is not None:
+                # High-water lock: the learned floor only ever moves up (BUG-027).
+                # EXPECTED_VIDEO is the operator's standard and never moves.
+                if expected_cfg is None:
+                    state.baseline_video_params = (w, h, fps)
+                    if codec:
+                        state.baseline_video_codec = codec
+                if (
+                    state.quality_downgrade_alarm_active
+                    or state.acknowledged_quality_params is not None
+                    or getattr(state, "quality_pending_downgrade", None) is not None
+                ):
                     quality_downgrade_alarm_stop(state, reason="upgraded")
                     state.acknowledged_quality_params = None
+                    state.acknowledged_quality_codec = None
                     state.last_downgraded_quality_params = None
+                    state.last_downgraded_codec = None
                     log_good_beep("quality_upgraded")
                     beep_good(state)
             elif is_downgrade:
-                if state.stats.get("good_chunks", 0) > 0:
+                if state.stats.get("good_chunks", 0) > 0 or expected_cfg is not None:
                     state.same_params = False
-                downgrade_msg = f"Quality downgraded: {w}x{h}@{fps}fps (baseline {base_w}x{base_h}@{base_fps}fps)"
+                downgrade_msg = verdict.reason or (
+                    f"Quality downgraded: {w}x{h}@{fps:g}fps "
+                    f"(standard {std_w}x{std_h}@{std_fps_eff:g}fps)"
+                )
                 state.mixed_reason = downgrade_msg
                 state.last_downgraded_quality_params = (w, h, fps)
-                if state.acknowledged_quality_params != (w, h, fps):
-                    log(f"[ALARM] QUALITY DOWNGRADE DETECTED: {downgrade_msg} (Press 'A' to ACK)", level="WARN")
-                    quality_downgrade_alarm_start(state)
+                state.last_downgraded_codec = codec or None
+
+                # An ACK taken at startup may not have carried a codec (the banner or
+                # the N_m3u8DL table published none). Lock it in now - unless this very
+                # chunk IS the codec change, which the ACK must not cover.
+                acked_codec = getattr(state, "acknowledged_quality_codec", None)
+                if (
+                    state.acknowledged_quality_params == (w, h, fps)
+                    and acked_codec is None
+                    and not verdict.is_codec_change
+                ):
+                    state.acknowledged_quality_codec = codec or None
+                    acked_codec = state.acknowledged_quality_codec
+
+                already_acked = (
+                    state.acknowledged_quality_params == (w, h, fps)
+                    and acked_codec == (codec or None)
+                )
+                if not already_acked:
+                    _raise_or_park_quality_alarm(state, downgrade_msg, source="chunk_seal")
             else:
-                if state.quality_downgrade_alarm_active or state.acknowledged_quality_params is not None:
+                if (
+                    state.quality_downgrade_alarm_active
+                    or state.acknowledged_quality_params is not None
+                    or getattr(state, "quality_pending_downgrade", None) is not None
+                ):
                     quality_downgrade_alarm_stop(state, reason="restored")
                     state.acknowledged_quality_params = None
+                    state.acknowledged_quality_codec = None
                     state.last_downgraded_quality_params = None
+                    state.last_downgraded_codec = None
                     log_good_beep("quality_restored")
                     beep_good(state)
-                    log(f"Broadcast quality restored to baseline {base_w}x{base_h}@{base_fps}fps")
+                    log(
+                        f"Broadcast quality restored to standard "
+                        f"{std_w}x{std_h}@{std_fps_eff:g}fps"
+                    )
 
         if state.stats["good_chunks"] == 0:
             # first GOOD chunk defines reference params
@@ -11687,15 +13059,26 @@ def apply_orchestrator_policy(state: RecorderState, engine: RecorderEngine, resu
         if result.status != "no_stream":
             backoff_sec = DEFAULT_MIN_BACKOFF if ok else min(backoff_sec + BACKOFF_STEP_SEC, BACKOFF_MAX_SEC)
 
+    # A planned format cut is neither corruption nor a failure: it must not raise the
+    # corruption summary line, and it must not be punished with a growing backoff.
+    is_format_recycle = result.status == "format_change_recycle"
     is_corrupt_recycle = (
         result.status == "stream_corrupt_recycle"
-        or "stream corruption" in str(result.reason or "").lower()
+        or (
+            "stream corruption" in str(result.reason or "").lower()
+            and not is_format_recycle
+        )
     )
     chunk_dur = 0.0
     if ok and state.stats.get("sessions"):
         chunk_dur = float(state.stats["sessions"][-1].get("dur_media", 0.0))
 
-    if result.status == "stalled" or (is_corrupt_recycle and ok) or (ok and chunk_dur >= HEALTHY_CHUNK_RESET_SEC):
+    if (
+        result.status == "stalled"
+        or (is_corrupt_recycle and ok)
+        or is_format_recycle                     # restart immediately in the new format
+        or (ok and chunk_dur >= HEALTHY_CHUNK_RESET_SEC)
+    ):
         backoff_sec = 0
 
     if state.stop_flag:
@@ -11804,6 +13187,15 @@ def write_summary_log(state, dur, finalized=True):
             lines.append("----------------")
             lines.append(f"Corruption incidents (fatal)    : {corrupt_fatal}")
             lines.append(f"Corruption incidents (non-fatal): {corrupt_nonfatal}")
+            lines.append("")
+
+        # BUG-029: a planned format cut is reported on its own line, never as
+        # corruption - the corruption counters above stay untouched by it.
+        if state.stats.get("format_change_recycles"):
+            lines.append(
+                f"Planned format-change recycles  : "
+                f"{state.stats['format_change_recycles']} (not counted as corruption)"
+            )
             lines.append("")
 
         if getattr(state, "network_guard", None):
@@ -12439,6 +13831,7 @@ def orchestrate_recording(state: RecorderState, engine: RecorderEngine):
     log(f"Engine selected   : {engine.description}")
     init_termcap()
     init_raw_external_capture()
+    check_alarm_sound_at_launch()
     
     state.start_time = time.time()
     state.stats["process_start"] = state.start_time

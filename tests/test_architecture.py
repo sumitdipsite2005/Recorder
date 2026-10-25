@@ -597,5 +597,166 @@ class ArchitectureGuardTests(unittest.TestCase):
         self.assertIn("selection_policy_for_provider(",snapshot)
 
 
+ALARM_AUDIO_CONSTANTS = (
+    "NM3U8DL_ALARM_BEEP_HZ",
+    "NM3U8DL_ALARM_BEEP_MS",
+    "NM3U8DL_ALARM_BEEP_GAP_SEC",
+    "NM3U8DL_ALARM_BEEP_BURST_PAUSE_SEC",
+    "ALARM_FALLBACK_BURST_HITS",
+    "ALARM_FALLBACK_MACOS_SOUND",
+    "ALARM_FALLBACK_RESPAWN_FLOOR_SEC",
+    "ALARM_FALLBACK_MAX_CONSECUTIVE_FAILURES",
+)
+
+
+def _module_constants(path, names):
+    """Return {name: literal value} for module-level constant assignments."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    values = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in names:
+                try:
+                    values[target.id] = ast.literal_eval(node.value)
+                except ValueError:
+                    values[target.id] = "unparsed"
+    return values
+
+
+class AlarmAudioParityTests(unittest.TestCase):
+    # BUG-038: both recorders sound the alarm by copy, so the values must match or
+    # the static and dynamic recorders will sound different alarms for one defect.
+    def test_alarm_audio_constants_are_defined_identically_in_both_recorders(self):
+        static = _module_constants(ROOT / "record_static.py", ALARM_AUDIO_CONSTANTS)
+        dynamic = _module_constants(ROOT / "record_dynamic.py", ALARM_AUDIO_CONSTANTS)
+        missing = [name for name in ALARM_AUDIO_CONSTANTS if name not in static or name not in dynamic]
+        self.assertEqual(missing, [], f"alarm-audio constants missing: {missing}")
+        for name in ALARM_AUDIO_CONSTANTS:
+            self.assertEqual(static[name], dynamic[name], f"{name} differs between the recorders")
+
+    def test_both_recorders_check_the_alarm_sound_at_launch(self):
+        for name in ("record_static.py", "record_dynamic.py"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("def check_alarm_sound_at_launch()", text, name)
+            self.assertIn("    check_alarm_sound_at_launch()", text, name)
+
+
+QUALITY_HELPER_NAMES = (
+    "begin_quality_observation",
+    "request_format_recycle",
+    "observe_startup_line",
+    "_raise_or_park_quality_alarm",
+    "evaluate_pending_quality_alarm",
+    "evaluate_startup_quality",
+    "_handle_startup_downgrade",
+    "_resolve_quality_standard",
+    "_classify_quality_reading",
+    "_coerce_video_params",
+    "_normalize_quality_fps",
+    "_parse_expected_video",
+    "VideoParams",
+    "QualityVerdict",
+)
+
+
+def _shared_quality_blocks(text):
+    """Return the two blocks both recorders must carry verbatim (BUG-029)."""
+    core_start = "# ==================== QUALITY STANDARD & STARTUP VERDICT (BUG-029)"
+    core_end = "def get_audio_layout(path):"
+    helpers_start = "def begin_quality_observation(state) -> None:"
+    helpers_end = "def maybe_accept_chunk("
+    core = text[text.index(core_start):text.index(core_end, text.index(core_start))]
+    helpers = text[
+        text.index(helpers_start):text.index(helpers_end, text.index(helpers_start))
+    ]
+    return core, helpers
+
+
+class QualityStandardParityTests(unittest.TestCase):
+    # BUG-029: the startup verdict, its standard and its alarm live in both
+    # recorders by copy. Two copies that drift judge the same feed differently.
+    def test_both_recorders_carry_the_same_quality_helpers_verbatim(self):
+        static = (ROOT / "record_static.py").read_text(encoding="utf-8")
+        dynamic = (ROOT / "record_dynamic.py").read_text(encoding="utf-8")
+
+        static_core, static_helpers = _shared_quality_blocks(static)
+        dynamic_core, dynamic_helpers = _shared_quality_blocks(dynamic)
+
+        for name in QUALITY_HELPER_NAMES:
+            self.assertIn(name, static_core + static_helpers, f"{name} missing in record_static.py")
+            self.assertIn(name, dynamic_core + dynamic_helpers, f"{name} missing in record_dynamic.py")
+
+        self.assertEqual(
+            static_core,
+            dynamic_core,
+            "VideoParams / verdict / WIN helpers differ between the recorders",
+        )
+        self.assertEqual(
+            static_helpers,
+            dynamic_helpers,
+            "quality standard / alarm helpers differ between the recorders",
+        )
+
+    def test_both_recorders_read_expected_video_from_their_own_config(self):
+        static = (ROOT / "record_static.py").read_text(encoding="utf-8")
+        dynamic = (ROOT / "record_dynamic.py").read_text(encoding="utf-8")
+        self.assertIn('EXPECTED_VIDEO = _static_user_config.get("EXPECTED_VIDEO", None)', static)
+        self.assertIn('EXPECTED_VIDEO = _dynamic_user_config.get("EXPECTED_VIDEO", None)', dynamic)
+
+    def test_both_recorders_probe_five_video_fields(self):
+        for name in ("record_static.py", "record_dynamic.py"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("codec_name,field_order", text, name)
+            self.assertIn("return VideoParams(int(w), int(h), float(fps), codec, field_order)", text, name)
+
+    def test_every_start_to_chunk_entry_point_resets_the_verdict_slots(self):
+        for name in ("record_static.py", "record_dynamic.py"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            tree = ast.parse(text)
+            entries = [
+                node for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name.startswith("start_")
+                and node.name.endswith("_to_chunk")
+            ]
+            self.assertEqual(
+                sorted(node.name for node in entries),
+                ["start_ffmpeg_to_chunk", "start_nm3u8dl_to_chunk"],
+                name,
+            )
+            for node in entries:
+                body = ast.get_source_segment(text, node) or ""
+                self.assertIn("begin_quality_observation(state)", body, f"{name}:{node.name}")
+
+    def test_dynamic_recorder_defines_the_parking_clock_helper(self):
+        # BLOCKER 3 item 8: parking a downgrade behind another alarm must not raise
+        # NameError in the dynamic recorder.
+        for name in ("record_static.py", "record_dynamic.py"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("def _fmt_monotonic_clock(", text, name)
+
+    def test_format_cut_is_distinguished_from_corruption(self):
+        static = (ROOT / "record_static.py").read_text(encoding="utf-8")
+        self.assertIn('self.recycle_kind: str = "corruption"', static)
+        self.assertEqual(static.count('self.recycle_kind = "corruption"'), 2)
+        self.assertIn('monitor.recycle_kind = "format_change"', static)
+        # The gate itself lives in settle_integrity_cut(); the run loop only calls it,
+        # so the corruption accounting cannot be duplicated in two branches again.
+        self.assertIn(
+            'is_format_change = getattr(monitor, "recycle_kind", "corruption") == "format_change"',
+            static,
+        )
+        self.assertIn("status = settle_integrity_cut(", static)
+        self.assertIn('"stream_corrupt_recycle", "format_change_recycle",', static)
+
+        for name in ("record_static.py", "record_dynamic.py"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn('is_format_recycle = result.status == "format_change_recycle"', text, name)
+            self.assertIn("or is_format_recycle", text, name)
+            self.assertIn("Planned format-change recycles", text, name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
