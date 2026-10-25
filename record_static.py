@@ -367,6 +367,9 @@ class RecorderState:
     quality_probe_done: bool = False
     quality_startup_checked: bool = False
     quality_expected_unset_logged: bool = False
+    # BUG-029: an fps=0 startup reading defers the frame-rate verdict without
+    # closing the chunk's startup slot. This keeps that deferral to one log/chunk.
+    quality_fps_defer_logged: bool = False
     # A quality alarm that could not sound because another alarm owns the bus.
     quality_pending_downgrade: Optional[dict] = None
     quality_pending_since_mono: Optional[float] = None
@@ -8568,15 +8571,6 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
                 state.rate_limit_429_detected = True
                 has_429 = True
 
-        # BUG-029: any Vid row during the startup phase is this chunk's format
-        # evidence - the selection table and the progress row both state geometry.
-        # It is judged HERE, before the progress branch below swallows Vid lines,
-        # and before the bitrate branch that needs a "Segments" column.
-        if state is not None:
-            vid_reading = _startup_vid_reading(stripped_line)
-            if vid_reading is not None:
-                evaluate_startup_quality(state, vid_reading, source="nm3u8dl")
-
         # Raw console-refresh progress has no timestamp/newline. Keep only the
         # latest Vid/Aud record and log it periodically instead of dumping every
         # refresh fragment into one unreadable line.
@@ -8585,6 +8579,15 @@ def extract_nm3u8dl_startup_info(proc, exclude_substrings=None, raw_invocation=N
             stripped_line,
             re.IGNORECASE,
         )
+
+        # BUG-029: judge only the selected Vid row (after "Selected streams:") or a
+        # live progress Vid row — never unselected variants in the initial manifest
+        # table printed before "Selected streams:".
+        if state is not None and (in_selected_section or progress_match):
+            vid_reading = _startup_vid_reading(stripped_line)
+            if vid_reading is not None:
+                evaluate_startup_quality(state, vid_reading, source="nm3u8dl")
+
         if progress_match:
             key = "vid" if progress_match.group(1).lower() == "vid" else "aud"
             startup_latest_progress[key] = stripped_line
@@ -11771,6 +11774,7 @@ def begin_quality_observation(state) -> None:
     state.quality_banner_consumed = False
     state.quality_probe_done = False
     state.quality_startup_checked = False
+    state.quality_fps_defer_logged = False
 
 
 def request_format_recycle(state, reason: str) -> None:
@@ -12043,24 +12047,35 @@ def evaluate_startup_quality(state, reading: VideoParams, source: str) -> None:
         # judged, so a downgraded first chunk is measured against the operator's
         # standard instead of being adopted as the standard itself.
         if expected is not None and getattr(state, "baseline_video_params", None) is None:
-            seeded_fps = expected[2] or reading.fps
-            state.baseline_video_params = (expected[0], expected[1], seeded_fps)
-            log(
-                f"QUALITY_STANDARD_ADOPTED source=expected_video "
-                f"{expected[0]}x{expected[1]}@{seeded_fps:g}fps"
+            meets_expected_area = (
+                float(reading.width) * float(reading.height)
+                >= float(expected[0]) * float(expected[1]) * 0.98
             )
+            seeded_fps = expected[2] or (
+                reading.fps if (reading.fps > 0 and meets_expected_area) else 0.0
+            )
+            if seeded_fps > 0:
+                state.baseline_video_params = (expected[0], expected[1], seeded_fps)
+                log(
+                    f"QUALITY_STANDARD_ADOPTED source=expected_video "
+                    f"{expected[0]}x{expected[1]}@{seeded_fps:g}fps"
+                )
         if getattr(state, "baseline_video_codec", None) is None and reading.codec:
             state.baseline_video_codec = reading.codec
 
         standard = _resolve_quality_standard(state)
         if standard is None:
             if reading.fps <= 0:
-                # Trap 5: never adopt a floor from a reading with fps <= 0.
-                log(
-                    f"QUALITY_CHECK_DEFERRED: {source} reading "
-                    f"{reading.width}x{reading.height} has fps=0 "
-                    f"— baseline adoption deferred to the probe or chunk seal"
-                )
+                # Trap 5: never adopt a floor from a reading with fps <= 0, and leave
+                # the startup slot open so a later reading with a real frame rate (or
+                # the 20 s probe) can still judge this chunk. Log once per chunk.
+                if not getattr(state, "quality_fps_defer_logged", False):
+                    state.quality_fps_defer_logged = True
+                    log(
+                        f"QUALITY_CHECK_DEFERRED: {source} reading "
+                        f"{reading.width}x{reading.height} has fps=0 "
+                        f"— baseline adoption deferred to the probe or chunk seal"
+                    )
                 return
             state.quality_startup_checked = True
             state.baseline_video_params = (reading.width, reading.height, reading.fps)
@@ -12075,14 +12090,49 @@ def evaluate_startup_quality(state, reading: VideoParams, source: str) -> None:
 
         verdict = _classify_quality_reading(reading, standard)
         if not verdict.reason:
-            state.quality_startup_checked = True
             if reading.fps <= 0:
                 # Geometry matches the standard but the frame rate is unknown (an
-                # N_m3u8DL Vid row without one). Say so instead of silently passing.
+                # N_m3u8DL Vid row without one). Keep quality_startup_checked False so
+                # a subsequent reading with fps > 0 (or the 20s probe) can still run,
+                # and log the deferral once per chunk.
+                if not getattr(state, "quality_fps_defer_logged", False):
+                    state.quality_fps_defer_logged = True
+                    log(
+                        f"QUALITY_CHECK_DEFERRED: {source} reading "
+                        f"{reading.width}x{reading.height} has fps=0 and matching geometry "
+                        f"— fps check deferred to chunk seal"
+                    )
+                return
+            state.quality_startup_checked = True
+            if (
+                getattr(state, "quality_downgrade_alarm_active", False)
+                or getattr(state, "acknowledged_quality_params", None) is not None
+                or getattr(state, "quality_pending_downgrade", None) is not None
+            ):
+                stop_fn = globals().get("quality_downgrade_alarm_stop")
+                if callable(stop_fn):
+                    stop_fn(state, reason="restored")
+                else:
+                    state.quality_downgrade_alarm_active = False
+                    state.quality_pending_downgrade = None
+                    state.quality_pending_since_mono = None
+                    if getattr(state, "shared_alarm_type", None) == "quality_downgrade":
+                        state.shared_alarm_type = None
+                state.acknowledged_quality_params = None
+                state.acknowledged_quality_codec = None
+                state.last_downgraded_quality_params = None
+                state.last_downgraded_codec = None
+                log_beep_fn = globals().get("log_good_beep")
+                if callable(log_beep_fn):
+                    log_beep_fn("quality_restored")
+                beep_fn = globals().get("beep_good")
+                if callable(beep_fn):
+                    beep_fn(state)
+                std_w, std_h, std_fps, _std_codec = standard
+                std_fps_eff = _normalize_quality_fps(std_fps) or reading.fps
                 log(
-                    f"QUALITY_CHECK_DEFERRED: {source} reading "
-                    f"{reading.width}x{reading.height} has fps=0 and matching geometry "
-                    f"— fps check deferred to chunk seal"
+                    f"Broadcast quality restored to standard "
+                    f"{std_w}x{std_h}@{std_fps_eff:g}fps (from {source})"
                 )
             return
 
@@ -12119,6 +12169,35 @@ def evaluate_startup_quality(state, reading: VideoParams, source: str) -> None:
                     f"QUALITY_STANDARD_UPGRADED: new high-water baseline "
                     f"{reading.width}x{reading.height}@{reading.fps:g}fps (from {source})"
                 )
+            if (
+                reading.fps > 0
+                and not verdict.codec_changed
+                and not verdict.interlace_changed
+                and (
+                    getattr(state, "quality_downgrade_alarm_active", False)
+                    or getattr(state, "acknowledged_quality_params", None) is not None
+                    or getattr(state, "quality_pending_downgrade", None) is not None
+                )
+            ):
+                stop_fn = globals().get("quality_downgrade_alarm_stop")
+                if callable(stop_fn):
+                    stop_fn(state, reason="upgraded")
+                else:
+                    state.quality_downgrade_alarm_active = False
+                    state.quality_pending_downgrade = None
+                    state.quality_pending_since_mono = None
+                    if getattr(state, "shared_alarm_type", None) == "quality_downgrade":
+                        state.shared_alarm_type = None
+                state.acknowledged_quality_params = None
+                state.acknowledged_quality_codec = None
+                state.last_downgraded_quality_params = None
+                state.last_downgraded_codec = None
+                log_beep_fn = globals().get("log_good_beep")
+                if callable(log_beep_fn):
+                    log_beep_fn("quality_upgraded")
+                beep_fn = globals().get("beep_good")
+                if callable(beep_fn):
+                    beep_fn(state)
     except Exception as exc:
         # A verdict must never break a live recording.
         log(f"QUALITY_VERDICT: evaluation failed ({exc}); continuing", level="WARN")
@@ -12160,7 +12239,8 @@ def _handle_startup_downgrade(state, reading: VideoParams, verdict: QualityVerdi
 def _resolve_quality_standard(state) -> Optional[Tuple[int, int, Optional[float], Optional[str]]]:
     """The rung this chunk is judged against: (w, h, fps|None, codec|None).
 
-    Rung 1 - EXPECTED_VIDEO, when the operator configured one.
+    Rung 1 - EXPECTED_VIDEO, when the operator configured one (using the learned
+             baseline frame rate when EXPECTED_VIDEO stated resolution only).
     Rung 2 - the learned geometry floor (baseline_video_params) plus baseline codec.
     Rung 3 - None: no standard yet, the first accepted chunk defines it.
 
@@ -12168,11 +12248,17 @@ def _resolve_quality_standard(state) -> Optional[Tuple[int, int, Optional[float]
     two can never judge the same chunk against different numbers.
     """
     expected = _parse_expected_video(globals().get("EXPECTED_VIDEO"))
+    baseline = getattr(state, "baseline_video_params", None)
     if expected is not None:
         exp_w, exp_h, exp_fps = expected
-        return (exp_w, exp_h, exp_fps, getattr(state, "baseline_video_codec", None))
+        learned_fps = (
+            _normalize_quality_fps(baseline[2])
+            if baseline and len(baseline) >= 3
+            else 0.0
+        )
+        eff_fps = exp_fps if exp_fps is not None else (learned_fps or None)
+        return (exp_w, exp_h, eff_fps, getattr(state, "baseline_video_codec", None))
 
-    baseline = getattr(state, "baseline_video_params", None)
     if baseline is not None:
         base_w, base_h, base_fps = baseline[:3]
         return (base_w, base_h, base_fps, getattr(state, "baseline_video_codec", None))
@@ -12348,12 +12434,17 @@ def maybe_accept_chunk(state: RecorderState, chunk_path, chunk_name, context):
         # BLOCKER 4 item 13: EXPECTED_VIDEO seeds the floor, so the seal judges the same
         # standard the startup verdict used, and a downgraded chunk can never become it.
         if expected_cfg is not None and state.baseline_video_params is None:
-            seeded_fps = expected_cfg[2] or fps
-            state.baseline_video_params = (expected_cfg[0], expected_cfg[1], seeded_fps)
-            log(
-                f"{context}: QUALITY BASELINE {expected_cfg[0]}x{expected_cfg[1]}"
-                f"@{seeded_fps:g}fps (from EXPECTED_VIDEO)"
+            meets_expected_area = (
+                float(w) * float(h)
+                >= float(expected_cfg[0]) * float(expected_cfg[1]) * 0.98
             )
+            seeded_fps = expected_cfg[2] or (fps if meets_expected_area else 0.0)
+            if seeded_fps > 0:
+                state.baseline_video_params = (expected_cfg[0], expected_cfg[1], seeded_fps)
+                log(
+                    f"{context}: QUALITY BASELINE {expected_cfg[0]}x{expected_cfg[1]}"
+                    f"@{seeded_fps:g}fps (from EXPECTED_VIDEO)"
+                )
 
         standard = _resolve_quality_standard(state)
         if standard is None:

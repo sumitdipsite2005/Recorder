@@ -88,11 +88,27 @@ class LogSink:
 class AlarmRecorder:
     def __init__(self):
         self.started = []
+        self.stopped = []
+        self.beeps = []
 
     def __call__(self, state):
         self.started.append("quality_downgrade")
         state.quality_downgrade_alarm_active = True
         state.shared_alarm_type = "quality_downgrade"
+
+    def stop(self, state, reason="recovered"):
+        self.stopped.append(reason)
+        state.quality_downgrade_alarm_active = False
+        state.quality_pending_downgrade = None
+        state.quality_pending_since_mono = None
+        if getattr(state, "shared_alarm_type", None) == "quality_downgrade":
+            state.shared_alarm_type = None
+
+    def beep(self, state):
+        self.beeps.append("beep_good")
+
+    def log_beep(self, reason):
+        self.beeps.append(reason)
 
 
 class QualityState:
@@ -111,6 +127,7 @@ class QualityState:
         self.quality_probe_done = False
         self.quality_startup_checked = False
         self.quality_expected_unset_logged = False
+        self.quality_fps_defer_logged = False
         self.quality_pending_downgrade = None
         self.quality_pending_since_mono = None
         self.shared_alarm_type = None
@@ -173,6 +190,9 @@ def load_quality(filename="record_static.py", expected_video=None):
         "EXPECTED_VIDEO": expected_video,
         "is_alarm_active": _alarm_active,
         "quality_downgrade_alarm_start": alarms,
+        "quality_downgrade_alarm_stop": alarms.stop,
+        "log_good_beep": alarms.log_beep,
+        "beep_good": alarms.beep,
     }
     module = ast.Module(body=wanted, type_ignores=[])
     exec(compile(module, str(path), "exec", flags=COMPILE_FLAGS), ns)
@@ -474,6 +494,159 @@ class StartupAckSuppressionTests(unittest.TestCase):
         self.assertEqual(state.integrity_monitor.recycle_kind, "format_change")
 
 
+class StartupRecoveryTests(unittest.TestCase):
+    """A recovered chunk silences the siren and re-arms the next real drop (BLOCKER 1)."""
+
+    def setUp(self):
+        self.ns, self.log, self.alarms = load_quality(expected_video="1080p50")
+        self.evaluate = self.ns["evaluate_startup_quality"]
+        self.VideoParams = self.ns["VideoParams"]
+
+    def _drop_on_chunk2(self, acked):
+        state = QualityState()
+        self.evaluate(state, self.VideoParams(1280, 720, 50.0, "h264", ""), "ffmpeg")
+        self.assertEqual(self.alarms.started, ["quality_downgrade"])
+        if acked:
+            state.acknowledged_quality_params = state.last_downgraded_quality_params
+            state.acknowledged_quality_codec = state.last_downgraded_codec
+            state.shared_alarm_type = None
+            state.quality_downgrade_alarm_active = False
+        return state
+
+    def _restore(self, state):
+        self.ns["begin_quality_observation"](state)
+        self.evaluate(
+            state, self.VideoParams(1920, 1080, 50.0, "h264", "progressive"), "ffmpeg"
+        )
+
+    def test_startup_recovery_stops_active_alarm_and_clears_ack_when_fps_known(self):
+        for acked in (False, True):
+            with self.subTest(acknowledged=acked):
+                self.alarms.started.clear()
+                self.alarms.stopped.clear()
+                self.alarms.beeps.clear()
+                state = self._drop_on_chunk2(acked)
+
+                self._restore(state)
+
+                self.assertFalse(state.quality_downgrade_alarm_active)
+                self.assertIsNone(state.quality_pending_downgrade)
+                self.assertIsNone(state.acknowledged_quality_params)
+                self.assertIsNone(state.acknowledged_quality_codec)
+                self.assertEqual(self.alarms.stopped, ["restored"])
+                self.assertIn("quality_restored", self.alarms.beeps)
+                self.assertIn("beep_good", self.alarms.beeps)
+                self.assertIn(
+                    "Broadcast quality restored to standard 1920x1080@50fps (from ffmpeg)",
+                    self.log.text,
+                )
+
+                # Chunk 4 drops again: the cleared acknowledgement must not silence it.
+                self.ns["begin_quality_observation"](state)
+                self.evaluate(
+                    state, self.VideoParams(1280, 720, 50.0, "h264", ""), "ffmpeg"
+                )
+                self.assertEqual(
+                    self.alarms.started, ["quality_downgrade", "quality_downgrade"]
+                )
+
+    def test_startup_recovery_with_unknown_fps_waits_for_seal_or_probe(self):
+        for acked in (False, True):
+            with self.subTest(acknowledged=acked):
+                self.alarms.started.clear()
+                self.alarms.stopped.clear()
+                self.alarms.beeps.clear()
+                state = self._drop_on_chunk2(acked)
+
+                # Chunk 3 is 1080p, but publishes no frame rate: recovery is not
+                # proven, so the siren and the acknowledgement stay exactly as they were.
+                self.ns["begin_quality_observation"](state)
+                self.evaluate(
+                    state, self.VideoParams(1920, 1080, 0.0, "h264", ""), "nm3u8dl"
+                )
+
+                self.assertEqual(state.quality_downgrade_alarm_active, not acked)
+                self.assertEqual(
+                    state.acknowledged_quality_params,
+                    (1280, 720, 50.0) if acked else None,
+                )
+                self.assertEqual(self.alarms.stopped, [])
+                self.assertEqual(self.alarms.beeps, [])
+                self.assertIn("QUALITY_CHECK_DEFERRED", self.log.text)
+
+                # The probe (or chunk seal) supplies the rate: now it stops and clears.
+                self.evaluate(
+                    state, self.VideoParams(1920, 1080, 50.0, "h264", ""), "probe"
+                )
+
+                self.assertFalse(state.quality_downgrade_alarm_active)
+                self.assertIsNone(state.acknowledged_quality_params)
+                self.assertIsNone(state.acknowledged_quality_codec)
+                self.assertEqual(self.alarms.stopped, ["restored"])
+
+
+class StartupFrameRateDeferralTests(unittest.TestCase):
+    """An fps=0 startup reading defers once and never locks out the probe (Item 5)."""
+
+    def setUp(self):
+        self.ns, self.log, self.alarms = load_quality(expected_video="1080p50")
+        self.evaluate = self.ns["evaluate_startup_quality"]
+
+    def test_fps_zero_deferral_logs_once_and_does_not_lock_out_probe(self):
+        state = QualityState()
+        reading = self.ns["VideoParams"](1920, 1080, 0.0, "", "")
+
+        self.evaluate(state, reading, "nm3u8dl")
+        self.evaluate(state, reading, "nm3u8dl")
+
+        self.assertEqual(self.log.text.count("QUALITY_CHECK_DEFERRED"), 1)
+        self.assertFalse(state.quality_startup_checked)
+
+        # The frame-rate drop is still caught by the probe within the same chunk.
+        self.evaluate(state, self.ns["VideoParams"](1920, 1080, 25.0, "h264", ""), "probe")
+
+        self.assertTrue(state.quality_startup_checked)
+        self.assertEqual(self.alarms.started, ["quality_downgrade"])
+        self.assertIn("geometry below standard 1920x1080@25 vs 1920x1080@50", self.log.text)
+
+
+class ExpectedVideoFrameRateInheritanceTests(unittest.TestCase):
+    """EXPECTED_VIDEO without a frame rate inherits the learned one (Item 6)."""
+
+    def setUp(self):
+        self.ns, self.log, self.alarms = load_quality(expected_video="1080p")
+        self.evaluate = self.ns["evaluate_startup_quality"]
+        self.VideoParams = self.ns["VideoParams"]
+
+    def test_expected_video_without_fps_learns_fps_and_catches_later_fps_drop(self):
+        state = QualityState()
+
+        self.evaluate(state, self.VideoParams(1920, 1080, 50.0, "h264", ""), "ffmpeg")
+        self.assertEqual(state.baseline_video_params, (1920, 1080, 50.0))
+        self.assertEqual(
+            self.ns["_resolve_quality_standard"](state), (1920, 1080, 50.0, "h264")
+        )
+
+        self.ns["begin_quality_observation"](state)
+        self.evaluate(state, self.VideoParams(1920, 1080, 25.0, "h264", ""), "ffmpeg")
+
+        self.assertEqual(self.alarms.started, ["quality_downgrade"])
+        self.assertIn("geometry below standard 1920x1080@25 vs 1920x1080@50", self.log.text)
+
+    def test_expected_video_without_fps_never_seeds_unknown_or_downgraded_fps(self):
+        cases = {
+            "unknown fps at the expected geometry": self.VideoParams(1920, 1080, 0.0, "h264", ""),
+            "downgraded chunk": self.VideoParams(1280, 720, 25.0, "h264", ""),
+        }
+        for label, reading in cases.items():
+            with self.subTest(case=label):
+                state = QualityState()
+                self.evaluate(state, reading, "nm3u8dl")
+                self.assertIsNone(state.baseline_video_params)
+                # The resolution floor still comes from EXPECTED_VIDEO.
+                self.assertEqual(self.ns["_resolve_quality_standard"](state)[:2], (1920, 1080))
+
+
 class PlannedCutTests(unittest.TestCase):
     """A codec change cuts the chunk as a planned format change, not as corruption."""
 
@@ -689,6 +862,36 @@ def _entry_points(filename):
     }
 
 
+def _function_source(filename, name):
+    """Source text of one top-level function in one recorder."""
+    path = ROOT / filename
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(text, node) or ""
+    raise AssertionError(f"{filename} has no {name}")
+
+
+class ManifestTableGatingTests(unittest.TestCase):
+    """Unselected playlist tiers are never format evidence (BLOCKER 2, Item 3)."""
+
+    def test_startup_verdict_waits_for_selected_streams_or_progress_row(self):
+        for filename in ("record_static.py", "record_dynamic.py"):
+            with self.subTest(module=filename):
+                source = _function_source(filename, "extract_nm3u8dl_startup_info")
+                self.assertIn(
+                    "if state is not None and (in_selected_section or progress_match):",
+                    source,
+                )
+                # The pre-gate form judged every Vid row, including the manifest table.
+                self.assertNotIn(
+                    "        if state is not None:\n"
+                    "            vid_reading = _startup_vid_reading(stripped_line)",
+                    source,
+                )
+
+
 class ChunkObservationTests(unittest.TestCase):
     """Every chunk run starts with fresh startup-verdict slots, in both recorders."""
 
@@ -724,6 +927,15 @@ class ChunkObservationTests(unittest.TestCase):
             for name, source in entries.items():
                 with self.subTest(module=filename, entry=name):
                     self.assertIn("begin_quality_observation(state)", source)
+
+    def test_both_recorders_call_maybe_probe_startup_quality_in_start_ffmpeg_to_chunk(self):
+        for filename in ("record_static.py", "record_dynamic.py"):
+            with self.subTest(module=filename):
+                entries = _entry_points(filename)
+                self.assertIn(
+                    "maybe_probe_startup_quality(state, chunk_path, start_run_mono)",
+                    entries["start_ffmpeg_to_chunk"],
+                )
 
 
 class CodecChangeTests(unittest.TestCase):
