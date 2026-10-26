@@ -17033,6 +17033,16 @@ def monitor_nm3u8dl_playlist_renewal(
                 quality_decision_level = "WARN"
 
         if authorization_check_due:
+            # Judge the backup and the candidate pool at a clock read *after*
+            # the quality probes above: `check_time` is taken before IDET
+            # probes that can run for minutes, and a short-lived backup can
+            # die inside that window. Judging it at the stale clock would let
+            # the card report a dead token as a retained fallback. Hunk 3A
+            # already uses a post-call clock (`check_completed_ts`); this
+            # makes the two doors agree. The candidate filter uses the same
+            # read, which can only drop candidates that are already dead.
+            retained_now_ts = time.time()
+
             replacement_candidates = [
                 pool_candidate
                 for pool_candidate in candidate_pool
@@ -17040,7 +17050,7 @@ def monitor_nm3u8dl_playlist_renewal(
                     running_expiry,
                     pool_candidate.get("stream_url", ""),
                     pool_candidate.get("expiry"),
-                    now_ts=check_time,
+                    now_ts=retained_now_ts,
                 )
             ]
 
@@ -17090,7 +17100,7 @@ def monitor_nm3u8dl_playlist_renewal(
                     running_expiry,
                     retained_source.get("stream_url", ""),
                     retained_source.get("expiry"),
-                    now_ts=check_time,
+                    now_ts=retained_now_ts,
                 )
             )
 
@@ -17174,6 +17184,10 @@ def monitor_nm3u8dl_playlist_renewal(
                     )
 
             elif retained_expired:
+                # The failed-check door already reports this same event at
+                # WARN; the card must not fall back to the pass default INFO
+                # just because the scan itself succeeded (BUG-012 P-1).
+                decision_level = "WARN"
                 decision = (
                     "retained replacement expired during this check; "
                     "discarded; current recording continues"

@@ -6,6 +6,13 @@ the renewal card tells the truth about the next check, a discarded backup
 re-arms the clock at once, and a backup that expires while a check is in
 progress is dropped the same way through both doors.
 
+Also covers the Round 1 audit remediations approved for Stage 5B and carried
+in ``..._3B_SPEC_OUT_R3.md``: the backup and the candidate pool are judged at a
+clock read taken *after* the quality probes (TD-1, TD-1b), the successful door
+reports a lost backup at ``WARN`` like the failed door (P-1), and the
+discard-then-scan ordering inside one pass is proven rather than inferred
+(P-3, audit §6.4).
+
 The recorder reads machine-specific configuration at import time, so each hunk
 is compiled from ``record_dynamic.py``'s AST and executed against stub globals.
 No recorder, network, or thread is started.
@@ -178,10 +185,12 @@ class RenewalScheduleTests(unittest.TestCase):
         cls.failed_check_code = _compile(failed)
         cls.rearm_code = _compile(healthy)
 
-        # §3.4 — the post-scan cleanup plus its decision chain.
+        # §3.4 — the post-scan cleanup plus its decision chain. The slice
+        # starts at the post-probe clock read so the TD-1 / TD-1b anchor is
+        # inside the compiled fragment instead of being stubbed from outside.
         cls.post_scan_code = _compile(
             _statements_around(
-                cls.monitor, "retained_usable", "stable_candidates"
+                cls.monitor, "retained_now_ts", "stable_candidates"
             )
         )
 
@@ -479,27 +488,29 @@ class RenewalScheduleTests(unittest.TestCase):
         )
 
     # -- Scenario 6 ---------------------------------------------------------
-    def _run_post_scan(self, held, replacement_candidates):
+    def _run_post_scan(
+        self, held, replacement_candidates, scan_time=None, probe_clock=None
+    ):
+        """Run the §3.4 block with the scan clock and the probe clock apart.
+
+        ``scan_time`` is the ``check_time`` sample taken before the quality
+        probes; ``probe_clock`` is what ``time.time()`` returns when the block
+        runs after them. They differ only in TD-1's window.
+        """
         logs = []
-        check_time = TARGET
-        candidate = (
-            replacement_candidates[0] if replacement_candidates else None
-        )
+        check_time = TARGET if scan_time is None else scan_time
+        clock = TARGET if probe_clock is None else probe_clock
 
         def record(message, level="INFO"):
             logs.append((message, level))
 
         env = {
+            "time": SimpleNamespace(time=lambda: clock),
             "state": SimpleNamespace(nm3u8dl_pending_source=dict(held)),
-            "retained_source": dict(held),
+            "candidate_pool": replacement_candidates,
+            "resolution": {"stream_url": "http://scan", "expiry": None},
             "running_expiry": check_time + 21600,
             "check_time": check_time,
-            "candidate": candidate,
-            "candidate_expiry": (
-                candidate.get("expiry") if candidate else None
-            ),
-            "stable_candidates": [],
-            "replacement_candidates": replacement_candidates,
             "running_source": {"stream_url": "http://running"},
             "is_nm3u8dl_usable_replacement": (
                 lambda running, url, expiry, now_ts=None: (
@@ -507,7 +518,7 @@ class RenewalScheduleTests(unittest.TestCase):
                 )
             ),
             "is_nm3u8dl_stable_replacement": (
-                lambda running, expiry: True
+                lambda running, expiry: False
             ),
             "get_nm3u8dl_candidate_quality_rank": (
                 lambda item: item.get("rank", 0)
@@ -515,6 +526,7 @@ class RenewalScheduleTests(unittest.TestCase):
             "NM3U8DL_NEW_SOURCE_MIN_REMAINING_MIN": 30,
             "log": record,
             "decision": "unset",
+            "decision_level": "INFO",
         }
         exec(self.post_scan_code, env)
         return env, logs
@@ -535,6 +547,9 @@ class RenewalScheduleTests(unittest.TestCase):
         self.assertNotIn("fallback retained", decision)
         self.assertNotIn("does not extend the running authorization", decision)
         self.assertIs(env["replacement_locked"], False)
+        # P-1: the successful door reports the loss at WARN, exactly as the
+        # failed door does for the same event.
+        self.assertEqual(env["decision_level"], "WARN")
         self.assertTrue(
             any(
                 "discarding it" in text and level == "WARN"
@@ -552,8 +567,140 @@ class RenewalScheduleTests(unittest.TestCase):
         env, _ = self._run_post_scan(
             expired, replacement_candidates=[fresh]
         )
-        self.assertEqual(env["state"].nm3u8dl_pending_source, fresh)
+        selected = env["state"].nm3u8dl_pending_source
+        # The scan copies the chosen candidate and attaches its metadata, so
+        # compare the identifying fields rather than the whole dictionary.
+        self.assertEqual(selected["stream_url"], fresh["stream_url"])
+        self.assertEqual(selected["expiry"], fresh["expiry"])
+        self.assertIn("candidate_count", selected)
         self.assertIn("fallback replacement retained", env["decision"])
+
+
+    # -- Scenario 7 (Round 1 audit TD-1 / TD-1b / P-1) -----------------------
+    def test_backup_expiring_during_quality_probes_is_discarded(self):
+        """The backup is judged after the probes, not before them."""
+        scan_time = TARGET - 120
+        probe_clock = TARGET
+        held = {
+            "stream_url": "http://backup",
+            "playlist_url": "http://backup/list.m3u8",
+            "expiry": TARGET - 60,
+        }
+        # The window this case proves: alive at the scan's own clock, dead by
+        # the clock read after the IDET quality probes.
+        self.assertGreater(held["expiry"], scan_time)
+        self.assertLessEqual(held["expiry"], probe_clock)
+
+        env, logs = self._run_post_scan(
+            held, [], scan_time=scan_time, probe_clock=probe_clock
+        )
+        decision = env["decision"]
+        self.assertIsNone(env["state"].nm3u8dl_pending_source)
+        self.assertIn("expired during this check; discarded", decision)
+        self.assertNotIn("fallback retained", decision)
+        self.assertIs(env["replacement_locked"], False)
+        self.assertEqual(env["decision_level"], "WARN")
+        self.assertEqual(
+            [text for text, level in logs if level == "WARN"],
+            [
+                "Retained authorization replacement expired during "
+                "this check → discarding it..."
+            ],
+        )
+
+        # TD-1b: a pool candidate that died during the probes is not handed
+        # over as the new retained source either. With the stale clock it
+        # would pass the filter and be re-installed as a live fallback.
+        dead_candidate = {
+            "stream_url": "http://dead-candidate",
+            "playlist_url": "http://dead-candidate/list.m3u8",
+            "expiry": TARGET - 30,
+            "rank": 2,
+        }
+        self.assertGreater(dead_candidate["expiry"], scan_time)
+        self.assertLessEqual(dead_candidate["expiry"], probe_clock)
+        env, _ = self._run_post_scan(
+            held,
+            [dead_candidate],
+            scan_time=scan_time,
+            probe_clock=probe_clock,
+        )
+        self.assertIsNone(env["state"].nm3u8dl_pending_source)
+        self.assertIn("expired during this check; discarded", env["decision"])
+        self.assertEqual(env["decision_level"], "WARN")
+
+
+    # -- Scenario 8 (Round 1 audit P-3, §6.4) --------------------------------
+    def test_discard_then_scan_in_one_pass_arms_fresh_cadence(self):
+        """Hunk 2's clamp and hunk 3's re-arm run in the same pass."""
+        now = TARGET - 1
+
+        # Inside the lead window the loop-top discard clamps the clock to
+        # "now", so the pass that follows scans immediately.
+        env, _ = self._run_discard(now, window_start=now - 600)
+        self.assertIsNone(env["state"].nm3u8dl_pending_source)
+        self.assertEqual(env["next_renewal_check_ts"], now)
+
+        # The scan in that same pass completes 0.2 s later and re-arms from
+        # its own completion time — the clamp must not survive the pass.
+        card = Mock()
+        env.update(
+            authorization_check_due=True,
+            normal_interval_sec=300,
+            risk_interval_sec=60,
+            risk_check_start_ts=TARGET - 300,
+            running_target=TARGET,
+            running_expiry=TARGET + 21600,
+            source_results=[],
+            candidate=None,
+            decision="scan completed",
+            decision_level="INFO",
+            replacement_locked=False,
+            log_nm3u8dl_playlist_renewal_check=card,
+        )
+        check_completed_ts = now + 0.2
+        env["check_completed_ts"] = check_completed_ts
+        exec(self.cadence_code, env)
+        exec(self.rearm_code, env)
+        self.assertGreaterEqual(check_completed_ts, env["risk_check_start_ts"])
+        # Inside the risk window the step is 60 s, capped at the rollover
+        # instant: min(check_completed + 60, running_target).
+        expected_next = min(check_completed_ts + 60, TARGET)
+        self.assertEqual(env["next_renewal_check_ts"], expected_next)
+        self.assertNotEqual(env["next_renewal_check_ts"], now)
+        self.assertGreater(env["next_renewal_check_ts"], now)
+        self.assertEqual(
+            card.call_args.kwargs["next_check_ts"],
+            env["next_renewal_check_ts"],
+        )
+
+        # Outside the lead window the clamp schedules the opening in the
+        # future, so the pass that follows does NOT scan: the same-pass
+        # supersede only happens inside the window.
+        early = TARGET - 11100
+        env, _ = self._run_discard(early, window_start=TARGET - 300)
+        self.assertEqual(env["next_renewal_check_ts"], TARGET - 300)
+        self.assertLess(early, env["next_renewal_check_ts"])
+
+        # Both doors lose a backup at the same severity and with the same
+        # sentence stem, so neither can be quietly downgraded later (P-1,
+        # stated as an equality between the two doors).
+        expired_held = {
+            "stream_url": "http://backup",
+            "playlist_url": "http://backup/list.m3u8",
+            "expiry": TARGET - 1,
+        }
+        _, failed_kwargs, _ = self._run_failed_check(
+            expired_held, usable=False, stable=True
+        )
+        scan_env, _ = self._run_post_scan(expired_held, [])
+        self.assertEqual(scan_env["decision_level"], "WARN")
+        self.assertEqual(
+            failed_kwargs["decision_level"], scan_env["decision_level"]
+        )
+        stem = "retained replacement expired during this check; discarded"
+        self.assertIn(stem, failed_kwargs["decision"])
+        self.assertIn(stem, scan_env["decision"])
 
 
 if __name__ == "__main__":
