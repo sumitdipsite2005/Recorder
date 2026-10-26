@@ -20,7 +20,7 @@ chore/<name>
 
 Iterative development commits stay on that temporary branch.
 
-Small corrections, experiments, review changes, and intermediate commits are expected there and do not need to be artificially minimized.
+Small corrections, experiments, review changes, and intermediate commits are expected there and do not need to be artificially minimized. This describes the **shape of history once the work reaches GitHub**; it does not relax the workspace rule that a local development turn must end with its changes committed. Local commits are mandatory on every turn — this section only says their granularity is unrestricted.
 
 ## Accepting completed work
 
