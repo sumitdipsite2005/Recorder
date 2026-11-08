@@ -16,6 +16,18 @@ from recorder_coordinator import terminal as coordinator_terminal
 from recorder_coordinator.snapshot import candidate_row_key, candidate_state
 from recorder_source.models import SourceCandidate
 
+_ORIGINAL_TERMINAL_IS_INTERACTIVE = coordinator_terminal._terminal_is_interactive
+
+
+def setUpModule() -> None:
+    # Ensure default terminal output in coordinator tests evaluates unstyled plain text
+    # for business logic assertions, while dedicated visual tests pass use_color=True.
+    coordinator_terminal._terminal_is_interactive = lambda: False
+
+
+def tearDownModule() -> None:
+    coordinator_terminal._terminal_is_interactive = _ORIGINAL_TERMINAL_IS_INTERACTIVE
+
 
 def target(name="T", policy=coord.POLICY_MANUAL, **kw):
     data = dict(name=name, policy=policy, source_groups=("SONYLIV_EVENTS",), primary=("Asian Games",))
