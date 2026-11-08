@@ -158,8 +158,8 @@ NM3U8DL_STDOUT_EXCLUDE_BY_URL = {
 NM3U8DL_AUDIO_OFFSET_SEC = 0.0
 
 # Part B: Static options (appended to command with dynamic chunk name)
-# Browser-paced defaults (--thread-count 2 --live-take-count 2 --live-wait-time 3 --download-retry-count 2) to prevent 429 CDN ban storms
-NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --live-take-count 2 --live-wait-time 3 --download-retry-count 2 --http-request-timeout 90 --select-video best --select-audio best'
+# Browser-paced defaults (--thread-count 2 --download-retry-count 2) to prevent 429 CDN ban storms while preserving native playlist refresh intervals
+NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --download-retry-count 2 --http-request-timeout 90 --select-video best --select-audio best'
 
 # Network Guardrail & Rate-Limit Circuit Breaker constants
 VPN_HOLD_TIMEOUT_SEC = 1800.0       # 30-minute standby hold on VPN collapse

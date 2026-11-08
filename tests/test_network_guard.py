@@ -370,9 +370,11 @@ class RecordDynamicWiringTests(unittest.TestCase):
     def test_custom_proxy_injected_for_wireproxy(self):
         self.assertIn("--custom-proxy http://127.0.0.1:{WIREPROXY_HTTP_PORT}", self.code)
         self.assertIn(
-            "NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --live-take-count 2 --live-wait-time 3 --download-retry-count 2",
+            "NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --download-retry-count 2",
             self.code,
         )
+        self.assertNotIn("--live-take-count 2", self.code)
+        self.assertNotIn("--live-wait-time 3", self.code)
         self.assertNotIn("--download-retry-count 30", self.code)
 
     def test_preflight_wireproxy_not_skipped_on_internet_recovery(self):
@@ -1030,21 +1032,21 @@ class RuntimeRouteResolutionAndBannerTests(unittest.TestCase):
         import record_dynamic
 
         default_b = record_dynamic.NM3U8DL_PART_B
+        self.assertNotIn("--live-take-count", default_b)
+        self.assertNotIn("--live-wait-time", default_b)
 
         # JIO overrides --thread-count 1 in PART_A
         jio_a = 'N_m3u8DL-RE "https://example.com/index.m3u8" --thread-count 1'
         dedup_jio = record_dynamic._deduplicate_nm3u8dl_part_b(jio_a, default_b)
         self.assertNotIn("--thread-count", dedup_jio)
-        self.assertIn("--live-take-count 2", dedup_jio)
-        self.assertIn("--live-wait-time 3", dedup_jio)
         self.assertIn("--download-retry-count 2", dedup_jio)
 
-        # 7AU overrides --live-wait-time 25 in PART_A
+        # 7AU overrides --live-wait-time 25 in PART_A when a custom PART_B contains --live-wait-time
         au_a = 'N_m3u8DL-RE "https://example.com/index.m3u8" --use-shaka-packager --live-wait-time 25'
-        dedup_au = record_dynamic._deduplicate_nm3u8dl_part_b(au_a, default_b)
+        custom_b_with_wait = f"{default_b} --live-wait-time 10"
+        dedup_au = record_dynamic._deduplicate_nm3u8dl_part_b(au_a, custom_b_with_wait)
         self.assertNotIn("--live-wait-time", dedup_au)
         self.assertIn("--thread-count 2", dedup_au)
-        self.assertIn("--live-take-count 2", dedup_au)
 
     def test_hotstar_client_hints_and_quote_escaping(self):
         import shlex
