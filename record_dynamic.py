@@ -368,7 +368,7 @@ NM3U8DL_AUDIO_OFFSET_SEC = 0.0
 
 # Part B: Static/default options (appended to command with dynamic chunk name).
 # Dynamic playlist mode replaces --select-video best at launch with the representation already selected by the recorder.
-NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --live-take-count 2 --live-wait-time 3 --download-retry-count 2 --http-request-timeout 90 --select-video best --select-audio best'
+NM3U8DL_PART_B = '-M format=ts --live-real-time-merge --live-pipe-mux --thread-count 2 --download-retry-count 2 --http-request-timeout 90 --select-video best --select-audio best'
 
 # ======================================================================================================================
 
